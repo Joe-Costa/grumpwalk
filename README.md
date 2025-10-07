@@ -40,7 +40,7 @@ chmod +x file_filter.sh
 ### Basic Syntax
 
 ```bash
-./file_filter.sh --path <path> [--older-than <days> | --newer-than <days>] [OPTIONS]
+./file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
 ```
 
 ### Common Examples
@@ -111,6 +111,17 @@ chmod +x file_filter.sh
 ./file_filter.sh --path /home --greater-than 100MB --smaller-than 1GB
 ```
 
+**Find files in a time range (between 7 and 30 days old):**
+```bash
+./file_filter.sh --path /home --newer-than 7 --older-than 30
+```
+
+**Find files in both time and size ranges:**
+```bash
+./file_filter.sh --path /home --newer-than 30 --older-than 90 \
+  --greater-than 1GB --smaller-than 10GB
+```
+
 ## Options
 
 ### Required Arguments
@@ -120,7 +131,9 @@ chmod +x file_filter.sh
 - `--older-than <days>` - Find files older than N days
 - `--newer-than <days>` - Find files newer than N days
 
-**Note:** If neither `--older-than` nor `--newer-than` is specified, all files will be returned (filtered only by owner if specified).
+**Time range filtering:** Both `--older-than` and `--newer-than` can be used together to find files within a specific age range (e.g., files between 7 and 30 days old).
+
+**Note:** If neither time filter is specified, all files will be returned (filtered only by owner/size if specified).
 
 ### Time Field Options (default: --created)
 - `--created` - Filter by creation time (default)

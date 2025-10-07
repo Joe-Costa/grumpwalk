@@ -129,6 +129,8 @@ Required Arguments:
 Time Filter Options (optional):
   --older-than <days>        Find files older than N days
   --newer-than <days>        Find files newer than N days
+                             Both can be used together for time range filtering
+                             (files between newer-than and older-than days old)
 
 Time Field Options (default: --created):
   --created                  Filter by creation time (default)
@@ -202,6 +204,12 @@ Examples:
 
   # Find files in a size range (between 100MB and 1GB)
   filter_old_files.sh --path /home --greater-than 100MB --smaller-than 1GB
+
+  # Find files in a time range (between 7 and 30 days old)
+  filter_old_files.sh --path /home --newer-than 7 --older-than 30
+
+  # Find files in both time and size range
+  filter_old_files.sh --path /home --newer-than 30 --older-than 90 --greater-than 1GB --smaller-than 10GB
 EOF
             exit 0
             ;;
@@ -223,10 +231,13 @@ if [ -z "$PATH_TO_SEARCH" ]; then
     exit 1
 fi
 
+# Validate time range if both --older-than and --newer-than are specified
 if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
-    echo "Error: cannot use both --older-than and --newer-than" >&2
-    echo "Usage: $0 --path <path> [--older-than <days> | --newer-than <days>] [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs \"pattern1 pattern2\"] [--json | --json-out <file>] [--verbose]" >&2
-    exit 1
+    if [ "$NEWER_THAN" -ge "$OLDER_THAN" ]; then
+        echo "Error: --newer-than ($NEWER_THAN) must be less than --older-than ($OLDER_THAN) for a valid time range" >&2
+        echo "Example: --newer-than 7 --older-than 30 (files between 7 and 30 days old)" >&2
+        exit 1
+    fi
 fi
 
 # Allow both --greater-than and --smaller-than for range filtering
@@ -328,14 +339,21 @@ if [ -n "$SMALLER_THAN" ]; then
     fi
 fi
 
-# Calculate the timestamp threshold (if time filter is specified)
-threshold=""
+# Calculate the timestamp threshold(s) (if time filter is specified)
+threshold_older=""
+threshold_newer=""
 comparison=""
-if [ -n "$OLDER_THAN" ]; then
-    threshold=$(date -u +%s -d "$OLDER_THAN days ago")
+
+if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
+    # Range: both thresholds needed
+    threshold_older=$(date -u +%s -d "$OLDER_THAN days ago")
+    threshold_newer=$(date -u +%s -d "$NEWER_THAN days ago")
+    comparison="range"
+elif [ -n "$OLDER_THAN" ]; then
+    threshold_older=$(date -u +%s -d "$OLDER_THAN days ago")
     comparison="older"
 elif [ -n "$NEWER_THAN" ]; then
-    threshold=$(date -u +%s -d "$NEWER_THAN days ago")
+    threshold_newer=$(date -u +%s -d "$NEWER_THAN days ago")
     comparison="newer"
 fi
 
@@ -627,7 +645,8 @@ from datetime import datetime
 # Ensure unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 
-threshold = '$threshold'
+threshold_older = '$threshold_older'
+threshold_newer = '$threshold_newer'
 comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
@@ -637,22 +656,33 @@ size_greater = '$SIZE_GREATER_BYTES'
 size_smaller = '$SIZE_SMALLER_BYTES'
 verbose = '${VERBOSE}' == 'true'
 
-# Calculate threshold_str only if threshold is provided
-threshold_str = ''
-if threshold:
-    threshold_str = datetime.utcfromtimestamp(int(threshold)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
+# Calculate threshold_str values only if thresholds are provided
+threshold_older_str = ''
+threshold_newer_str = ''
+if threshold_older:
+    threshold_older_str = datetime.utcfromtimestamp(int(threshold_older)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
+if threshold_newer:
+    threshold_newer_str = datetime.utcfromtimestamp(int(threshold_newer)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
 
 current_obj = {}
 current_idx = None
 
 def matches_filter(time_value):
     # If no time filter specified, match everything
-    if not comparison or not threshold_str:
+    if not comparison:
         return True
-    if comparison == 'older':
-        return time_value < threshold_str
-    else:  # newer
-        return time_value > threshold_str
+
+    if comparison == 'range':
+        # Range: file must be newer than older_threshold AND older than newer_threshold
+        # (between newer_days and older_days old)
+        # Older timestamps = smaller values, so: time > older AND time < newer
+        return time_value > threshold_older_str and time_value < threshold_newer_str
+    elif comparison == 'older':
+        return time_value < threshold_older_str
+    elif comparison == 'newer':
+        return time_value > threshold_newer_str
+
+    return True
 
 def matches_owner(file_owner):
     # If no owner filter specified, match everything
