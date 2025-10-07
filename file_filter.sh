@@ -139,6 +139,7 @@ Time Field Options (default: --created):
 Size Filter Options (optional):
   --greater-than <size>      Find files greater than specified size
   --smaller-than <size>      Find files smaller than specified size
+                             Both can be used together for range filtering
                              Supported units: B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB
                              Examples: 100MB, 1.5GiB, 500, 10KB
 
@@ -198,6 +199,9 @@ Examples:
 
   # Find files smaller than 1GiB and older than 30 days
   filter_old_files.sh --path /home --smaller-than 1GiB --older-than 30
+
+  # Find files in a size range (between 100MB and 1GB)
+  filter_old_files.sh --path /home --greater-than 100MB --smaller-than 1GB
 EOF
             exit 0
             ;;
@@ -225,10 +229,7 @@ if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
     exit 1
 fi
 
-if [ -n "$GREATER_THAN" ] && [ -n "$SMALLER_THAN" ]; then
-    echo "Error: cannot use both --greater-than and --smaller-than" >&2
-    exit 1
-fi
+# Allow both --greater-than and --smaller-than for range filtering
 
 # Check for conflicting options
 if [ "$VERBOSE" = true ] && [ "$OUTPUT_JSON" = true ] && [ -z "$JSON_OUT_FILE" ]; then
@@ -676,7 +677,11 @@ def matches_size(file_size):
     except (ValueError, TypeError):
         return False
 
-    if size_greater:
+    # Check size filters (both can be specified for range filtering)
+    if size_greater and size_smaller:
+        # Range: file must be greater than min AND smaller than max
+        return size_bytes > int(size_greater) and size_bytes < int(size_smaller)
+    elif size_greater:
         return size_bytes > int(size_greater)
     elif size_smaller:
         return size_bytes < int(size_smaller)

@@ -106,6 +106,11 @@ chmod +x file_filter.sh
 ./file_filter.sh --path /home --smaller-than 1GiB --older-than 30
 ```
 
+**Find files in a size range (between 100MB and 1GB):**
+```bash
+./file_filter.sh --path /home --greater-than 100MB --smaller-than 1GB
+```
+
 ## Options
 
 ### Required Arguments
@@ -133,7 +138,7 @@ chmod +x file_filter.sh
 
 **Examples:** `100MB`, `1.5GiB`, `500` (bytes), `10KB`
 
-**Note:** You cannot use both `--greater-than` and `--smaller-than` together.
+**Range filtering:** Both `--greater-than` and `--smaller-than` can be used together to find files within a size range.
 
 ### Owner Filter Options
 - `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)
