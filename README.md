@@ -7,6 +7,7 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 - **Memory-safe streaming**: Processes files one at a time using jq streaming, avoiding OOM issues on large directory trees
 - **File listing**: List all files in a directory tree with optional filtering
 - **Time-based filtering**: Optionally filter by creation, access, modification, or change time
+- **Size-based filtering**: Filter by file size with support for decimal (KB, MB, GB, TB, PB) and binary (KiB, MiB, GiB, TiB, PiB) units
 - **Owner filtering**: Filter by file owner with support for AD users, local users, and UIDs (supports multiple owners with OR logic)
 - **Identity expansion**: Automatically match equivalent identities (e.g., AD user + corresponding NFS UID)
 - **Selective directory omission**: Skip directories using wildcard patterns
@@ -95,6 +96,16 @@ chmod +x file_filter.sh
   --json-out results.json --all-attributes
 ```
 
+**Find files larger than 100MB:**
+```bash
+./file_filter.sh --path /home --greater-than 100MB
+```
+
+**Find files smaller than 1GiB and older than 30 days:**
+```bash
+./file_filter.sh --path /home --smaller-than 1GiB --older-than 30
+```
+
 ## Options
 
 ### Required Arguments
@@ -111,6 +122,18 @@ chmod +x file_filter.sh
 - `--accessed` - Filter by last access time
 - `--modified` - Filter by last modification time
 - `--changed` - Filter by last metadata change time
+
+### Size Filter Options (optional)
+- `--greater-than <size>` - Find files greater than specified size
+- `--smaller-than <size>` - Find files smaller than specified size
+
+**Supported size units:**
+- Decimal: B, KB, MB, GB, TB, PB
+- Binary: KiB, MiB, GiB, TiB, PiB
+
+**Examples:** `100MB`, `1.5GiB`, `500` (bytes), `10KB`
+
+**Note:** You cannot use both `--greater-than` and `--smaller-than` together.
 
 ### Owner Filter Options
 - `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)

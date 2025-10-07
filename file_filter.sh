@@ -21,6 +21,8 @@ OWNERS=()
 OWNER_TYPE=""
 EXPAND_IDENTITY=false
 ALL_ATTRIBUTES=false
+GREATER_THAN=""
+SMALLER_THAN=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -106,6 +108,14 @@ while [[ $# -gt 0 ]]; do
             ALL_ATTRIBUTES=true
             shift
             ;;
+        --greater-than)
+            GREATER_THAN="$2"
+            shift 2
+            ;;
+        --smaller-than)
+            SMALLER_THAN="$2"
+            shift 2
+            ;;
         --help|-h)
             cat << 'EOF'
 Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
@@ -125,6 +135,12 @@ Time Field Options (default: --created):
   --accessed                 Filter by last access time
   --modified                 Filter by last modification time
   --changed                  Filter by last metadata change time
+
+Size Filter Options (optional):
+  --greater-than <size>      Find files greater than specified size
+  --smaller-than <size>      Find files smaller than specified size
+                             Supported units: B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB
+                             Examples: 100MB, 1.5GiB, 500, 10KB
 
 Owner Filter Options:
   --owner <name>             Filter by file owner (can be specified multiple times for OR logic)
@@ -176,6 +192,12 @@ Examples:
 
   # Output all file attributes in JSON format
   filter_old_files.sh --path /home --older-than 30 --json --all-attributes
+
+  # Find files larger than 100MB
+  filter_old_files.sh --path /home --greater-than 100MB
+
+  # Find files smaller than 1GiB and older than 30 days
+  filter_old_files.sh --path /home --smaller-than 1GiB --older-than 30
 EOF
             exit 0
             ;;
@@ -200,6 +222,11 @@ fi
 if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
     echo "Error: cannot use both --older-than and --newer-than" >&2
     echo "Usage: $0 --path <path> [--older-than <days> | --newer-than <days>] [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs \"pattern1 pattern2\"] [--json | --json-out <file>] [--verbose]" >&2
+    exit 1
+fi
+
+if [ -n "$GREATER_THAN" ] && [ -n "$SMALLER_THAN" ]; then
+    echo "Error: cannot use both --greater-than and --smaller-than" >&2
     exit 1
 fi
 
@@ -237,6 +264,67 @@ if [ ${#OWNERS[@]} -gt 0 ] && [ -z "$OWNER_TYPE" ]; then
         echo "[INFO] No owner type specified, will auto-detect" >&2
     fi
     OWNER_TYPE="auto"
+fi
+
+# Function to parse size with units to bytes (must be defined before use)
+parse_size_to_bytes() {
+    local size_str="$1"
+    local size_num=""
+    local size_unit=""
+
+    # Extract number and unit using regex
+    if [[ "$size_str" =~ ^([0-9]+\.?[0-9]*)([A-Za-z]*)$ ]]; then
+        size_num="${BASH_REMATCH[1]}"
+        size_unit="${BASH_REMATCH[2]}"
+    else
+        echo "Error: Invalid size format '$size_str'" >&2
+        echo "Expected format: <number>[unit] (e.g., 100MB, 1.5GiB, 500)" >&2
+        exit 1
+    fi
+
+    # Convert to bytes based on unit (case insensitive)
+    # Use Python for calculations to avoid bc dependency and handle large numbers
+    local bytes=""
+    bytes=$(python3 -c "
+size_num = float('$size_num')
+unit = '${size_unit,,}'
+
+multipliers = {
+    '': 1, 'b': 1,
+    'kb': 1000, 'mb': 1000000, 'gb': 1000000000, 'tb': 1000000000000, 'pb': 1000000000000000,
+    'kib': 1024, 'mib': 1048576, 'gib': 1073741824, 'tib': 1099511627776, 'pib': 1125899906842624
+}
+
+if unit in multipliers:
+    print(int(size_num * multipliers[unit]))
+else:
+    import sys
+    sys.exit(1)
+" 2>/dev/null)
+
+    if [ $? -ne 0 ] || [ -z "$bytes" ]; then
+        echo "Error: Unknown size unit '$size_unit'" >&2
+        echo "Supported units: B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB" >&2
+        exit 1
+    fi
+
+    echo "$bytes"
+}
+
+# Parse size filters (if specified) - moved here to be right after function definition
+SIZE_GREATER_BYTES=""
+SIZE_SMALLER_BYTES=""
+if [ -n "$GREATER_THAN" ]; then
+    SIZE_GREATER_BYTES=$(parse_size_to_bytes "$GREATER_THAN")
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Size filter: greater than $SIZE_GREATER_BYTES bytes ($GREATER_THAN)" >&2
+    fi
+fi
+if [ -n "$SMALLER_THAN" ]; then
+    SIZE_SMALLER_BYTES=$(parse_size_to_bytes "$SMALLER_THAN")
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Size filter: smaller than $SIZE_SMALLER_BYTES bytes ($SMALLER_THAN)" >&2
+    fi
 fi
 
 # Calculate the timestamp threshold (if time filter is specified)
@@ -544,6 +632,9 @@ output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
 owner_auth_id = '$ALL_OWNER_AUTH_IDS'
 all_attributes = '${ALL_ATTRIBUTES}' == 'true'
+size_greater = '$SIZE_GREATER_BYTES'
+size_smaller = '$SIZE_SMALLER_BYTES'
+verbose = '${VERBOSE}' == 'true'
 
 # Calculate threshold_str only if threshold is provided
 threshold_str = ''
@@ -570,6 +661,27 @@ def matches_owner(file_owner):
     owner_ids = owner_auth_id.split()
     return file_owner in owner_ids
 
+def matches_size(file_size):
+    # If no size filter specified, match everything
+    if not size_greater and not size_smaller:
+        return True
+
+    # Handle missing file_size
+    if not file_size:
+        return False
+
+    # Convert file_size to int for comparison
+    try:
+        size_bytes = int(file_size)
+    except (ValueError, TypeError):
+        return False
+
+    if size_greater:
+        return size_bytes > int(size_greater)
+    elif size_smaller:
+        return size_bytes < int(size_smaller)
+    return True
+
 json_out_file = '$JSON_OUT_FILE'
 json_file_handle = None
 if json_out_file:
@@ -592,21 +704,32 @@ for line in sys.stdin:
             # Check if we have minimum required data (path, and time_field if time filter is used)
             has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
             if has_required_data:
-                if matches_filter(current_obj.get(time_field)) and matches_owner(current_obj.get('owner')):
+                # AND logic: all specified filters must match
+                time_match = matches_filter(current_obj.get(time_field))
+                owner_match = matches_owner(current_obj.get('owner'))
+                size_match = matches_size(current_obj.get('size'))
+
+                if time_match and owner_match and size_match:
                     if output_json:
                         if all_attributes:
                             # Include all attributes
                             output = json.dumps(current_obj)
                         else:
-                            # Only include path and the selected time field (if filtering by time)
+                            # Include path and any fields used in filtering
+                            filtered_obj = {'path': current_obj['path']}
+
+                            # Add time field if time filter was used
                             if comparison and time_field in current_obj:
-                                filtered_obj = {
-                                    'path': current_obj['path'],
-                                    time_field: current_obj[time_field]
-                                }
-                            else:
-                                # No time filter, just output path
-                                filtered_obj = {'path': current_obj['path']}
+                                filtered_obj[time_field] = current_obj[time_field]
+
+                            # Add owner if owner filter was used
+                            if owner_auth_id and 'owner' in current_obj:
+                                filtered_obj['owner'] = current_obj['owner']
+
+                            # Add size if size filter was used
+                            if (size_greater or size_smaller) and 'size' in current_obj:
+                                filtered_obj['size'] = current_obj['size']
+
                             output = json.dumps(filtered_obj)
                         if json_file_handle:
                             json_file_handle.write(output + '\n')
@@ -625,28 +748,39 @@ for line in sys.stdin:
         # Collect all attributes if --all-attributes, otherwise just what we need
         if all_attributes:
             current_obj[key] = val
-        elif key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner'):
+        elif key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner', 'size'):
             current_obj[key] = val
 
 # Process final object
 # Check if we have minimum required data (path, and time_field if time filter is used)
 has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
 if has_required_data:
-    if matches_filter(current_obj.get(time_field)) and matches_owner(current_obj.get('owner')):
+    # AND logic: all specified filters must match
+    time_match = matches_filter(current_obj.get(time_field))
+    owner_match = matches_owner(current_obj.get('owner'))
+    size_match = matches_size(current_obj.get('size'))
+
+    if time_match and owner_match and size_match:
         if output_json:
             if all_attributes:
                 # Include all attributes
                 output = json.dumps(current_obj)
             else:
-                # Only include path and the selected time field (if filtering by time)
+                # Include path and any fields used in filtering
+                filtered_obj = {'path': current_obj['path']}
+
+                # Add time field if time filter was used
                 if comparison and time_field in current_obj:
-                    filtered_obj = {
-                        'path': current_obj['path'],
-                        time_field: current_obj[time_field]
-                    }
-                else:
-                    # No time filter, just output path
-                    filtered_obj = {'path': current_obj['path']}
+                    filtered_obj[time_field] = current_obj[time_field]
+
+                # Add owner if owner filter was used
+                if owner_auth_id and 'owner' in current_obj:
+                    filtered_obj['owner'] = current_obj['owner']
+
+                # Add size if size filter was used
+                if (size_greater or size_smaller) and 'size' in current_obj:
+                    filtered_obj['size'] = current_obj['size']
+
                 output = json.dumps(filtered_obj)
             if json_file_handle:
                 json_file_handle.write(output + '\n')
