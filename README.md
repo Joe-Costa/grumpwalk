@@ -1,6 +1,6 @@
 # Qumulo File Filter
 
-A memory-efficient streaming utility for filtering files on Qumulo storage systems by timestamps, size and ownership. This tool uses `jq` streaming to process large directory trees without running out of memory.
+A memory-efficient streaming utility for filtering files on Qumulo storage systems by timestamps, size and ownership. This tool uses `jq` streaming to process large directory trees efficiently, even via remote `qq` CLI
 
 **Two versions available:**
 - `file_filter.sh` - For Linux/GNU systems (uses GNU date)
