@@ -122,6 +122,15 @@ chmod +x file_filter.sh
   --greater-than 1GB --smaller-than 10GB
 ```
 
+**Complex multi-field query (accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago):**
+```bash
+./file_filter.sh --path /home \
+  --accessed-newer-than 10 --accessed-older-than 30 \
+  --modified-newer-than 20 --modified-older-than 22 \
+  --created-older-than 100 \
+  --owner joe
+```
+
 ## Options
 
 ### Required Arguments
@@ -135,11 +144,23 @@ chmod +x file_filter.sh
 
 **Note:** If neither time filter is specified, all files will be returned (filtered only by owner/size if specified).
 
-### Time Field Options (default: --created)
+### Time Field Options (for use with --older-than/--newer-than)
 - `--created` - Filter by creation time (default)
 - `--accessed` - Filter by last access time
 - `--modified` - Filter by last modification time
 - `--changed` - Filter by last metadata change time
+
+### Field-Specific Time Filters (for complex multi-field queries)
+- `--accessed-older-than <days>` - Files accessed older than N days
+- `--accessed-newer-than <days>` - Files accessed newer than N days
+- `--modified-older-than <days>` - Files modified older than N days
+- `--modified-newer-than <days>` - Files modified newer than N days
+- `--created-older-than <days>` - Files created older than N days
+- `--created-newer-than <days>` - Files created newer than N days
+- `--changed-older-than <days>` - Files with metadata changed older than N days
+- `--changed-newer-than <days>` - Files with metadata changed newer than N days
+
+**Note:** All field-specific filters use AND logic. This allows complex queries like "files accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago".
 
 ### Size Filter Options (optional)
 - `--greater-than <size>` - Find files greater than specified size

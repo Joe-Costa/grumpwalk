@@ -24,6 +24,16 @@ ALL_ATTRIBUTES=false
 GREATER_THAN=""
 SMALLER_THAN=""
 
+# Field-specific time filters
+ACCESSED_OLDER_THAN=""
+ACCESSED_NEWER_THAN=""
+MODIFIED_OLDER_THAN=""
+MODIFIED_NEWER_THAN=""
+CREATED_OLDER_THAN=""
+CREATED_NEWER_THAN=""
+CHANGED_OLDER_THAN=""
+CHANGED_NEWER_THAN=""
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -84,6 +94,38 @@ while [[ $# -gt 0 ]]; do
             TIME_FIELD="change_time"
             shift
             ;;
+        --accessed-older-than)
+            ACCESSED_OLDER_THAN="$2"
+            shift 2
+            ;;
+        --accessed-newer-than)
+            ACCESSED_NEWER_THAN="$2"
+            shift 2
+            ;;
+        --modified-older-than)
+            MODIFIED_OLDER_THAN="$2"
+            shift 2
+            ;;
+        --modified-newer-than)
+            MODIFIED_NEWER_THAN="$2"
+            shift 2
+            ;;
+        --created-older-than)
+            CREATED_OLDER_THAN="$2"
+            shift 2
+            ;;
+        --created-newer-than)
+            CREATED_NEWER_THAN="$2"
+            shift 2
+            ;;
+        --changed-older-than)
+            CHANGED_OLDER_THAN="$2"
+            shift 2
+            ;;
+        --changed-newer-than)
+            CHANGED_NEWER_THAN="$2"
+            shift 2
+            ;;
         --owner)
             OWNERS+=("$2")
             shift 2
@@ -127,16 +169,26 @@ Required Arguments:
   --path <path>              Path to search
 
 Time Filter Options (optional):
-  --older-than <days>        Find files older than N days
-  --newer-than <days>        Find files newer than N days
+  --older-than <days>        Find files older than N days (uses field selected by --accessed/--modified/etc.)
+  --newer-than <days>        Find files newer than N days (uses field selected by --accessed/--modified/etc.)
                              Both can be used together for time range filtering
-                             (files between newer-than and older-than days old)
 
-Time Field Options (default: --created):
+Time Field Options (for use with --older-than/--newer-than):
   --created                  Filter by creation time (default)
   --accessed                 Filter by last access time
   --modified                 Filter by last modification time
   --changed                  Filter by last metadata change time
+
+Field-Specific Time Filters (for complex multi-field queries):
+  --accessed-older-than <days>    Files accessed older than N days
+  --accessed-newer-than <days>    Files accessed newer than N days
+  --modified-older-than <days>    Files modified older than N days
+  --modified-newer-than <days>    Files modified newer than N days
+  --created-older-than <days>     Files created older than N days
+  --created-newer-than <days>     Files created newer than N days
+  --changed-older-than <days>     Files with metadata changed older than N days
+  --changed-newer-than <days>     Files with metadata changed newer than N days
+                                  All field-specific filters use AND logic
 
 Size Filter Options (optional):
   --greater-than <size>      Find files greater than specified size
@@ -210,6 +262,10 @@ Examples:
 
   # Find files in both time and size range
   filter_old_files.sh --path /home --newer-than 30 --older-than 90 --greater-than 1GB --smaller-than 10GB
+
+  # Complex multi-field query: accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago
+  filter_old_files.sh --path /home --accessed-newer-than 10 --accessed-older-than 30 \
+    --modified-newer-than 20 --modified-older-than 22 --created-older-than 100 --owner joe
 EOF
             exit 0
             ;;
@@ -339,7 +395,7 @@ if [ -n "$SMALLER_THAN" ]; then
     fi
 fi
 
-# Calculate the timestamp threshold(s) (if time filter is specified)
+# Calculate the timestamp threshold(s) for legacy flags (backward compatibility)
 threshold_older=""
 threshold_newer=""
 comparison=""
@@ -355,6 +411,41 @@ elif [ -n "$OLDER_THAN" ]; then
 elif [ -n "$NEWER_THAN" ]; then
     threshold_newer=$(date -u +%s -d "$NEWER_THAN days ago")
     comparison="newer"
+fi
+
+# Calculate thresholds for field-specific time filters
+ACCESSED_THRESHOLD_OLDER=""
+ACCESSED_THRESHOLD_NEWER=""
+MODIFIED_THRESHOLD_OLDER=""
+MODIFIED_THRESHOLD_NEWER=""
+CREATED_THRESHOLD_OLDER=""
+CREATED_THRESHOLD_NEWER=""
+CHANGED_THRESHOLD_OLDER=""
+CHANGED_THRESHOLD_NEWER=""
+
+if [ -n "$ACCESSED_OLDER_THAN" ]; then
+    ACCESSED_THRESHOLD_OLDER=$(date -u +%s -d "$ACCESSED_OLDER_THAN days ago")
+fi
+if [ -n "$ACCESSED_NEWER_THAN" ]; then
+    ACCESSED_THRESHOLD_NEWER=$(date -u +%s -d "$ACCESSED_NEWER_THAN days ago")
+fi
+if [ -n "$MODIFIED_OLDER_THAN" ]; then
+    MODIFIED_THRESHOLD_OLDER=$(date -u +%s -d "$MODIFIED_OLDER_THAN days ago")
+fi
+if [ -n "$MODIFIED_NEWER_THAN" ]; then
+    MODIFIED_THRESHOLD_NEWER=$(date -u +%s -d "$MODIFIED_NEWER_THAN days ago")
+fi
+if [ -n "$CREATED_OLDER_THAN" ]; then
+    CREATED_THRESHOLD_OLDER=$(date -u +%s -d "$CREATED_OLDER_THAN days ago")
+fi
+if [ -n "$CREATED_NEWER_THAN" ]; then
+    CREATED_THRESHOLD_NEWER=$(date -u +%s -d "$CREATED_NEWER_THAN days ago")
+fi
+if [ -n "$CHANGED_OLDER_THAN" ]; then
+    CHANGED_THRESHOLD_OLDER=$(date -u +%s -d "$CHANGED_OLDER_THAN days ago")
+fi
+if [ -n "$CHANGED_NEWER_THAN" ]; then
+    CHANGED_THRESHOLD_NEWER=$(date -u +%s -d "$CHANGED_NEWER_THAN days ago")
 fi
 
 # Function to resolve a single owner to auth_id(s)
@@ -656,7 +747,17 @@ size_greater = '$SIZE_GREATER_BYTES'
 size_smaller = '$SIZE_SMALLER_BYTES'
 verbose = '${VERBOSE}' == 'true'
 
-# Calculate threshold_str values only if thresholds are provided
+# Field-specific thresholds
+accessed_threshold_older = '$ACCESSED_THRESHOLD_OLDER'
+accessed_threshold_newer = '$ACCESSED_THRESHOLD_NEWER'
+modified_threshold_older = '$MODIFIED_THRESHOLD_OLDER'
+modified_threshold_newer = '$MODIFIED_THRESHOLD_NEWER'
+created_threshold_older = '$CREATED_THRESHOLD_OLDER'
+created_threshold_newer = '$CREATED_THRESHOLD_NEWER'
+changed_threshold_older = '$CHANGED_THRESHOLD_OLDER'
+changed_threshold_newer = '$CHANGED_THRESHOLD_NEWER'
+
+# Calculate threshold_str values only if thresholds are provided (legacy)
 threshold_older_str = ''
 threshold_newer_str = ''
 if threshold_older:
@@ -664,23 +765,104 @@ if threshold_older:
 if threshold_newer:
     threshold_newer_str = datetime.utcfromtimestamp(int(threshold_newer)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
 
+# Convert field-specific thresholds to timestamp strings
+def to_timestamp_str(ts):
+    if ts:
+        return datetime.utcfromtimestamp(int(ts)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
+    return ''
+
+accessed_older_str = to_timestamp_str(accessed_threshold_older)
+accessed_newer_str = to_timestamp_str(accessed_threshold_newer)
+modified_older_str = to_timestamp_str(modified_threshold_older)
+modified_newer_str = to_timestamp_str(modified_threshold_newer)
+created_older_str = to_timestamp_str(created_threshold_older)
+created_newer_str = to_timestamp_str(created_threshold_newer)
+changed_older_str = to_timestamp_str(changed_threshold_older)
+changed_newer_str = to_timestamp_str(changed_threshold_newer)
+
 current_obj = {}
 current_idx = None
 
 def matches_filter(time_value):
-    # If no time filter specified, match everything
+    # Legacy time filter (for backward compatibility with --older-than/--newer-than + --accessed/--modified etc.)
     if not comparison:
         return True
 
     if comparison == 'range':
-        # Range: file must be newer than older_threshold AND older than newer_threshold
-        # (between newer_days and older_days old)
-        # Older timestamps = smaller values, so: time > older AND time < newer
         return time_value > threshold_older_str and time_value < threshold_newer_str
     elif comparison == 'older':
         return time_value < threshold_older_str
     elif comparison == 'newer':
         return time_value > threshold_newer_str
+
+    return True
+
+def matches_field_specific_time_filters(obj):
+    # Check field-specific time filters (all must match - AND logic)
+
+    # Access time filter
+    if accessed_older_str or accessed_newer_str:
+        access_time = obj.get('access_time')
+        if not access_time:
+            return False
+        if accessed_older_str and accessed_newer_str:
+            # Range
+            if not (access_time > accessed_older_str and access_time < accessed_newer_str):
+                return False
+        elif accessed_older_str:
+            if not access_time < accessed_older_str:
+                return False
+        elif accessed_newer_str:
+            if not access_time > accessed_newer_str:
+                return False
+
+    # Modification time filter
+    if modified_older_str or modified_newer_str:
+        modification_time = obj.get('modification_time')
+        if not modification_time:
+            return False
+        if modified_older_str and modified_newer_str:
+            # Range
+            if not (modification_time > modified_older_str and modification_time < modified_newer_str):
+                return False
+        elif modified_older_str:
+            if not modification_time < modified_older_str:
+                return False
+        elif modified_newer_str:
+            if not modification_time > modified_newer_str:
+                return False
+
+    # Creation time filter
+    if created_older_str or created_newer_str:
+        creation_time = obj.get('creation_time')
+        if not creation_time:
+            return False
+        if created_older_str and created_newer_str:
+            # Range
+            if not (creation_time > created_older_str and creation_time < created_newer_str):
+                return False
+        elif created_older_str:
+            if not creation_time < created_older_str:
+                return False
+        elif created_newer_str:
+            if not creation_time > created_newer_str:
+                return False
+
+    # Change time filter
+    if changed_older_str or changed_newer_str:
+        change_time = obj.get('change_time')
+        if not change_time:
+            return False
+        if changed_older_str and changed_newer_str:
+            # Range
+            if not (change_time > changed_older_str and change_time < changed_newer_str):
+                return False
+        elif changed_older_str:
+            if not change_time < changed_older_str:
+                return False
+        elif changed_newer_str:
+            if not change_time > changed_newer_str:
+                return False
 
     return True
 
@@ -741,10 +923,11 @@ for line in sys.stdin:
             if has_required_data:
                 # AND logic: all specified filters must match
                 time_match = matches_filter(current_obj.get(time_field))
+                field_time_match = matches_field_specific_time_filters(current_obj)
                 owner_match = matches_owner(current_obj.get('owner'))
                 size_match = matches_size(current_obj.get('size'))
 
-                if time_match and owner_match and size_match:
+                if time_match and field_time_match and owner_match and size_match:
                     if output_json:
                         if all_attributes:
                             # Include all attributes
@@ -792,10 +975,11 @@ has_required_data = current_obj.get('path') and (not comparison or current_obj.g
 if has_required_data:
     # AND logic: all specified filters must match
     time_match = matches_filter(current_obj.get(time_field))
+    field_time_match = matches_field_specific_time_filters(current_obj)
     owner_match = matches_owner(current_obj.get('owner'))
     size_match = matches_size(current_obj.get('size'))
 
-    if time_match and owner_match and size_match:
+    if time_match and field_time_match and owner_match and size_match:
         if output_json:
             if all_attributes:
                 # Include all attributes
