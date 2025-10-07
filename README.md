@@ -121,7 +121,7 @@ The `--expand-identity` flag leverages Qumulo's `qq auth_expand_identity` to fin
 
 This will match files owned by:
 - joe's AD identity (SID-based)
-- joe's NFS UID (e.g., 2111)
+- joe's NFS UID (e.g., 3030)
 - Any other equivalent identity
 
 ## How It Works
