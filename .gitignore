@@ -1,0 +1,6 @@
+directives.txt
+# Ignore Mac system files
+.DS_Store
+nostream.json
+stream.json
+scrap.txt
