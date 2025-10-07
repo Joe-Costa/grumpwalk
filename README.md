@@ -65,6 +65,12 @@ chmod +x file_filter.sh
   --owner jdoe --expand-identity
 ```
 
+**Find files owned by multiple users (OR logic):**
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --owner jdoe --owner jane --owner bob --ad
+```
+
 **Find recently modified files with depth limit:**
 ```bash
 ./file_filter.sh --path /data --newer-than 1 \
@@ -85,11 +91,13 @@ chmod +x file_filter.sh
 - `--changed` - Filter by last metadata change time
 
 ### Owner Filter Options
-- `--owner <name>` - Filter by file owner (auto-detects if no type specified)
-- `--ad` - Owner is Active Directory user
-- `--local` - Owner is local user
-- `--uid` - Owner is specified as UID number
+- `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)
+- `--ad` - Owner(s) are Active Directory users
+- `--local` - Owner(s) are local users
+- `--uid` - Owner(s) are specified as UID numbers
 - `--expand-identity` - Match all equivalent identities (e.g., AD user + NFS UID)
+
+**Note:** You cannot mix `--uid` with `--ad` or `--local` for simplicity. All owners must be of the same type.
 
 ### Search Options
 - `--max-depth <N>` - Maximum directory depth to search (default: unlimited)
@@ -123,6 +131,36 @@ This will match files owned by:
 - joe's AD identity (SID-based)
 - joe's NFS UID (e.g., 3030)
 - Any other equivalent identity
+
+## Multiple Owner Filtering
+
+You can specify multiple `--owner` flags to filter files owned by any of the specified users (OR logic):
+
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --owner joe --owner jane --owner bob --ad --verbose
+```
+
+**Verbose output example:**
+```
+[INFO] Resolving 3 owner(s)...
+[INFO] Resolving owner identity: joe (type: ad)
+[INFO] Resolved owner auth_id: 25769805128
+[INFO] Resolving owner identity: jane (type: ad)
+[INFO] Resolved owner auth_id: 25769805129
+[INFO] Resolving owner identity: bob (type: ad)
+[INFO] Resolved owner auth_id: 25769805130
+[INFO] Final auth_id list (OR filter): 25769805128 25769805129 25769805130
+```
+
+When combined with `--expand-identity`, each owner's equivalent identities are also included:
+
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --owner joe --owner jane --expand-identity --verbose
+```
+
+This will match files owned by joe OR jane, including all their equivalent identities (AD, NFS UID, etc.).
 
 ## How It Works
 

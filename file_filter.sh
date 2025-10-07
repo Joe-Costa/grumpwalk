@@ -17,7 +17,7 @@ OMIT_SUBDIRS=""
 VERBOSE=false
 JSON_OUT_FILE=""
 TIME_FIELD="creation_time"
-OWNER=""
+OWNERS=()
 OWNER_TYPE=""
 EXPAND_IDENTITY=false
 
@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --owner)
-            OWNER="$2"
+            OWNERS+=("$2")
             shift 2
             ;;
         --ad)
@@ -120,11 +120,12 @@ Time Field Options (default: --created):
   --changed                  Filter by last metadata change time
 
 Owner Filter Options:
-  --owner <name>             Filter by file owner (auto-detects if no type specified)
-  --ad                       Owner is Active Directory user
-  --local                    Owner is local user
-  --uid                      Owner is specified as UID number
+  --owner <name>             Filter by file owner (can be specified multiple times for OR logic)
+  --ad                       Owner(s) are Active Directory users
+  --local                    Owner(s) are local users
+  --uid                      Owner(s) are specified as UID numbers
   --expand-identity          Match all equivalent identities (e.g., AD user + NFS UID)
+                             Note: Cannot mix --uid with --ad or --local
 
 Search Options:
   --max-depth <N>            Maximum directory depth to search
@@ -153,11 +154,17 @@ Examples:
   # Find files owned by a specific user
   filter_old_files.sh --path /home --older-than 30 --owner jdoe --ad
 
-  # Find files owned by a specific UID
-  filter_old_files.sh --path /home --older-than 90 --owner 1001 --uid
+  # Find files owned by multiple users (OR logic)
+  filter_old_files.sh --path /home --older-than 30 --owner jdoe --owner jane --ad
+
+  # Find files owned by specific UIDs
+  filter_old_files.sh --path /home --older-than 90 --owner 1001 --owner 1002 --uid
 
   # Find files with identity expansion (matches AD user and equivalent NFS UID)
   filter_old_files.sh --path /home --older-than 30 --owner joe --expand-identity
+
+  # Find files owned by multiple users with identity expansion
+  filter_old_files.sh --path /home --older-than 30 --owner joe --owner jane --expand-identity
 EOF
             exit 0
             ;;
@@ -201,14 +208,27 @@ if [ "$VERBOSE" = true ] && [ "$OUTPUT_JSON" = true ] && [ -z "$JSON_OUT_FILE" ]
 fi
 
 # Validate owner filter options
-if [ -z "$OWNER" ] && [ -n "$OWNER_TYPE" ]; then
+if [ ${#OWNERS[@]} -eq 0 ] && [ -n "$OWNER_TYPE" ]; then
     echo "Error: Owner type flag (--ad, --local, --uid) requires --owner" >&2
     echo "Example: $0 --path /home --older-than 30 --owner jdoe --ad" >&2
     exit 1
 fi
 
+# Validate that --uid is not mixed with --ad or --local
+if [ "$OWNER_TYPE" = "uid" ] && [ ${#OWNERS[@]} -gt 0 ]; then
+    # Check if any owner looks like it might be a name (for clarity in error message)
+    # We'll prevent mixing types for simplicity
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Using --uid for all owners" >&2
+    fi
+elif [ "$OWNER_TYPE" = "ad" ] || [ "$OWNER_TYPE" = "local" ]; then
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Using --$OWNER_TYPE for all owners" >&2
+    fi
+fi
+
 # If owner specified without type, use auto-detection
-if [ -n "$OWNER" ] && [ -z "$OWNER_TYPE" ]; then
+if [ ${#OWNERS[@]} -gt 0 ] && [ -z "$OWNER_TYPE" ]; then
     if [ "$VERBOSE" = true ]; then
         echo "[INFO] No owner type specified, will auto-detect" >&2
     fi
@@ -224,44 +244,65 @@ else
     comparison="newer"
 fi
 
-# Resolve owner to auth_id if owner filter is specified
-OWNER_AUTH_ID=""
-if [ -n "$OWNER" ]; then
-    if [ "$VERBOSE" = true ]; then
-        echo "[INFO] Resolving owner identity: $OWNER (type: $OWNER_TYPE)" >&2
+# Function to resolve a single owner to auth_id(s)
+resolve_owner_identity() {
+    local owner="$1"
+    local owner_type="$2"
+    local expand_identity="$3"
+    local verbose="$4"
+
+    if [ "$verbose" = true ]; then
+        echo "[INFO] Resolving owner identity: $owner (type: $owner_type)" >&2
     fi
 
+    local AUTH_RESULT=""
+    local OWNER_AUTH_ID=""
+
     # Capture both stdout and error information
-    case "$OWNER_TYPE" in
+    case "$owner_type" in
         ad)
-            AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --domain ACTIVE_DIRECTORY --json 2>&1)
+            AUTH_RESULT=$(qq auth_find_identity --name "$owner" --domain ACTIVE_DIRECTORY --json 2>&1)
             ;;
         local)
-            AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --domain LOCAL --json 2>&1)
+            AUTH_RESULT=$(qq auth_find_identity --name "$owner" --domain LOCAL --json 2>&1)
             ;;
         uid)
-            AUTH_RESULT=$(qq auth_find_identity --uid "$OWNER" --json 2>&1)
+            AUTH_RESULT=$(qq auth_find_identity --uid "$owner" --json 2>&1)
             ;;
         auto)
-            # Try generic lookup first
-            if [ "$VERBOSE" = true ]; then
-                echo "[INFO] Trying generic lookup for '$OWNER'..." >&2
-            fi
-            AUTH_RESULT=$(qq auth_find_identity "$OWNER" --json 2>&1)
-
-            # If generic lookup failed, try with --name flag which supports various AD formats
-            TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
-            if [ -z "$TEMP_AUTH_ID" ]; then
-                if [ "$VERBOSE" = true ]; then
-                    echo "[INFO] Generic lookup failed, trying --name lookup..." >&2
+            # Check if owner is numeric (UID)
+            if [[ "$owner" =~ ^[0-9]+$ ]]; then
+                if [ "$verbose" = true ]; then
+                    echo "[INFO] Owner appears to be numeric, trying UID lookup for '$owner'..." >&2
                 fi
-                AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --json 2>&1)
-            fi
+                AUTH_RESULT=$(qq auth_find_identity --uid "$owner" --json 2>&1)
+                TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+                if [ -n "$TEMP_AUTH_ID" ]; then
+                    if [ "$verbose" = true ]; then
+                        echo "[INFO] Auto-detected owner type: UID" >&2
+                    fi
+                fi
+            else
+                # Try generic lookup first for non-numeric names
+                if [ "$verbose" = true ]; then
+                    echo "[INFO] Trying generic lookup for '$owner'..." >&2
+                fi
+                AUTH_RESULT=$(qq auth_find_identity "$owner" --json 2>&1)
 
-            if [ "$VERBOSE" = true ]; then
-                DETECTED_TYPE=$(echo "$AUTH_RESULT" | jq -r '.id_type // empty' 2>/dev/null)
-                if [ -n "$DETECTED_TYPE" ]; then
-                    echo "[INFO] Auto-detected owner type: $DETECTED_TYPE" >&2
+                # If generic lookup failed, try with --name flag which supports various AD formats
+                TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+                if [ -z "$TEMP_AUTH_ID" ]; then
+                    if [ "$verbose" = true ]; then
+                        echo "[INFO] Generic lookup failed, trying --name lookup..." >&2
+                    fi
+                    AUTH_RESULT=$(qq auth_find_identity --name "$owner" --json 2>&1)
+                fi
+
+                if [ "$verbose" = true ]; then
+                    DETECTED_TYPE=$(echo "$AUTH_RESULT" | jq -r '.id_type // empty' 2>/dev/null)
+                    if [ -n "$DETECTED_TYPE" ]; then
+                        echo "[INFO] Auto-detected owner type: $DETECTED_TYPE" >&2
+                    fi
                 fi
             fi
             ;;
@@ -271,13 +312,13 @@ if [ -n "$OWNER" ]; then
     OWNER_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
 
     if [ -z "$OWNER_AUTH_ID" ]; then
-        echo "Error: Could not resolve owner identity for '$OWNER' (type: $OWNER_TYPE)" >&2
+        echo "Error: Could not resolve owner identity for '$owner' (type: $owner_type)" >&2
 
         # Try to find the user with different methods to provide helpful suggestions
         echo "[INFO] Attempting alternative lookups..." >&2
 
         # Try positional argument
-        GENERIC_RESULT=$(qq auth_find_identity "$OWNER" 2>&1)
+        GENERIC_RESULT=$(qq auth_find_identity "$owner" 2>&1)
         GENERIC_AUTH_ID=$(echo "$GENERIC_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
 
         if [ -n "$GENERIC_AUTH_ID" ]; then
@@ -294,8 +335,8 @@ if [ -n "$OWNER" ]; then
             OWNER_AUTH_ID="$GENERIC_AUTH_ID"
         else
             # Try one more time with --name and various formats
-            for try_name in "$OWNER" "ad:$OWNER" "local:$OWNER"; do
-                if [ "$VERBOSE" = true ]; then
+            for try_name in "$owner" "ad:$owner" "local:$owner"; do
+                if [ "$verbose" = true ]; then
                     echo "[INFO] Trying lookup with: $try_name" >&2
                 fi
                 TRY_RESULT=$(qq auth_find_identity --name "$try_name" --json 2>&1)
@@ -308,21 +349,21 @@ if [ -n "$OWNER" ]; then
             done
 
             if [ -z "$OWNER_AUTH_ID" ]; then
-                echo "User '$OWNER' not found in any domain" >&2
-                echo "Try running: qq auth_find_identity $OWNER" >&2
+                echo "User '$owner' not found in any domain" >&2
+                echo "Try running: qq auth_find_identity $owner" >&2
                 echo "Or: qq auth_find_identity --help" >&2
                 exit 1
             fi
         fi
     fi
 
-    if [ "$VERBOSE" = true ]; then
+    if [ "$verbose" = true ]; then
         echo "[INFO] Resolved owner auth_id: $OWNER_AUTH_ID" >&2
     fi
 
     # If expand-identity is enabled, get all equivalent auth_ids
-    if [ "$EXPAND_IDENTITY" = true ]; then
-        if [ "$VERBOSE" = true ]; then
+    if [ "$expand_identity" = true ]; then
+        if [ "$verbose" = true ]; then
             echo "[INFO] Expanding identity to find equivalent auth_ids..." >&2
         fi
 
@@ -339,21 +380,50 @@ if [ -n "$OWNER" ]; then
             ] | unique | .[]' 2>/dev/null | tr '\n' ' ')
 
             if [ -n "$EQUIVALENT_AUTH_IDS" ]; then
-                if [ "$VERBOSE" = true ]; then
+                if [ "$verbose" = true ]; then
                     echo "[INFO] Found equivalent auth_ids: $EQUIVALENT_AUTH_IDS" >&2
                 fi
-                # Store as comma-separated for Python
-                OWNER_AUTH_ID="$EQUIVALENT_AUTH_IDS"
+                # Return space-separated auth_ids
+                echo "$EQUIVALENT_AUTH_IDS"
+                return
             else
-                if [ "$VERBOSE" = true ]; then
+                if [ "$verbose" = true ]; then
                     echo "[WARN] Identity expansion returned no results, using original auth_id" >&2
                 fi
             fi
         else
-            if [ "$VERBOSE" = true ]; then
+            if [ "$verbose" = true ]; then
                 echo "[WARN] Could not expand identity, using original auth_id only" >&2
             fi
         fi
+    fi
+
+    # Return single auth_id
+    echo "$OWNER_AUTH_ID"
+}
+
+# Resolve all owners to auth_ids if owner filter is specified
+ALL_OWNER_AUTH_IDS=""
+if [ ${#OWNERS[@]} -gt 0 ]; then
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Resolving ${#OWNERS[@]} owner(s)..." >&2
+    fi
+
+    for OWNER in "${OWNERS[@]}"; do
+        RESOLVED_IDS=$(resolve_owner_identity "$OWNER" "$OWNER_TYPE" "$EXPAND_IDENTITY" "$VERBOSE")
+        # Append to the list of all auth_ids (space-separated)
+        if [ -n "$ALL_OWNER_AUTH_IDS" ]; then
+            ALL_OWNER_AUTH_IDS="$ALL_OWNER_AUTH_IDS $RESOLVED_IDS"
+        else
+            ALL_OWNER_AUTH_IDS="$RESOLVED_IDS"
+        fi
+    done
+
+    # Remove duplicates
+    ALL_OWNER_AUTH_IDS=$(echo "$ALL_OWNER_AUTH_IDS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Final auth_id list (OR filter): $ALL_OWNER_AUTH_IDS" >&2
     fi
 fi
 
@@ -467,7 +537,7 @@ threshold_str = datetime.utcfromtimestamp(threshold).strftime('%Y-%m-%dT%H:%M:%S
 comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
-owner_auth_id = '$OWNER_AUTH_ID'
+owner_auth_id = '$ALL_OWNER_AUTH_IDS'
 
 current_obj = {}
 current_idx = None
