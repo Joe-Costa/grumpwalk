@@ -5,11 +5,13 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 ## Features
 
 - **Memory-safe streaming**: Processes files one at a time using jq streaming, avoiding OOM issues on large directory trees
-- **Time-based filtering**: Filter by creation, access, modification, or change time
-- **Owner filtering**: Filter by file owner with support for AD users, local users, and UIDs
+- **File listing**: List all files in a directory tree with optional filtering
+- **Time-based filtering**: Optionally filter by creation, access, modification, or change time
+- **Owner filtering**: Filter by file owner with support for AD users, local users, and UIDs (supports multiple owners with OR logic)
 - **Identity expansion**: Automatically match equivalent identities (e.g., AD user + corresponding NFS UID)
 - **Selective directory omission**: Skip directories using wildcard patterns
 - **Flexible output**: Plain text or JSON output, with optional file output for verbose mode
+- **All attributes output**: Include all file metadata in JSON output when needed
 - **Real-time results**: Streaming architecture outputs results as they're found
 
 ## Requirements
@@ -37,10 +39,20 @@ chmod +x file_filter.sh
 ### Basic Syntax
 
 ```bash
-./file_filter.sh --path <path> (--older-than <days> | --newer-than <days>) [OPTIONS]
+./file_filter.sh --path <path> [--older-than <days> | --newer-than <days>] [OPTIONS]
 ```
 
 ### Common Examples
+
+**List all files in a directory:**
+```bash
+./file_filter.sh --path /home
+```
+
+**List all files owned by a specific user:**
+```bash
+./file_filter.sh --path /home --owner jdoe --ad
+```
 
 **Find files created more than 30 days ago:**
 ```bash
@@ -87,8 +99,12 @@ chmod +x file_filter.sh
 
 ### Required Arguments
 - `--path <path>` - Path to search
+
+### Time Filter Options (optional)
 - `--older-than <days>` - Find files older than N days
 - `--newer-than <days>` - Find files newer than N days
+
+**Note:** If neither `--older-than` nor `--newer-than` is specified, all files will be returned (filtered only by owner if specified).
 
 ### Time Field Options (default: --created)
 - `--created` - Filter by creation time (default)

@@ -111,10 +111,12 @@ while [[ $# -gt 0 ]]; do
 Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
 
 Usage:
-  filter_old_files.sh --path <path> (--older-than <days> | --newer-than <days>) [OPTIONS]
+  filter_old_files.sh --path <path> [--older-than <days> | --newer-than <days>] [OPTIONS]
 
 Required Arguments:
   --path <path>              Path to search
+
+Time Filter Options (optional):
   --older-than <days>        Find files older than N days
   --newer-than <days>        Find files newer than N days
 
@@ -145,6 +147,12 @@ Output Options:
   --all-attributes           Include all file attributes in JSON output (default: path + time field only)
 
 Examples:
+  # List all files in a path
+  filter_old_files.sh --path /home
+
+  # List all files owned by a specific user
+  filter_old_files.sh --path /home --owner jdoe --ad
+
   # Find files created more than 30 days ago
   filter_old_files.sh --path /home --older-than 30
 
@@ -157,9 +165,6 @@ Examples:
   # Find recently modified files with depth limit
   filter_old_files.sh --path /data --newer-than 1 --modified --max-depth 3
 
-  # Find files owned by a specific user
-  filter_old_files.sh --path /home --older-than 30 --owner jdoe --ad
-
   # Find files owned by multiple users (OR logic)
   filter_old_files.sh --path /home --older-than 30 --owner jdoe --owner jane --ad
 
@@ -168,9 +173,6 @@ Examples:
 
   # Find files with identity expansion (matches AD user and equivalent NFS UID)
   filter_old_files.sh --path /home --older-than 30 --owner joe --expand-identity
-
-  # Find files owned by multiple users with identity expansion
-  filter_old_files.sh --path /home --older-than 30 --owner joe --owner jane --expand-identity
 
   # Output all file attributes in JSON format
   filter_old_files.sh --path /home --older-than 30 --json --all-attributes
@@ -195,16 +197,9 @@ if [ -z "$PATH_TO_SEARCH" ]; then
     exit 1
 fi
 
-if [ -z "$OLDER_THAN" ] && [ -z "$NEWER_THAN" ]; then
-    echo "Error: either --older-than or --newer-than is required" >&2
-    echo "Usage: $0 --path <path> (--older-than <days> | --newer-than <days>) [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs \"pattern1 pattern2\"] [--json | --json-out <file>] [--verbose]" >&2
-    echo "Example: $0 --path /home --older-than 30 --accessed --max-depth 1 --file-only --omit-subdirs \"temp cache 100k*\" --json-out results.json --verbose" >&2
-    exit 1
-fi
-
 if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
     echo "Error: cannot use both --older-than and --newer-than" >&2
-    echo "Usage: $0 --path <path> (--older-than <days> | --newer-than <days>) [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs \"pattern1 pattern2\"] [--json | --json-out <file>] [--verbose]" >&2
+    echo "Usage: $0 --path <path> [--older-than <days> | --newer-than <days>] [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs \"pattern1 pattern2\"] [--json | --json-out <file>] [--verbose]" >&2
     exit 1
 fi
 
@@ -244,11 +239,13 @@ if [ ${#OWNERS[@]} -gt 0 ] && [ -z "$OWNER_TYPE" ]; then
     OWNER_TYPE="auto"
 fi
 
-# Calculate the timestamp threshold
+# Calculate the timestamp threshold (if time filter is specified)
+threshold=""
+comparison=""
 if [ -n "$OLDER_THAN" ]; then
     threshold=$(date -u +%s -d "$OLDER_THAN days ago")
     comparison="older"
-else
+elif [ -n "$NEWER_THAN" ]; then
     threshold=$(date -u +%s -d "$NEWER_THAN days ago")
     comparison="newer"
 fi
@@ -541,18 +538,25 @@ from datetime import datetime
 # Ensure unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 
-threshold = $threshold
-threshold_str = datetime.utcfromtimestamp(threshold).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
+threshold = '$threshold'
 comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
 owner_auth_id = '$ALL_OWNER_AUTH_IDS'
 all_attributes = '${ALL_ATTRIBUTES}' == 'true'
 
+# Calculate threshold_str only if threshold is provided
+threshold_str = ''
+if threshold:
+    threshold_str = datetime.utcfromtimestamp(int(threshold)).strftime('%Y-%m-%dT%H:%M:%S') + '.000000000Z'
+
 current_obj = {}
 current_idx = None
 
 def matches_filter(time_value):
+    # If no time filter specified, match everything
+    if not comparison or not threshold_str:
+        return True
     if comparison == 'older':
         return time_value < threshold_str
     else:  # newer
@@ -585,18 +589,24 @@ for line in sys.stdin:
         # New object detected
         if idx != current_idx:
             # Process previous object
-            if current_obj.get('path') and current_obj.get(time_field):
-                if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
+            # Check if we have minimum required data (path, and time_field if time filter is used)
+            has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
+            if has_required_data:
+                if matches_filter(current_obj.get(time_field)) and matches_owner(current_obj.get('owner')):
                     if output_json:
                         if all_attributes:
                             # Include all attributes
                             output = json.dumps(current_obj)
                         else:
-                            # Only include path and the selected time field
-                            filtered_obj = {
-                                'path': current_obj['path'],
-                                time_field: current_obj[time_field]
-                            }
+                            # Only include path and the selected time field (if filtering by time)
+                            if comparison and time_field in current_obj:
+                                filtered_obj = {
+                                    'path': current_obj['path'],
+                                    time_field: current_obj[time_field]
+                                }
+                            else:
+                                # No time filter, just output path
+                                filtered_obj = {'path': current_obj['path']}
                             output = json.dumps(filtered_obj)
                         if json_file_handle:
                             json_file_handle.write(output + '\n')
@@ -604,7 +614,8 @@ for line in sys.stdin:
                         else:
                             print(output)
                     else:
-                        print(current_obj[time_field])
+                        if comparison and time_field in current_obj:
+                            print(current_obj[time_field])
                         print(current_obj['path'])
 
             # Reset for new object
@@ -618,18 +629,24 @@ for line in sys.stdin:
             current_obj[key] = val
 
 # Process final object
-if current_obj.get('path') and current_obj.get(time_field):
-    if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
+# Check if we have minimum required data (path, and time_field if time filter is used)
+has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
+if has_required_data:
+    if matches_filter(current_obj.get(time_field)) and matches_owner(current_obj.get('owner')):
         if output_json:
             if all_attributes:
                 # Include all attributes
                 output = json.dumps(current_obj)
             else:
-                # Only include path and the selected time field
-                filtered_obj = {
-                    'path': current_obj['path'],
-                    time_field: current_obj[time_field]
-                }
+                # Only include path and the selected time field (if filtering by time)
+                if comparison and time_field in current_obj:
+                    filtered_obj = {
+                        'path': current_obj['path'],
+                        time_field: current_obj[time_field]
+                    }
+                else:
+                    # No time filter, just output path
+                    filtered_obj = {'path': current_obj['path']}
                 output = json.dumps(filtered_obj)
             if json_file_handle:
                 json_file_handle.write(output + '\n')
@@ -637,7 +654,8 @@ if current_obj.get('path') and current_obj.get(time_field):
             else:
                 print(output)
         else:
-            print(current_obj[time_field])
+            if comparison and time_field in current_obj:
+                print(current_obj[time_field])
             print(current_obj['path'])
 
 if json_file_handle:
