@@ -43,6 +43,14 @@ chmod +x file_filter.sh
 ./file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
 ```
 
+**Connect to specific Qumulo cluster: (For remote qq CLI use)**
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --host 10.1.1.100 --credentials-store ~/.qumulo_creds
+```
+
+*You may alternatively run `qq --host YOUR_QUMULO login -u YOUR_USER` in advance instead of using a `.qumulo_creds` file*
+
 ### Common Examples
 
 **List all files in a directory:**
@@ -129,12 +137,6 @@ chmod +x file_filter.sh
   --modified-newer-than 20 --modified-older-than 22 \
   --created-older-than 100 \
   --owner joe
-```
-
-**Connect to specific Qumulo cluster:**
-```bash
-./file_filter.sh --path /home --older-than 30 \
-  --host 10.1.1.100 --credentials-store ~/.qumulo_creds
 ```
 
 ## Options
