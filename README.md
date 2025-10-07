@@ -77,6 +77,12 @@ chmod +x file_filter.sh
   --modified --max-depth 3
 ```
 
+**Output all file attributes in JSON:**
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --json-out results.json --all-attributes
+```
+
 ## Options
 
 ### Required Arguments
@@ -109,6 +115,7 @@ chmod +x file_filter.sh
 - `--json` - Output results as JSON to stdout
 - `--json-out <file>` - Write JSON results to file (allows --verbose)
 - `--verbose` - Show detailed logging to stderr
+- `--all-attributes` - Include all file attributes in JSON output (default: path + time field only)
 
 ## Identity Expansion
 
@@ -161,6 +168,28 @@ When combined with `--expand-identity`, each owner's equivalent identities are a
 ```
 
 This will match files owned by joe OR jane, including all their equivalent identities (AD, NFS UID, etc.).
+
+## All Attributes Output
+
+By default, JSON output includes only the file path and the selected time field. Use `--all-attributes` to include all available file attributes:
+
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --json --all-attributes
+```
+
+**Default output (path + selected time field only):**
+```json
+{"path": "/home/joe/file1.txt", "creation_time": "2024-01-15T10:30:00.000000000Z"}
+{"path": "/home/jane/file2.txt", "creation_time": "2024-01-10T14:20:00.000000000Z"}
+```
+
+**With --all-attributes:**
+```json
+{"path": "/home/joe/file1.txt", "name": "file1.txt", "type": "FS_FILE_TYPE_FILE", "owner": "25769805128", "group": "25769805200", "size": "1024", "creation_time": "2024-01-15T10:30:00.000000000Z", "access_time": "2024-03-01T09:15:00.000000000Z", "modification_time": "2024-02-20T16:45:00.000000000Z", "change_time": "2024-02-20T16:45:00.000000000Z", "num_links": "1", "mode": "0644"}
+```
+
+**Note:** `--all-attributes` only affects JSON output. Plain text output always shows the time field and path.
 
 ## How It Works
 

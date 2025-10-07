@@ -20,6 +20,7 @@ TIME_FIELD="creation_time"
 OWNERS=()
 OWNER_TYPE=""
 EXPAND_IDENTITY=false
+ALL_ATTRIBUTES=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -101,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             EXPAND_IDENTITY=true
             shift
             ;;
+        --all-attributes)
+            ALL_ATTRIBUTES=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
@@ -137,6 +142,7 @@ Output Options:
   --json                     Output results as JSON to stdout
   --json-out <file>          Write JSON results to file (allows --verbose)
   --verbose                  Show detailed logging to stderr
+  --all-attributes           Include all file attributes in JSON output (default: path + time field only)
 
 Examples:
   # Find files created more than 30 days ago
@@ -165,6 +171,9 @@ Examples:
 
   # Find files owned by multiple users with identity expansion
   filter_old_files.sh --path /home --older-than 30 --owner joe --owner jane --expand-identity
+
+  # Output all file attributes in JSON format
+  filter_old_files.sh --path /home --older-than 30 --json --all-attributes
 EOF
             exit 0
             ;;
@@ -538,6 +547,7 @@ comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
 owner_auth_id = '$ALL_OWNER_AUTH_IDS'
+all_attributes = '${ALL_ATTRIBUTES}' == 'true'
 
 current_obj = {}
 current_idx = None
@@ -578,12 +588,16 @@ for line in sys.stdin:
             if current_obj.get('path') and current_obj.get(time_field):
                 if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
                     if output_json:
-                        # Only include path and the selected time field
-                        filtered_obj = {
-                            'path': current_obj['path'],
-                            time_field: current_obj[time_field]
-                        }
-                        output = json.dumps(filtered_obj)
+                        if all_attributes:
+                            # Include all attributes
+                            output = json.dumps(current_obj)
+                        else:
+                            # Only include path and the selected time field
+                            filtered_obj = {
+                                'path': current_obj['path'],
+                                time_field: current_obj[time_field]
+                            }
+                            output = json.dumps(filtered_obj)
                         if json_file_handle:
                             json_file_handle.write(output + '\n')
                             json_file_handle.flush()
@@ -597,20 +611,26 @@ for line in sys.stdin:
             current_obj = {}
             current_idx = idx
 
-        # Collect path, time fields, and owner
-        if key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner'):
+        # Collect all attributes if --all-attributes, otherwise just what we need
+        if all_attributes:
+            current_obj[key] = val
+        elif key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner'):
             current_obj[key] = val
 
 # Process final object
 if current_obj.get('path') and current_obj.get(time_field):
     if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
         if output_json:
-            # Only include path and the selected time field
-            filtered_obj = {
-                'path': current_obj['path'],
-                time_field: current_obj[time_field]
-            }
-            output = json.dumps(filtered_obj)
+            if all_attributes:
+                # Include all attributes
+                output = json.dumps(current_obj)
+            else:
+                # Only include path and the selected time field
+                filtered_obj = {
+                    'path': current_obj['path'],
+                    time_field: current_obj[time_field]
+                }
+                output = json.dumps(filtered_obj)
             if json_file_handle:
                 json_file_handle.write(output + '\n')
                 json_file_handle.flush()
