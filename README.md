@@ -131,6 +131,12 @@ chmod +x file_filter.sh
   --owner joe
 ```
 
+**Connect to specific Qumulo cluster:**
+```bash
+./file_filter.sh --path /home --older-than 30 \
+  --host 10.1.1.100 --credentials-store ~/.qumulo_creds
+```
+
 ## Options
 
 ### Required Arguments
@@ -194,6 +200,10 @@ chmod +x file_filter.sh
 - `--json-out <file>` - Write JSON results to file (allows --verbose)
 - `--verbose` - Show detailed logging to stderr
 - `--all-attributes` - Include all file attributes in JSON output (default: path + time field only)
+
+### Qumulo Connection Options
+- `--host <host>` - Qumulo cluster hostname or IP
+- `--credentials-store <path>` - Path to credentials file (default: ~/.qfsd_cred)
 
 ## Identity Expansion
 

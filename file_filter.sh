@@ -23,6 +23,8 @@ EXPAND_IDENTITY=false
 ALL_ATTRIBUTES=false
 GREATER_THAN=""
 SMALLER_THAN=""
+QQ_HOST=""
+QQ_CREDENTIALS_STORE=""
 
 # Field-specific time filters
 ACCESSED_OLDER_THAN=""
@@ -158,6 +160,14 @@ while [[ $# -gt 0 ]]; do
             SMALLER_THAN="$2"
             shift 2
             ;;
+        --host)
+            QQ_HOST="$2"
+            shift 2
+            ;;
+        --credentials-store)
+            QQ_CREDENTIALS_STORE="$2"
+            shift 2
+            ;;
         --help|-h)
             cat << 'EOF'
 Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
@@ -216,6 +226,10 @@ Output Options:
   --json-out <file>          Write JSON results to file (allows --verbose)
   --verbose                  Show detailed logging to stderr
   --all-attributes           Include all file attributes in JSON output (default: path + time field only)
+
+Qumulo Connection Options:
+  --host <host>              Qumulo cluster hostname or IP
+  --credentials-store <path> Path to credentials file (default: ~/.qfsd_cred)
 
 Examples:
   # List all files in a path
@@ -333,6 +347,18 @@ if [ ${#OWNERS[@]} -gt 0 ] && [ -z "$OWNER_TYPE" ]; then
     fi
     OWNER_TYPE="auto"
 fi
+
+# Function to build qq command with connection options
+build_qq_cmd() {
+    local cmd="qq"
+    if [ -n "$QQ_HOST" ]; then
+        cmd="$cmd --host $QQ_HOST"
+    fi
+    if [ -n "$QQ_CREDENTIALS_STORE" ]; then
+        cmd="$cmd --credentials-store $QQ_CREDENTIALS_STORE"
+    fi
+    echo "$cmd"
+}
 
 # Function to parse size with units to bytes (must be defined before use)
 parse_size_to_bytes() {
@@ -462,16 +488,19 @@ resolve_owner_identity() {
     local AUTH_RESULT=""
     local OWNER_AUTH_ID=""
 
+    # Build qq command with connection options
+    local QQ_CMD=$(build_qq_cmd)
+
     # Capture both stdout and error information
     case "$owner_type" in
         ad)
-            AUTH_RESULT=$(qq auth_find_identity --name "$owner" --domain ACTIVE_DIRECTORY --json 2>&1)
+            AUTH_RESULT=$($QQ_CMD auth_find_identity --name "$owner" --domain ACTIVE_DIRECTORY --json 2>&1)
             ;;
         local)
-            AUTH_RESULT=$(qq auth_find_identity --name "$owner" --domain LOCAL --json 2>&1)
+            AUTH_RESULT=$($QQ_CMD auth_find_identity --name "$owner" --domain LOCAL --json 2>&1)
             ;;
         uid)
-            AUTH_RESULT=$(qq auth_find_identity --uid "$owner" --json 2>&1)
+            AUTH_RESULT=$($QQ_CMD auth_find_identity --uid "$owner" --json 2>&1)
             ;;
         auto)
             # Check if owner is numeric (UID)
@@ -479,7 +508,7 @@ resolve_owner_identity() {
                 if [ "$verbose" = true ]; then
                     echo "[INFO] Owner appears to be numeric, trying UID lookup for '$owner'..." >&2
                 fi
-                AUTH_RESULT=$(qq auth_find_identity --uid "$owner" --json 2>&1)
+                AUTH_RESULT=$($QQ_CMD auth_find_identity --uid "$owner" --json 2>&1)
                 TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
                 if [ -n "$TEMP_AUTH_ID" ]; then
                     if [ "$verbose" = true ]; then
@@ -491,7 +520,7 @@ resolve_owner_identity() {
                 if [ "$verbose" = true ]; then
                     echo "[INFO] Trying generic lookup for '$owner'..." >&2
                 fi
-                AUTH_RESULT=$(qq auth_find_identity "$owner" --json 2>&1)
+                AUTH_RESULT=$($QQ_CMD auth_find_identity "$owner" --json 2>&1)
 
                 # If generic lookup failed, try with --name flag which supports various AD formats
                 TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
@@ -499,7 +528,7 @@ resolve_owner_identity() {
                     if [ "$verbose" = true ]; then
                         echo "[INFO] Generic lookup failed, trying --name lookup..." >&2
                     fi
-                    AUTH_RESULT=$(qq auth_find_identity --name "$owner" --json 2>&1)
+                    AUTH_RESULT=$($QQ_CMD auth_find_identity --name "$owner" --json 2>&1)
                 fi
 
                 if [ "$verbose" = true ]; then
@@ -522,7 +551,7 @@ resolve_owner_identity() {
         echo "[INFO] Attempting alternative lookups..." >&2
 
         # Try positional argument
-        GENERIC_RESULT=$(qq auth_find_identity "$owner" 2>&1)
+        GENERIC_RESULT=$($QQ_CMD auth_find_identity "$owner" 2>&1)
         GENERIC_AUTH_ID=$(echo "$GENERIC_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
 
         if [ -n "$GENERIC_AUTH_ID" ]; then
@@ -543,7 +572,7 @@ resolve_owner_identity() {
                 if [ "$verbose" = true ]; then
                     echo "[INFO] Trying lookup with: $try_name" >&2
                 fi
-                TRY_RESULT=$(qq auth_find_identity --name "$try_name" --json 2>&1)
+                TRY_RESULT=$($QQ_CMD auth_find_identity --name "$try_name" --json 2>&1)
                 TRY_AUTH_ID=$(echo "$TRY_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
                 if [ -n "$TRY_AUTH_ID" ]; then
                     echo "Found using name format: $try_name" >&2
@@ -554,8 +583,8 @@ resolve_owner_identity() {
 
             if [ -z "$OWNER_AUTH_ID" ]; then
                 echo "User '$owner' not found in any domain" >&2
-                echo "Try running: qq auth_find_identity $owner" >&2
-                echo "Or: qq auth_find_identity --help" >&2
+                echo "Try running: $QQ_CMD auth_find_identity $owner" >&2
+                echo "Or: $QQ_CMD auth_find_identity --help" >&2
                 exit 1
             fi
         fi
@@ -572,7 +601,7 @@ resolve_owner_identity() {
         fi
 
         # Use auth_expand_identity to get all equivalent IDs
-        EXPAND_RESULT=$(qq auth_expand_identity --auth-id "$OWNER_AUTH_ID" --json 2>/dev/null)
+        EXPAND_RESULT=$($QQ_CMD auth_expand_identity --auth-id "$OWNER_AUTH_ID" --json 2>/dev/null)
 
         if [ -n "$EXPAND_RESULT" ]; then
             # Extract all auth_ids from equivalent_ids, nfs_id, smb_id, and id
@@ -634,7 +663,8 @@ fi
 # Function to process a single directory path
 process_directory() {
     local dir_path="$1"
-    local qq_cmd="qq fs_walk_tree --path \"$dir_path\" --display-all-attributes"
+    local qq_base=$(build_qq_cmd)
+    local qq_cmd="$qq_base fs_walk_tree --path \"$dir_path\" --display-all-attributes"
 
     if [ "$FILE_ONLY" = true ]; then
         qq_cmd="$qq_cmd --file-only"
@@ -655,14 +685,15 @@ if [ -n "$OMIT_SUBDIRS" ]; then
             echo "[INFO] Processing root directory: $PATH_TO_SEARCH" >&2
         fi
 
-        ROOT_CMD="qq fs_walk_tree --path \"$PATH_TO_SEARCH\" --display-all-attributes --max-depth 1"
+        QQ_BASE=$(build_qq_cmd)
+        ROOT_CMD="$QQ_BASE fs_walk_tree --path \"$PATH_TO_SEARCH\" --display-all-attributes --max-depth 1"
         if [ "$FILE_ONLY" = true ]; then
             ROOT_CMD="$ROOT_CMD --file-only"
         fi
         eval "$ROOT_CMD"
 
         # Then, process subdirectories (excluding omitted ones)
-        qq fs_walk_tree --path "$PATH_TO_SEARCH" --max-depth 1 --display-all-attributes | \
+        $QQ_BASE fs_walk_tree --path "$PATH_TO_SEARCH" --max-depth 1 --display-all-attributes | \
         python3 -c "
 import sys
 import json
@@ -672,6 +703,7 @@ import fnmatch
 
 omit_patterns = shlex.split('$OMIT_SUBDIRS')
 verbose = '$VERBOSE' == 'true'
+qq_base = '$QQ_BASE'
 data = json.load(sys.stdin)
 
 def should_omit(dirname, patterns):
@@ -711,7 +743,7 @@ for node in data.get('tree_nodes', []):
             print(f'[PROCESS] Processing subdirectory: {dirname}', file=sys.stderr)
 
         processed_count += 1
-        cmd = 'qq fs_walk_tree --path ' + shlex.quote(path) + ' --display-all-attributes'
+        cmd = qq_base + ' fs_walk_tree --path ' + shlex.quote(path) + ' --display-all-attributes'
         if '$FILE_ONLY' == 'true':
             cmd += ' --file-only'
         if '$MAX_DEPTH':
