@@ -17,6 +17,9 @@ OMIT_SUBDIRS=""
 VERBOSE=false
 JSON_OUT_FILE=""
 TIME_FIELD="creation_time"
+OWNER=""
+OWNER_TYPE=""
+EXPAND_IDENTITY=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -78,6 +81,26 @@ while [[ $# -gt 0 ]]; do
             TIME_FIELD="change_time"
             shift
             ;;
+        --owner)
+            OWNER="$2"
+            shift 2
+            ;;
+        --ad)
+            OWNER_TYPE="ad"
+            shift
+            ;;
+        --local)
+            OWNER_TYPE="local"
+            shift
+            ;;
+        --uid)
+            OWNER_TYPE="uid"
+            shift
+            ;;
+        --expand-identity)
+            EXPAND_IDENTITY=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
@@ -95,6 +118,13 @@ Time Field Options (default: --created):
   --accessed                 Filter by last access time
   --modified                 Filter by last modification time
   --changed                  Filter by last metadata change time
+
+Owner Filter Options:
+  --owner <name>             Filter by file owner (auto-detects if no type specified)
+  --ad                       Owner is Active Directory user
+  --local                    Owner is local user
+  --uid                      Owner is specified as UID number
+  --expand-identity          Match all equivalent identities (e.g., AD user + NFS UID)
 
 Search Options:
   --max-depth <N>            Maximum directory depth to search
@@ -119,6 +149,15 @@ Examples:
 
   # Find recently modified files with depth limit
   filter_old_files.sh --path /data --newer-than 1 --modified --max-depth 3
+
+  # Find files owned by a specific user
+  filter_old_files.sh --path /home --older-than 30 --owner jdoe --ad
+
+  # Find files owned by a specific UID
+  filter_old_files.sh --path /home --older-than 90 --owner 1001 --uid
+
+  # Find files with identity expansion (matches AD user and equivalent NFS UID)
+  filter_old_files.sh --path /home --older-than 30 --owner joe --expand-identity
 EOF
             exit 0
             ;;
@@ -161,6 +200,21 @@ if [ "$VERBOSE" = true ] && [ "$OUTPUT_JSON" = true ] && [ -z "$JSON_OUT_FILE" ]
     exit 1
 fi
 
+# Validate owner filter options
+if [ -z "$OWNER" ] && [ -n "$OWNER_TYPE" ]; then
+    echo "Error: Owner type flag (--ad, --local, --uid) requires --owner" >&2
+    echo "Example: $0 --path /home --older-than 30 --owner jdoe --ad" >&2
+    exit 1
+fi
+
+# If owner specified without type, use auto-detection
+if [ -n "$OWNER" ] && [ -z "$OWNER_TYPE" ]; then
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] No owner type specified, will auto-detect" >&2
+    fi
+    OWNER_TYPE="auto"
+fi
+
 # Calculate the timestamp threshold
 if [ -n "$OLDER_THAN" ]; then
     threshold=$(date -u +%s -d "$OLDER_THAN days ago")
@@ -168,6 +222,139 @@ if [ -n "$OLDER_THAN" ]; then
 else
     threshold=$(date -u +%s -d "$NEWER_THAN days ago")
     comparison="newer"
+fi
+
+# Resolve owner to auth_id if owner filter is specified
+OWNER_AUTH_ID=""
+if [ -n "$OWNER" ]; then
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Resolving owner identity: $OWNER (type: $OWNER_TYPE)" >&2
+    fi
+
+    # Capture both stdout and error information
+    case "$OWNER_TYPE" in
+        ad)
+            AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --domain ACTIVE_DIRECTORY --json 2>&1)
+            ;;
+        local)
+            AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --domain LOCAL --json 2>&1)
+            ;;
+        uid)
+            AUTH_RESULT=$(qq auth_find_identity --uid "$OWNER" --json 2>&1)
+            ;;
+        auto)
+            # Try generic lookup first
+            if [ "$VERBOSE" = true ]; then
+                echo "[INFO] Trying generic lookup for '$OWNER'..." >&2
+            fi
+            AUTH_RESULT=$(qq auth_find_identity "$OWNER" --json 2>&1)
+
+            # If generic lookup failed, try with --name flag which supports various AD formats
+            TEMP_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+            if [ -z "$TEMP_AUTH_ID" ]; then
+                if [ "$VERBOSE" = true ]; then
+                    echo "[INFO] Generic lookup failed, trying --name lookup..." >&2
+                fi
+                AUTH_RESULT=$(qq auth_find_identity --name "$OWNER" --json 2>&1)
+            fi
+
+            if [ "$VERBOSE" = true ]; then
+                DETECTED_TYPE=$(echo "$AUTH_RESULT" | jq -r '.id_type // empty' 2>/dev/null)
+                if [ -n "$DETECTED_TYPE" ]; then
+                    echo "[INFO] Auto-detected owner type: $DETECTED_TYPE" >&2
+                fi
+            fi
+            ;;
+    esac
+
+    # Try to extract the auth_id (support both 'id' and 'auth_id' fields)
+    OWNER_AUTH_ID=$(echo "$AUTH_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+
+    if [ -z "$OWNER_AUTH_ID" ]; then
+        echo "Error: Could not resolve owner identity for '$OWNER' (type: $OWNER_TYPE)" >&2
+
+        # Try to find the user with different methods to provide helpful suggestions
+        echo "[INFO] Attempting alternative lookups..." >&2
+
+        # Try positional argument
+        GENERIC_RESULT=$(qq auth_find_identity "$OWNER" 2>&1)
+        GENERIC_AUTH_ID=$(echo "$GENERIC_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+
+        if [ -n "$GENERIC_AUTH_ID" ]; then
+            FOUND_TYPE=$(echo "$GENERIC_RESULT" | jq -r '.domain // empty' 2>/dev/null)
+            FOUND_NAME=$(echo "$GENERIC_RESULT" | jq -r '.name // empty' 2>/dev/null)
+            echo "" >&2
+            echo "Found user successfully with positional lookup:" >&2
+            echo "  Domain: $FOUND_TYPE" >&2
+            echo "  Name: $FOUND_NAME" >&2
+            echo "  Auth ID: $GENERIC_AUTH_ID" >&2
+            echo "" >&2
+            echo "This is likely a script bug - the identity was found but not extracted correctly." >&2
+            echo "Using the found auth_id: $GENERIC_AUTH_ID" >&2
+            OWNER_AUTH_ID="$GENERIC_AUTH_ID"
+        else
+            # Try one more time with --name and various formats
+            for try_name in "$OWNER" "ad:$OWNER" "local:$OWNER"; do
+                if [ "$VERBOSE" = true ]; then
+                    echo "[INFO] Trying lookup with: $try_name" >&2
+                fi
+                TRY_RESULT=$(qq auth_find_identity --name "$try_name" --json 2>&1)
+                TRY_AUTH_ID=$(echo "$TRY_RESULT" | jq -r '.auth_id // .id // empty' 2>/dev/null)
+                if [ -n "$TRY_AUTH_ID" ]; then
+                    echo "Found using name format: $try_name" >&2
+                    OWNER_AUTH_ID="$TRY_AUTH_ID"
+                    break
+                fi
+            done
+
+            if [ -z "$OWNER_AUTH_ID" ]; then
+                echo "User '$OWNER' not found in any domain" >&2
+                echo "Try running: qq auth_find_identity $OWNER" >&2
+                echo "Or: qq auth_find_identity --help" >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] Resolved owner auth_id: $OWNER_AUTH_ID" >&2
+    fi
+
+    # If expand-identity is enabled, get all equivalent auth_ids
+    if [ "$EXPAND_IDENTITY" = true ]; then
+        if [ "$VERBOSE" = true ]; then
+            echo "[INFO] Expanding identity to find equivalent auth_ids..." >&2
+        fi
+
+        # Use auth_expand_identity to get all equivalent IDs
+        EXPAND_RESULT=$(qq auth_expand_identity --auth-id "$OWNER_AUTH_ID" --json 2>/dev/null)
+
+        if [ -n "$EXPAND_RESULT" ]; then
+            # Extract all auth_ids from equivalent_ids, nfs_id, smb_id, and id
+            EQUIVALENT_AUTH_IDS=$(echo "$EXPAND_RESULT" | jq -r '[
+                .id.auth_id,
+                .nfs_id.auth_id,
+                .smb_id.auth_id,
+                (.equivalent_ids[]?.auth_id // empty)
+            ] | unique | .[]' 2>/dev/null | tr '\n' ' ')
+
+            if [ -n "$EQUIVALENT_AUTH_IDS" ]; then
+                if [ "$VERBOSE" = true ]; then
+                    echo "[INFO] Found equivalent auth_ids: $EQUIVALENT_AUTH_IDS" >&2
+                fi
+                # Store as comma-separated for Python
+                OWNER_AUTH_ID="$EQUIVALENT_AUTH_IDS"
+            else
+                if [ "$VERBOSE" = true ]; then
+                    echo "[WARN] Identity expansion returned no results, using original auth_id" >&2
+                fi
+            fi
+        else
+            if [ "$VERBOSE" = true ]; then
+                echo "[WARN] Could not expand identity, using original auth_id only" >&2
+            fi
+        fi
+    fi
 fi
 
 # Function to process a single directory path
@@ -280,6 +467,7 @@ threshold_str = datetime.utcfromtimestamp(threshold).strftime('%Y-%m-%dT%H:%M:%S
 comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
 time_field = '$TIME_FIELD'
+owner_auth_id = '$OWNER_AUTH_ID'
 
 current_obj = {}
 current_idx = None
@@ -289,6 +477,14 @@ def matches_filter(time_value):
         return time_value < threshold_str
     else:  # newer
         return time_value > threshold_str
+
+def matches_owner(file_owner):
+    # If no owner filter specified, match everything
+    if not owner_auth_id:
+        return True
+    # Support multiple auth_ids (space-separated from identity expansion)
+    owner_ids = owner_auth_id.split()
+    return file_owner in owner_ids
 
 json_out_file = '$JSON_OUT_FILE'
 json_file_handle = None
@@ -310,7 +506,7 @@ for line in sys.stdin:
         if idx != current_idx:
             # Process previous object
             if current_obj.get('path') and current_obj.get(time_field):
-                if matches_filter(current_obj[time_field]):
+                if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
                     if output_json:
                         # Only include path and the selected time field
                         filtered_obj = {
@@ -331,13 +527,13 @@ for line in sys.stdin:
             current_obj = {}
             current_idx = idx
 
-        # Collect path and time fields
-        if key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time'):
+        # Collect path, time fields, and owner
+        if key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner'):
             current_obj[key] = val
 
 # Process final object
 if current_obj.get('path') and current_obj.get(time_field):
-    if matches_filter(current_obj[time_field]):
+    if matches_filter(current_obj[time_field]) and matches_owner(current_obj.get('owner')):
         if output_json:
             # Only include path and the selected time field
             filtered_obj = {
