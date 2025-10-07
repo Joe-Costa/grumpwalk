@@ -379,10 +379,12 @@ parse_size_to_bytes() {
 
     # Convert to bytes based on unit (case insensitive)
     # Use Python for calculations to avoid bc dependency and handle large numbers
+    # Convert to lowercase using tr for bash 3.2 compatibility (macOS default)
+    local size_unit_lower=$(echo "$size_unit" | tr '[:upper:]' '[:lower:]')
     local bytes=""
     bytes=$(python3 -c "
 size_num = float('$size_num')
-unit = '${size_unit,,}'
+unit = '$size_unit_lower'
 
 multipliers = {
     '': 1, 'b': 1,
