@@ -92,7 +92,7 @@ chmod +x file_filter.sh
 - `--expand-identity` - Match all equivalent identities (e.g., AD user + NFS UID)
 
 ### Search Options
-- `--max-depth <N>` - Maximum directory depth to search
+- `--max-depth <N>` - Maximum directory depth to search (default: unlimited)
 - `--file-only` - Search files only (default)
 - `--all` - Search both files and directories
 - `--omit-subdirs "patterns"` - Space-separated patterns to omit (supports wildcards)
