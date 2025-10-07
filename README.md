@@ -21,11 +21,12 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 
 ## Requirements
 
-- Qumulo cluster with `qq` CLI installed
+- Linux, Mac or Windows with Linux Subsystem
+- `qq` CLI (`pip install qumulo_api`)
 - `jq` (JSON processor)
 - Python 3
-- Bash
-- **Note**: Use `file_filter_mac.sh` on macOS/BSD systems (uses BSD date syntax)
+- Bash (I've not tested it in other shells...)
+- **Note**: Use `file_filter_mac.sh` on macOS/BSD systems (Also one `bash`, I have not tested it with `zsh`)
 
 ## Installation
 
