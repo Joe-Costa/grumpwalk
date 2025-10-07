@@ -2,6 +2,10 @@
 
 A memory-efficient streaming utility for filtering files on Qumulo storage systems by timestamps, size and ownership. This tool uses `jq` streaming to process large directory trees without running out of memory.
 
+**Two versions available:**
+- `file_filter.sh` - For Linux/GNU systems (uses GNU date)
+- `file_filter_mac.sh` - For macOS/BSD systems (uses BSD date)
+
 ## Features
 
 - **Memory-safe streaming**: Processes files one at a time using jq streaming, avoiding OOM issues on large directory trees
@@ -21,6 +25,7 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 - `jq` (JSON processor)
 - Python 3
 - Bash
+- **Note**: Use `file_filter_mac.sh` on macOS/BSD systems (uses BSD date syntax)
 
 ## Installation
 
@@ -32,7 +37,11 @@ cd qumulo-file-filter
 
 2. Make the script executable:
 ```bash
+# For Linux/GNU systems:
 chmod +x file_filter.sh
+
+# For macOS/BSD systems:
+chmod +x file_filter_mac.sh
 ```
 
 ## Usage
@@ -40,7 +49,11 @@ chmod +x file_filter.sh
 ### Basic Syntax
 
 ```bash
+# Linux/GNU:
 ./file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
+
+# macOS/BSD:
+./file_filter_mac.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
 ```
 
 **Connect to specific Qumulo cluster: (For remote qq CLI use)**
