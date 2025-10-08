@@ -242,7 +242,7 @@ Examples:
   # Find files created more than 30 days ago
   filter_old_files.sh --path /home --older-than 30
 
-  # Find files owned by a user with identity expansion
+  # Find files owned by a user with identity expansion (Match Names to UID Numbers or vice versa)
   filter_old_files.sh --path /home --owner jdoe --expand-identity
 
   # Find files in size and time ranges, save to CSV

@@ -94,7 +94,7 @@ chmod +x file_filter_mac.sh
   --json-out old-files.json --verbose
 ```
 
-**Find files owned by a specific user (with identity expansion):**
+**Find files owned by a specific user (with identity expansion - Match Names to UID Numbers or vice versa):**
 ```bash
 ./file_filter.sh --path /home --older-than 30 \
   --owner jdoe --expand-identity
