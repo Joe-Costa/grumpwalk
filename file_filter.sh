@@ -16,6 +16,7 @@ OUTPUT_JSON=false
 OMIT_SUBDIRS=""
 VERBOSE=false
 JSON_OUT_FILE=""
+CSV_OUT_FILE=""
 TIME_FIELD="creation_time"
 OWNERS=()
 OWNER_TYPE=""
@@ -78,6 +79,10 @@ while [[ $# -gt 0 ]]; do
         --json-out)
             JSON_OUT_FILE="$2"
             OUTPUT_JSON=true
+            shift 2
+            ;;
+        --csv-out)
+            CSV_OUT_FILE="$2"
             shift 2
             ;;
         --created)
@@ -224,6 +229,7 @@ Search Options:
 Output Options:
   --json                     Output results as JSON to stdout
   --json-out <file>          Write JSON results to file (allows --verbose)
+  --csv-out <file>           Write results to CSV file (mutually exclusive with --json/--json-out)
   --verbose                  Show detailed logging to stderr
   --all-attributes           Include all file attributes in JSON output (default: path + time field only)
 
@@ -232,54 +238,21 @@ Qumulo Connection Options:
   --credentials-store <path> Path to credentials file (default: ~/.qfsd_cred)
 
 Examples:
-  # List all files in a path
-  filter_old_files.sh --path /home
-
-  # List all files owned by a specific user
-  filter_old_files.sh --path /home --owner jdoe --ad
-
   # Find files created more than 30 days ago
   filter_old_files.sh --path /home --older-than 30
 
-  # Find files accessed in the last 7 days
-  filter_old_files.sh --path /home --newer-than 7 --accessed
+  # Find files owned by a user with identity expansion
+  filter_old_files.sh --path /home --owner jdoe --expand-identity
 
-  # Find old files, exclude temp directories, save to JSON with logging
-  filter_old_files.sh --path /home --older-than 90 --omit-subdirs "temp cache 100k*" --json-out old-files.json --verbose
+  # Find files in size and time ranges, save to CSV
+  filter_old_files.sh --path /home --older-than 90 --greater-than 1GB --smaller-than 10GB --csv-out results.csv
 
-  # Find recently modified files with depth limit
-  filter_old_files.sh --path /data --newer-than 1 --modified --max-depth 3
+  # Exclude directories and limit depth
+  filter_old_files.sh --path /home --older-than 30 --omit-subdirs "temp cache" --max-depth 3
 
-  # Find files owned by multiple users (OR logic)
-  filter_old_files.sh --path /home --older-than 30 --owner jdoe --owner jane --ad
-
-  # Find files owned by specific UIDs
-  filter_old_files.sh --path /home --older-than 90 --owner 1001 --owner 1002 --uid
-
-  # Find files with identity expansion (matches AD user and equivalent NFS UID)
-  filter_old_files.sh --path /home --older-than 30 --owner joe --expand-identity
-
-  # Output all file attributes in JSON format
-  filter_old_files.sh --path /home --older-than 30 --json --all-attributes
-
-  # Find files larger than 100MB
-  filter_old_files.sh --path /home --greater-than 100MB
-
-  # Find files smaller than 1GiB and older than 30 days
-  filter_old_files.sh --path /home --smaller-than 1GiB --older-than 30
-
-  # Find files in a size range (between 100MB and 1GB)
-  filter_old_files.sh --path /home --greater-than 100MB --smaller-than 1GB
-
-  # Find files in a time range (between 7 and 30 days old)
-  filter_old_files.sh --path /home --newer-than 7 --older-than 30
-
-  # Find files in both time and size range
-  filter_old_files.sh --path /home --newer-than 30 --older-than 90 --greater-than 1GB --smaller-than 10GB
-
-  # Complex multi-field query: accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago
+  # Complex multi-field query with multiple conditions
   filter_old_files.sh --path /home --accessed-newer-than 10 --accessed-older-than 30 \
-    --modified-newer-than 20 --modified-older-than 22 --created-older-than 100 --owner joe
+    --modified-older-than 20 --created-older-than 100 --owner joe
 EOF
             exit 0
             ;;
@@ -317,6 +290,13 @@ if [ "$VERBOSE" = true ] && [ "$OUTPUT_JSON" = true ] && [ -z "$JSON_OUT_FILE" ]
     echo "Error: --json and --verbose produce conflicting output to stdout" >&2
     echo "Suggestion: Use --json-out <file> instead of --json to separate JSON output from verbose logs" >&2
     echo "Example: $0 --path /home --older-than 30 --json-out results.json --verbose" >&2
+    exit 1
+fi
+
+# Check for mutually exclusive CSV and JSON output
+if [ -n "$CSV_OUT_FILE" ] && { [ "$OUTPUT_JSON" = true ] || [ -n "$JSON_OUT_FILE" ]; }; then
+    echo "Error: --csv-out cannot be used with --json or --json-out" >&2
+    echo "Please choose either CSV or JSON output format" >&2
     exit 1
 fi
 
@@ -763,6 +743,7 @@ else
 fi | python3 -u -c "
 import sys
 import json
+import csv
 from datetime import datetime
 
 # Ensure unbuffered output
@@ -772,6 +753,7 @@ threshold_older = '$threshold_older'
 threshold_newer = '$threshold_newer'
 comparison = '${comparison}'
 output_json = '${OUTPUT_JSON}' == 'true'
+output_csv = '$CSV_OUT_FILE' != ''
 time_field = '$TIME_FIELD'
 owner_auth_id = '$ALL_OWNER_AUTH_IDS'
 all_attributes = '${ALL_ATTRIBUTES}' == 'true'
@@ -932,9 +914,18 @@ def matches_size(file_size):
     return True
 
 json_out_file = '$JSON_OUT_FILE'
+csv_out_file = '$CSV_OUT_FILE'
 json_file_handle = None
+csv_file_handle = None
+csv_writer = None
+csv_header_written = False
+
 if json_out_file:
     json_file_handle = open(json_out_file, 'w')
+
+if csv_out_file:
+    csv_file_handle = open(csv_out_file, 'w', newline='')
+    csv_writer = csv.writer(csv_file_handle)
 
 for line in sys.stdin:
     try:
@@ -960,7 +951,31 @@ for line in sys.stdin:
                 size_match = matches_size(current_obj.get('size'))
 
                 if time_match and field_time_match and owner_match and size_match:
-                    if output_json:
+                    if output_csv:
+                        # CSV output
+                        if all_attributes:
+                            # Write header on first row
+                            if not csv_header_written:
+                                csv_writer.writerow(sorted(current_obj.keys()))
+                                csv_header_written = True
+                            # Write values in same order as header
+                            csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+                        else:
+                            # Write selective fields
+                            row_data = {'path': current_obj['path']}
+                            if comparison and time_field in current_obj:
+                                row_data[time_field] = current_obj[time_field]
+                            if owner_auth_id and 'owner' in current_obj:
+                                row_data['owner'] = current_obj['owner']
+                            if (size_greater or size_smaller) and 'size' in current_obj:
+                                row_data['size'] = current_obj['size']
+
+                            if not csv_header_written:
+                                csv_writer.writerow(row_data.keys())
+                                csv_header_written = True
+                            csv_writer.writerow(row_data.values())
+                        csv_file_handle.flush()
+                    elif output_json:
                         if all_attributes:
                             # Include all attributes
                             output = json.dumps(current_obj)
@@ -1012,7 +1027,31 @@ if has_required_data:
     size_match = matches_size(current_obj.get('size'))
 
     if time_match and field_time_match and owner_match and size_match:
-        if output_json:
+        if output_csv:
+            # CSV output
+            if all_attributes:
+                # Write header on first row
+                if not csv_header_written:
+                    csv_writer.writerow(sorted(current_obj.keys()))
+                    csv_header_written = True
+                # Write values in same order as header
+                csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+            else:
+                # Write selective fields
+                row_data = {'path': current_obj['path']}
+                if comparison and time_field in current_obj:
+                    row_data[time_field] = current_obj[time_field]
+                if owner_auth_id and 'owner' in current_obj:
+                    row_data['owner'] = current_obj['owner']
+                if (size_greater or size_smaller) and 'size' in current_obj:
+                    row_data['size'] = current_obj['size']
+
+                if not csv_header_written:
+                    csv_writer.writerow(row_data.keys())
+                    csv_header_written = True
+                csv_writer.writerow(row_data.values())
+            csv_file_handle.flush()
+        elif output_json:
             if all_attributes:
                 # Include all attributes
                 output = json.dumps(current_obj)
@@ -1045,4 +1084,6 @@ if has_required_data:
 
 if json_file_handle:
     json_file_handle.close()
+if csv_file_handle:
+    csv_file_handle.close()
 "
