@@ -28,6 +28,7 @@ GREATER_THAN=""
 SMALLER_THAN=""
 QQ_HOST=""
 QQ_CREDENTIALS_STORE=""
+OWNER_REPORT=false
 
 # Field-specific time filters
 ACCESSED_OLDER_THAN=""
@@ -175,6 +176,10 @@ while [[ $# -gt 0 ]]; do
             QQ_CREDENTIALS_STORE="$2"
             shift 2
             ;;
+        --owner-report)
+            OWNER_REPORT=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Qumulo File Filter - macOS/BSD version
@@ -234,6 +239,7 @@ Output Options:
   --csv-out <file>           Write results to CSV file (mutually exclusive with --json/--json-out)
   --verbose                  Show detailed logging to stderr
   --all-attributes           Include all file attributes in JSON output (default: path + time field only)
+  --owner-report             Generate usage report by file owner (auto-enables --all-attributes)
 
 Qumulo Connection Options:
   --host <host>              Qumulo cluster hostname or IP
@@ -255,6 +261,9 @@ Examples:
   # Complex multi-field query with multiple conditions
   qumulo_file_filter_mac.sh --path /home --accessed-newer-than 10 --accessed-older-than 30 \
     --modified-older-than 20 --created-older-than 100 --owner joe
+
+  # Generate owner usage report
+  qumulo_file_filter_mac.sh --path /home --owner-report --csv-out owner_report.csv
 EOF
             exit 0
             ;;
@@ -300,6 +309,14 @@ if [ -n "$CSV_OUT_FILE" ] && { [ "$OUTPUT_JSON" = true ] || [ -n "$JSON_OUT_FILE
     echo "Error: --csv-out cannot be used with --json or --json-out" >&2
     echo "Please choose either CSV or JSON output format" >&2
     exit 1
+fi
+
+# Auto-enable --all-attributes when --owner-report is used
+if [ "$OWNER_REPORT" = true ]; then
+    ALL_ATTRIBUTES=true
+    if [ "$VERBOSE" = true ]; then
+        echo "[INFO] --owner-report automatically enabled --all-attributes" >&2
+    fi
 fi
 
 # Validate owner filter options
@@ -765,6 +782,9 @@ all_attributes = '${ALL_ATTRIBUTES}' == 'true'
 size_greater = '$SIZE_GREATER_BYTES'
 size_smaller = '$SIZE_SMALLER_BYTES'
 verbose = '${VERBOSE}' == 'true'
+owner_report = '${OWNER_REPORT}' == 'true'
+qq_host = '$QQ_HOST'
+qq_creds = '$QQ_CREDENTIALS_STORE'
 
 # Field-specific thresholds
 accessed_threshold_older = '$ACCESSED_THRESHOLD_OLDER'
@@ -925,6 +945,62 @@ csv_file_handle = None
 csv_writer = None
 csv_header_written = False
 
+# Owner report aggregation data
+owner_aggregates = {}  # auth_id -> total_size
+owner_name_cache = {}  # auth_id -> resolved_name
+
+def resolve_owner_name(auth_id):
+    \"\"\"Resolve owner auth_id to human-readable name using qq auth_find_identity with caching.\"\"\"
+    if auth_id in owner_name_cache:
+        return owner_name_cache[auth_id]
+
+    try:
+        import subprocess
+
+        # Build qq command with connection options
+        qq_cmd = ['qq']
+        if qq_host:
+            qq_cmd.extend(['--host', qq_host])
+        if qq_creds:
+            qq_cmd.extend(['--credentials-store', qq_creds])
+        qq_cmd.extend(['auth_find_identity', '--auth-id', auth_id, '--json'])
+
+        if verbose:
+            print(f'[INFO] Resolving auth_id {auth_id} to name...', file=sys.stderr)
+
+        result = subprocess.run(qq_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            try:
+                identity = json.loads(result.stdout)
+                # Try to get name from various fields
+                name = identity.get('name') or identity.get('sid') or identity.get('uid') or auth_id
+
+                # Format name nicely
+                if isinstance(name, str) and name:
+                    owner_name_cache[auth_id] = name
+                else:
+                    # Fall back to auth_id if no name found
+                    owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+
+                if verbose:
+                    print(f'[INFO] Resolved auth_id {auth_id} to: {owner_name_cache[auth_id]}', file=sys.stderr)
+
+                return owner_name_cache[auth_id]
+            except json.JSONDecodeError:
+                pass
+
+        # If resolution fails, use auth_id as fallback
+        if verbose:
+            print(f'[WARN] Could not resolve auth_id {auth_id}, using auth_id as name', file=sys.stderr)
+        owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+        return owner_name_cache[auth_id]
+
+    except Exception as e:
+        if verbose:
+            print(f'[ERROR] Exception resolving auth_id {auth_id}: {e}', file=sys.stderr)
+        owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+        return owner_name_cache[auth_id]
+
 if json_out_file:
     json_file_handle = open(json_out_file, 'w')
 
@@ -956,7 +1032,19 @@ for line in sys.stdin:
                 size_match = matches_size(current_obj.get('size'))
 
                 if time_match and field_time_match and owner_match and size_match:
-                    if output_csv:
+                    if owner_report:
+                        # Aggregate by owner instead of outputting individual files
+                        file_owner = current_obj.get('owner')
+                        file_size = current_obj.get('size', 0)
+                        if file_owner:
+                            try:
+                                size_bytes = int(file_size) if file_size else 0
+                                if file_owner not in owner_aggregates:
+                                    owner_aggregates[file_owner] = 0
+                                owner_aggregates[file_owner] += size_bytes
+                            except (ValueError, TypeError):
+                                pass  # Skip files with invalid size
+                    elif output_csv:
                         # CSV output
                         if all_attributes:
                             # Write header on first row
@@ -1032,7 +1120,19 @@ if has_required_data:
     size_match = matches_size(current_obj.get('size'))
 
     if time_match and field_time_match and owner_match and size_match:
-        if output_csv:
+        if owner_report:
+            # Aggregate by owner instead of outputting individual files
+            file_owner = current_obj.get('owner')
+            file_size = current_obj.get('size', 0)
+            if file_owner:
+                try:
+                    size_bytes = int(file_size) if file_size else 0
+                    if file_owner not in owner_aggregates:
+                        owner_aggregates[file_owner] = 0
+                    owner_aggregates[file_owner] += size_bytes
+                except (ValueError, TypeError):
+                    pass  # Skip files with invalid size
+        elif output_csv:
             # CSV output
             if all_attributes:
                 # Write header on first row
@@ -1086,6 +1186,61 @@ if has_required_data:
             if comparison and time_field in current_obj:
                 print(current_obj[time_field])
             print(current_obj['path'])
+
+# Output owner report if requested
+if owner_report and owner_aggregates:
+    if verbose:
+        print(f'[INFO] Generating owner report for {len(owner_aggregates)} unique owners...', file=sys.stderr)
+
+    # Resolve all owner names
+    owner_report_data = []
+    for auth_id, total_size in owner_aggregates.items():
+        owner_name = resolve_owner_name(auth_id)
+        owner_report_data.append({
+            'owner': owner_name,
+            'auth_id': auth_id,
+            'total_capacity_bytes': total_size
+        })
+
+    # Sort by total size descending
+    owner_report_data.sort(key=lambda x: x['total_capacity_bytes'], reverse=True)
+
+    if output_csv or csv_file_handle:
+        # CSV output
+        if not csv_file_handle:
+            csv_file_handle = open(csv_out_file, 'w', newline='')
+            csv_writer = csv.writer(csv_file_handle)
+
+        csv_writer.writerow(['owner', 'auth_id', 'total_capacity_bytes'])
+        for item in owner_report_data:
+            csv_writer.writerow([item['owner'], item['auth_id'], item['total_capacity_bytes']])
+        csv_file_handle.flush()
+
+        if verbose:
+            print(f'[INFO] Owner report written to {csv_out_file}', file=sys.stderr)
+    elif output_json or json_file_handle:
+        # JSON output
+        for item in owner_report_data:
+            output = json.dumps(item)
+            if json_file_handle:
+                json_file_handle.write(output + '\\n')
+                json_file_handle.flush()
+            else:
+                print(output)
+
+        if verbose and json_out_file:
+            print(f'[INFO] Owner report written to {json_out_file}', file=sys.stderr)
+    else:
+        # Plain text output
+        print('Owner Report')
+        print('=' * 80)
+        print(f'{\"Owner\":<40} {\"Auth ID\":<20} {\"Total Capacity\":>15}')
+        print('-' * 80)
+        for item in owner_report_data:
+            capacity_str = f\"{item['total_capacity_bytes']:,} bytes\"
+            print(f\"{item['owner']:<40} {item['auth_id']:<20} {capacity_str:>15}\")
+        print('=' * 80)
+        print(f'Total owners: {len(owner_report_data)}')
 
 if json_file_handle:
     json_file_handle.close()
