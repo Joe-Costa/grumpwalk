@@ -11,7 +11,7 @@ PATH_TO_SEARCH=""
 OLDER_THAN=""
 NEWER_THAN=""
 MAX_DEPTH=""
-FILE_ONLY=true
+FILE_ONLY=false
 OUTPUT_JSON=false
 OMIT_SUBDIRS=""
 VERBOSE=false
@@ -222,8 +222,8 @@ Owner Filter Options:
 
 Search Options:
   --max-depth <N>            Maximum directory depth to search
-  --file-only                Search files only (default)
-  --all                      Search both files and directories
+  --file-only                Search files only
+  --all                      Search both files and directories (default)
   --omit-subdirs "patterns"  Space-separated patterns to omit (supports wildcards)
 
 Output Options:
