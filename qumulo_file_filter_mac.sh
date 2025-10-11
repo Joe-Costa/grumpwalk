@@ -1,9 +1,10 @@
 #!/bin/bash
 
+# Qumulo File Filter - macOS/BSD version
 # Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
 # macOS/BSD version - uses BSD date command syntax
-# Usage: ./filter_old_files.sh --path <path> (--older-than <days> | --newer-than <days>) [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs "pattern1 pattern2"] [--json | --json-out <file>] [--verbose]
-# Example: ./filter_old_files.sh --path /home --older-than 30 --accessed --max-depth 1 --file-only --omit-subdirs "temp cache 100k*" --json-out results.json --verbose
+# Usage: ./qumulo_file_filter_mac.sh --path <path> (--older-than <days> | --newer-than <days>) [--created | --accessed | --modified | --changed] [--max-depth <depth>] [--file-only | --all] [--omit-subdirs "pattern1 pattern2"] [--json | --json-out <file>] [--verbose]
+# Example: ./qumulo_file_filter_mac.sh --path /home --older-than 30 --accessed --max-depth 1 --file-only --omit-subdirs "temp cache 100k*" --json-out results.json --verbose
 
 set -euo pipefail
 
@@ -176,10 +177,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --help|-h)
             cat << 'EOF'
-Filter files by age from qq fs_walk_tree output using streaming to avoid OOM
+Qumulo File Filter - macOS/BSD version
 
 Usage:
-  filter_old_files.sh --path <path> [--older-than <days> | --newer-than <days>] [OPTIONS]
+  qumulo_file_filter_mac.sh --path <path> [--older-than <days> | --newer-than <days>] [OPTIONS]
 
 Required Arguments:
   --path <path>              Path to search
@@ -240,19 +241,19 @@ Qumulo Connection Options:
 
 Examples:
   # Find files created more than 30 days ago
-  filter_old_files.sh --path /home --older-than 30
+  qumulo_file_filter_mac.sh --path /home --older-than 30
 
   # Find files owned by a user with identity expansion (Match Names to UID Numbers or vice versa)
-  filter_old_files.sh --path /home --owner jdoe --expand-identity
+  qumulo_file_filter_mac.sh --path /home --owner jdoe --expand-identity
 
   # Find files in size and time ranges, save to CSV
-  filter_old_files.sh --path /home --older-than 90 --greater-than 1GB --smaller-than 10GB --csv-out results.csv
+  qumulo_file_filter_mac.sh --path /home --older-than 90 --greater-than 1GB --smaller-than 10GB --csv-out results.csv
 
   # Exclude directories and limit depth
-  filter_old_files.sh --path /home --older-than 30 --omit-subdirs "temp cache" --max-depth 3
+  qumulo_file_filter_mac.sh --path /home --older-than 30 --omit-subdirs "temp cache" --max-depth 3
 
   # Complex multi-field query with multiple conditions
-  filter_old_files.sh --path /home --accessed-newer-than 10 --accessed-older-than 30 \
+  qumulo_file_filter_mac.sh --path /home --accessed-newer-than 10 --accessed-older-than 30 \
     --modified-older-than 20 --created-older-than 100 --owner joe
 EOF
             exit 0

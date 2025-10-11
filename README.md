@@ -3,8 +3,8 @@
 A memory-efficient streaming utility for filtering files on Qumulo storage systems by timestamps, size and ownership. This tool uses `jq` streaming to process large directory trees efficiently, even via remote `qq` CLI
 
 **Two versions available:**
-- `file_filter.sh` - For Linux/GNU systems (uses GNU date)
-- `file_filter_mac.sh` - For macOS/BSD systems (uses BSD date)
+- `qumulo_file_filter.sh` - For Linux/GNU systems (uses GNU date)
+- `qumulo_file_filter_mac.sh` - For macOS/BSD systems (uses BSD date)
 
 ## Features
 
@@ -26,7 +26,7 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 - `jq` (JSON processor)
 - Python 3
 - Bash (I've not tested it in other shells...)
-- **Note**: Use `file_filter_mac.sh` on macOS/BSD systems (Also one `bash`, I have not tested it with `zsh`)
+- **Note**: Use `qumulo_file_filter_mac.sh` on macOS/BSD systems (Also one `bash`, I have not tested it with `zsh`)
 
 ## Installation
 
@@ -39,10 +39,10 @@ cd qumulo-file-filter
 2. Make the script executable:
 ```bash
 # For Linux/GNU systems:
-chmod +x file_filter.sh
+chmod +x qumulo_file_filter.sh
 
 # For macOS/BSD systems:
-chmod +x file_filter_mac.sh
+chmod +x qumulo_file_filter_mac.sh
 ```
 
 ## Usage
@@ -51,15 +51,15 @@ chmod +x file_filter_mac.sh
 
 ```bash
 # Linux/GNU:
-./file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
+./qumulo_file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
 
 # macOS/BSD:
-./file_filter_mac.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
+./qumulo_file_filter_mac.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
 ```
 
 **Connect to specific Qumulo cluster: (For remote qq CLI use)**
 ```bash
-./file_filter.sh --path /home --older-than 30 \
+./qumulo_file_filter.sh --path /home --older-than 30 \
   --host 10.1.1.100 --credentials-store ~/.qumulo_creds
 ```
 
@@ -69,84 +69,84 @@ chmod +x file_filter_mac.sh
 
 **List all files in a directory:**
 ```bash
-./file_filter.sh --path /home
+./qumulo_file_filter.sh --path /home
 ```
 
 **List all files owned by a specific user:**
 ```bash
-./file_filter.sh --path /home --owner jdoe --ad
+./qumulo_file_filter.sh --path /home --owner jdoe --ad
 ```
 
 **Find files created more than 30 days ago:**
 ```bash
-./file_filter.sh --path /home --older-than 30
+./qumulo_file_filter.sh --path /home --older-than 30
 ```
 
 **Find files accessed in the last 7 days:**
 ```bash
-./file_filter.sh --path /home --newer-than 7 --accessed
+./qumulo_file_filter.sh --path /home --newer-than 7 --accessed
 ```
 
 **Find old files, exclude temp directories, save to JSON with logging:**
 ```bash
-./file_filter.sh --path /home --older-than 90 \
+./qumulo_file_filter.sh --path /home --older-than 90 \
   --omit-subdirs "temp cache 100k*" \
   --json-out old-files.json --verbose
 ```
 
 **Find files owned by a specific user (with identity expansion - Match Names to UID Numbers or vice versa):**
 ```bash
-./file_filter.sh --path /home --older-than 30 \
+./qumulo_file_filter.sh --path /home --older-than 30 \
   --owner jdoe --expand-identity
 ```
 
 **Find files owned by multiple users (OR logic):**
 ```bash
-./file_filter.sh --path /home --older-than 30 \
+./qumulo_file_filter.sh --path /home --older-than 30 \
   --owner jdoe --owner jane --owner bob --ad
 ```
 
 **Find recently modified files with depth limit:**
 ```bash
-./file_filter.sh --path /data --newer-than 1 \
+./qumulo_file_filter.sh --path /data --newer-than 1 \
   --modified --max-depth 3
 ```
 
 **Output all file attributes in JSON:**
 ```bash
-./file_filter.sh --path /home --older-than 30 \
+./qumulo_file_filter.sh --path /home --older-than 30 \
   --json-out results.json --all-attributes
 ```
 
 **Find files larger than 100MB:**
 ```bash
-./file_filter.sh --path /home --greater-than 100MB
+./qumulo_file_filter.sh --path /home --greater-than 100MB
 ```
 
 **Find files smaller than 1GiB and older than 30 days:**
 ```bash
-./file_filter.sh --path /home --smaller-than 1GiB --older-than 30
+./qumulo_file_filter.sh --path /home --smaller-than 1GiB --older-than 30
 ```
 
 **Find files in a size range (between 100MB and 1GB):**
 ```bash
-./file_filter.sh --path /home --greater-than 100MB --smaller-than 1GB
+./qumulo_file_filter.sh --path /home --greater-than 100MB --smaller-than 1GB
 ```
 
 **Find files in a time range (between 7 and 30 days old):**
 ```bash
-./file_filter.sh --path /home --newer-than 7 --older-than 30
+./qumulo_file_filter.sh --path /home --newer-than 7 --older-than 30
 ```
 
 **Find files in both time and size ranges:**
 ```bash
-./file_filter.sh --path /home --newer-than 30 --older-than 90 \
+./qumulo_file_filter.sh --path /home --newer-than 30 --older-than 90 \
   --greater-than 1GB --smaller-than 10GB
 ```
 
 **Complex multi-field query (accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago):**
 ```bash
-./file_filter.sh --path /home \
+./qumulo_file_filter.sh --path /home \
   --accessed-newer-than 10 --accessed-older-than 30 \
   --modified-newer-than 20 --modified-older-than 22 \
   --created-older-than 100 \
