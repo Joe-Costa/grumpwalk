@@ -1103,7 +1103,8 @@ for line in sys.stdin:
             if progress and objects_processed % progress_interval == 0:
                 elapsed = time.time() - start_time
                 rate = objects_processed / elapsed if elapsed > 0 else 0
-                print(f'[PROGRESS] Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Elapsed: {elapsed:.1f}s', file=sys.stderr)
+                # Use carriage return to overwrite the same line
+                print(f'\r[PROGRESS] Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Elapsed: {elapsed:.1f}s', end='', file=sys.stderr, flush=True)
             # Process previous object
             # Check if we have minimum required data (path, and time_field if time filter is used)
             has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
@@ -1417,7 +1418,8 @@ if owner_report and owner_aggregates:
 if progress and start_time:
     elapsed = time.time() - start_time
     rate = objects_processed / elapsed if elapsed > 0 else 0
-    print(f'[PROGRESS] FINAL: Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Total time: {elapsed:.1f}s', file=sys.stderr)
+    # Clear the progress line and print final stats on a new line
+    print(f'\r[PROGRESS] FINAL: Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Total time: {elapsed:.1f}s', file=sys.stderr)
 
 if json_file_handle:
     json_file_handle.close()
