@@ -1210,13 +1210,14 @@ for line in sys.stdin:
                     continue
 
                 # All filters passed
-                # Check limit (skip for owner_report as it aggregates)
-                if not owner_report:
-                    match_count += 1
-                    if limit and match_count > limit:
-                        if verbose:
-                            print(f'[INFO] Reached limit of {limit} matches, stopping...', file=sys.stderr)
-                        break
+                # Increment match count for progress reporting
+                match_count += 1
+
+                # Check limit (only for non-owner_report output)
+                if not owner_report and limit and match_count > limit:
+                    if verbose:
+                        print(f'[INFO] Reached limit of {limit} matches, stopping...', file=sys.stderr)
+                    break
 
                 if owner_report:
                     # Aggregate by owner instead of outputting individual files
@@ -1311,13 +1312,13 @@ if has_required_data:
        matches_owner(current_obj.get('owner')) and \
        matches_filter(current_obj.get(time_field)) and \
        matches_field_specific_time_filters(current_obj):
-        # Check limit (skip for owner_report as it aggregates)
-        if not owner_report:
-            match_count += 1
-            # For final object, just skip output if limit reached (no loop to break)
-            if limit and match_count > limit:
-                if verbose:
-                    print(f'[INFO] Reached limit of {limit} matches (skipping final object)', file=sys.stderr)
+        # Increment match count for progress reporting
+        match_count += 1
+
+        # Check limit (only for non-owner_report output)
+        if not owner_report and limit and match_count > limit:
+            if verbose:
+                print(f'[INFO] Reached limit of {limit} matches (skipping final object)', file=sys.stderr)
 
         # Only output if limit not exceeded (or owner_report which doesn't use limit)
         if owner_report or not limit or match_count <= limit:
