@@ -23,7 +23,7 @@ OWNERS=()
 OWNER_TYPE=""
 EXPAND_IDENTITY=false
 ALL_ATTRIBUTES=false
-GREATER_THAN=""
+LARGER_THAN=""
 SMALLER_THAN=""
 QQ_HOST=""
 QQ_CREDENTIALS_STORE=""
@@ -162,8 +162,8 @@ while [[ $# -gt 0 ]]; do
             ALL_ATTRIBUTES=true
             shift
             ;;
-        --greater-than)
-            GREATER_THAN="$2"
+        --larger-than)
+            LARGER_THAN="$2"
             shift 2
             ;;
         --smaller-than)
@@ -227,7 +227,7 @@ Field-Specific Time Filters (for complex multi-field queries):
                                   All field-specific filters use AND logic
 
 Size Filter Options (optional):
-  --greater-than <size>      Find files greater than specified size
+  --larger-than <size>       Find files larger than specified size
   --smaller-than <size>      Find files smaller than specified size
                              Both can be used together for range filtering
                              Supported units: B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB
@@ -270,7 +270,7 @@ Examples:
   qumulo_file_filter.sh --path /home --owner jdoe --expand-identity
 
   # Find files in size and time ranges, save to CSV
-  qumulo_file_filter.sh --path /home --older-than 90 --greater-than 1GB --smaller-than 10GB --csv-out results.csv
+  qumulo_file_filter.sh --path /home --older-than 90 --larger-than 1GB --smaller-than 10GB --csv-out results.csv
 
   # Exclude directories and limit depth
   qumulo_file_filter.sh --path /home --older-than 30 --omit-subdirs "temp cache" --max-depth 3
@@ -311,7 +311,7 @@ if [ -n "$OLDER_THAN" ] && [ -n "$NEWER_THAN" ]; then
     fi
 fi
 
-# Allow both --greater-than and --smaller-than for range filtering
+# Allow both --larger-than and --smaller-than for range filtering
 
 # Check for conflicting options
 if [ "$VERBOSE" = true ] && [ "$OUTPUT_JSON" = true ] && [ -z "$JSON_OUT_FILE" ]; then
@@ -433,12 +433,12 @@ else:
 }
 
 # Parse size filters (if specified) - moved here to be right after function definition
-SIZE_GREATER_BYTES=""
+SIZE_LARGER_BYTES=""
 SIZE_SMALLER_BYTES=""
-if [ -n "$GREATER_THAN" ]; then
-    SIZE_GREATER_BYTES=$(parse_size_to_bytes "$GREATER_THAN")
+if [ -n "$LARGER_THAN" ]; then
+    SIZE_LARGER_BYTES=$(parse_size_to_bytes "$LARGER_THAN")
     if [ "$VERBOSE" = true ]; then
-        echo "[INFO] Size filter: greater than $SIZE_GREATER_BYTES bytes ($GREATER_THAN)" >&2
+        echo "[INFO] Size filter: larger than $SIZE_LARGER_BYTES bytes ($LARGER_THAN)" >&2
     fi
 fi
 if [ -n "$SMALLER_THAN" ]; then
@@ -867,7 +867,7 @@ output_csv = '$CSV_OUT_FILE' != ''
 time_field = '$TIME_FIELD'
 owner_auth_id = '$ALL_OWNER_AUTH_IDS'
 all_attributes = '${ALL_ATTRIBUTES}' == 'true'
-size_greater = '$SIZE_GREATER_BYTES'
+size_larger = '$SIZE_LARGER_BYTES'
 size_smaller = '$SIZE_SMALLER_BYTES'
 verbose = '${VERBOSE}' == 'true'
 owner_report = '${OWNER_REPORT}' == 'true'
@@ -1010,7 +1010,7 @@ def matches_owner(file_owner):
 
 def matches_size(file_size):
     # If no size filter specified, match everything
-    if not size_greater and not size_smaller:
+    if not size_larger and not size_smaller:
         return True
 
     # Handle missing file_size
@@ -1024,11 +1024,11 @@ def matches_size(file_size):
         return False
 
     # Check size filters (both can be specified for range filtering)
-    if size_greater and size_smaller:
-        # Range: file must be greater than min AND smaller than max
-        return size_bytes > int(size_greater) and size_bytes < int(size_smaller)
-    elif size_greater:
-        return size_bytes > int(size_greater)
+    if size_larger and size_smaller:
+        # Range: file must be larger than min AND smaller than max
+        return size_bytes > int(size_larger) and size_bytes < int(size_smaller)
+    elif size_larger:
+        return size_bytes > int(size_larger)
     elif size_smaller:
         return size_bytes < int(size_smaller)
     return True
@@ -1223,7 +1223,7 @@ for line in sys.stdin:
                             row_data[time_field] = current_obj[time_field]
                         if owner_auth_id and 'owner' in current_obj:
                             row_data['owner'] = current_obj['owner']
-                        if (size_greater or size_smaller) and 'size' in current_obj:
+                        if (size_larger or size_smaller) and 'size' in current_obj:
                             row_data['size'] = current_obj['size']
 
                         if not csv_header_written:
@@ -1252,7 +1252,7 @@ for line in sys.stdin:
                             filtered_obj['owner'] = current_obj['owner']
 
                         # Add size if size filter was used
-                        if (size_greater or size_smaller) and 'size' in current_obj:
+                        if (size_larger or size_smaller) and 'size' in current_obj:
                             filtered_obj['size'] = current_obj['size']
 
                         output = json.dumps(filtered_obj)
@@ -1326,7 +1326,7 @@ if has_required_data:
                         row_data[time_field] = current_obj[time_field]
                     if owner_auth_id and 'owner' in current_obj:
                         row_data['owner'] = current_obj['owner']
-                    if (size_greater or size_smaller) and 'size' in current_obj:
+                    if (size_larger or size_smaller) and 'size' in current_obj:
                         row_data['size'] = current_obj['size']
 
                     if not csv_header_written:
@@ -1352,7 +1352,7 @@ if has_required_data:
                         filtered_obj['owner'] = current_obj['owner']
 
                     # Add size if size filter was used
-                    if (size_greater or size_smaller) and 'size' in current_obj:
+                    if (size_larger or size_smaller) and 'size' in current_obj:
                         filtered_obj['size'] = current_obj['size']
 
                     output = json.dumps(filtered_obj)

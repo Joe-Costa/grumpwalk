@@ -120,7 +120,7 @@ chmod +x qumulo_file_filter_mac.sh
 
 **Find files larger than 100MB:**
 ```bash
-./qumulo_file_filter.sh --path /home --greater-than 100MB
+./qumulo_file_filter.sh --path /home --larger-than 100MB
 ```
 
 **Find files smaller than 1GiB and older than 30 days:**
@@ -130,7 +130,7 @@ chmod +x qumulo_file_filter_mac.sh
 
 **Find files in a size range (between 100MB and 1GB):**
 ```bash
-./qumulo_file_filter.sh --path /home --greater-than 100MB --smaller-than 1GB
+./qumulo_file_filter.sh --path /home --larger-than 100MB --smaller-than 1GB
 ```
 
 **Find files in a time range (between 7 and 30 days old):**
@@ -141,7 +141,7 @@ chmod +x qumulo_file_filter_mac.sh
 **Find files in both time and size ranges:**
 ```bash
 ./qumulo_file_filter.sh --path /home --newer-than 30 --older-than 90 \
-  --greater-than 1GB --smaller-than 10GB
+  --larger-than 1GB --smaller-than 10GB
 ```
 
 **Complex multi-field query (accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago):**
@@ -185,7 +185,7 @@ chmod +x qumulo_file_filter_mac.sh
 **Note:** All field-specific filters use AND logic. This allows complex queries like "files accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago".
 
 ### Size Filter Options (optional)
-- `--greater-than <size>` - Find files greater than specified size
+- `--larger-than <size>` - Find files larger than specified size
 - `--smaller-than <size>` - Find files smaller than specified size
 
 **Supported size units:**
@@ -194,7 +194,7 @@ chmod +x qumulo_file_filter_mac.sh
 
 **Examples:** `100MB`, `1.5GiB`, `500` (bytes), `10KB`
 
-**Range filtering:** Both `--greater-than` and `--smaller-than` can be used together to find files within a size range.
+**Range filtering:** Both `--larger-than` and `--smaller-than` can be used together to find files within a size range.
 
 ### Owner Filter Options
 - `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)
