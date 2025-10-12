@@ -328,17 +328,6 @@ if [ -n "$CSV_OUT_FILE" ] && { [ "$OUTPUT_JSON" = true ] || [ -n "$JSON_OUT_FILE
     exit 1
 fi
 
-# Disable --progress when output goes to stdout (conflicts with piping)
-if [ "$PROGRESS" = true ]; then
-    # Progress only works with file-based output (--json-out or --csv-out)
-    if [ -z "$JSON_OUT_FILE" ] && [ -z "$CSV_OUT_FILE" ]; then
-        if [ "$VERBOSE" = true ]; then
-            echo "[WARN] --progress disabled: only supported with --json-out or --csv-out (stdout output detected)" >&2
-        fi
-        PROGRESS=false
-    fi
-fi
-
 # Auto-enable --all-attributes when --owner-report is used
 if [ "$OWNER_REPORT" = true ]; then
     ALL_ATTRIBUTES=true
