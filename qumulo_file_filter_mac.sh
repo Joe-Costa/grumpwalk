@@ -329,13 +329,9 @@ if [ -n "$CSV_OUT_FILE" ] && { [ "$OUTPUT_JSON" = true ] || [ -n "$JSON_OUT_FILE
     exit 1
 fi
 
-# Auto-enable --all-attributes when --owner-report is used
-if [ "$OWNER_REPORT" = true ]; then
-    ALL_ATTRIBUTES=true
-    if [ "$VERBOSE" = true ]; then
-        echo "[INFO] --owner-report automatically enabled --all-attributes" >&2
-    fi
-fi
+# Note: --owner-report does NOT auto-enable --all-attributes
+# Owner reports only need 'owner' and 'size' fields for aggregation
+# Users can manually specify --all-attributes if needed for other purposes
 
 # Validate owner filter options
 if [ ${#OWNERS[@]} -eq 0 ] && [ -n "$OWNER_TYPE" ]; then
@@ -1089,6 +1085,44 @@ def resolve_owner_name(auth_id):
                 identity = json.loads(result.stdout)
                 # Try to get name from various fields
                 name = identity.get('name') or identity.get('sid') or identity.get('uid') or auth_id
+
+                # Check if we got a POSIX user SID (S-1-5-88-1-*) which indicates a UID
+                # These SIDs encode the UID in the last component: S-1-5-88-1-{UID}
+                if isinstance(name, str) and name.startswith('S-1-5-88-1-'):
+                    # Extract UID from SID
+                    try:
+                        uid = name.split('-')[-1]
+                        if verbose:
+                            print(f'[INFO] Detected POSIX user SID {name}, extracting UID {uid}', file=sys.stderr)
+
+                        # Try to resolve UID to username using auth_expand_identity
+                        expand_cmd = ['qq']
+                        if qq_host:
+                            expand_cmd.extend(['--host', qq_host])
+                        if qq_creds:
+                            expand_cmd.extend(['--credentials-store', qq_creds])
+                        expand_cmd.extend(['auth_expand_identity', '--auth-id', auth_id, '--json'])
+
+                        expand_result = subprocess.run(expand_cmd, capture_output=True, text=True)
+                        if expand_result.returncode == 0:
+                            expand_data = json.loads(expand_result.stdout)
+                            # Look for AD identity with a name
+                            for equiv in expand_data.get('equivalent_ids', []):
+                                if equiv.get('name') and equiv.get('domain') == 'ACTIVE_DIRECTORY':
+                                    name = equiv['name']
+                                    if verbose:
+                                        print(f'[INFO] Resolved UID {uid} to AD user: {name}', file=sys.stderr)
+                                    break
+                            # If no AD name found, check main identity
+                            if name.startswith('S-1-5-88-1-'):
+                                main_name = expand_data.get('id', {}).get('name')
+                                if main_name:
+                                    name = main_name
+                                    if verbose:
+                                        print(f'[INFO] Resolved UID {uid} to: {name}', file=sys.stderr)
+                    except (IndexError, ValueError, json.JSONDecodeError) as e:
+                        if verbose:
+                            print(f'[WARN] Could not resolve POSIX SID to username: {e}', file=sys.stderr)
 
                 # Format name nicely
                 if isinstance(name, str) and name:
