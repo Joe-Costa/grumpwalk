@@ -12,12 +12,14 @@ A memory-efficient streaming utility for filtering files on Qumulo storage syste
 - **File listing**: List all files in a directory tree with optional filtering
 - **Time-based filtering**: Optionally filter by creation, access, modification, or change time
 - **Size-based filtering**: Filter by file size with support for decimal (KB, MB, GB, TB, PB) and binary (KiB, MiB, GiB, TiB, PiB) units
+- **Metadata overhead tracking**: Include storage metadata consumption in size calculations and reports
 - **Owner filtering**: Filter by file owner with support for AD users, local users, and UIDs (supports multiple owners with OR logic)
+- **Owner usage reports**: Generate storage capacity reports by owner with parallel name resolution
 - **Identity expansion**: Automatically match equivalent identities (e.g., AD user + corresponding NFS UID)
 - **Selective directory omission**: Skip directories using wildcard patterns
-- **Flexible output**: Plain text or JSON output, with optional file output for verbose mode
+- **Flexible output**: Plain text, JSON, or CSV output with optional file output for verbose mode
 - **All attributes output**: Include all file metadata in JSON output when needed
-- **Real-time results**: Streaming architecture outputs results as they're found
+- **Real-time results**: Streaming architecture outputs results as they're found with progress reporting
 
 ## Requirements
 
@@ -144,13 +146,33 @@ chmod +x qumulo_file_filter_mac.sh
   --larger-than 1GB --smaller-than 10GB
 ```
 
-**Complex multi-field query (accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago):**
+**Generate storage capacity report by owner:**
+```bash
+./qumulo_file_filter.sh --path /data --owner-report --csv-out capacity_report.csv
+```
+
+**Generate capacity report with metadata breakdown:**
+```bash
+./qumulo_file_filter.sh --path /data --owner-report --include-metadata --csv-out report.csv
+```
+
+**Filter by size including metadata overhead:**
+```bash
+./qumulo_file_filter.sh --path /data --larger-than 1GB --include-metadata --json-out results.json
+```
+
+**Complex multi-field query with progress reporting:**
 ```bash
 ./qumulo_file_filter.sh --path /home \
   --accessed-newer-than 10 --accessed-older-than 30 \
   --modified-newer-than 20 --modified-older-than 22 \
   --created-older-than 100 \
-  --owner joe
+  --owner joe --progress
+```
+
+**Quick sampling - find first 100 matches:**
+```bash
+./qumulo_file_filter.sh --path /data --older-than 365 --limit 100
 ```
 
 ## Options
@@ -187,6 +209,7 @@ chmod +x qumulo_file_filter_mac.sh
 ### Size Filter Options (optional)
 - `--larger-than <size>` - Find files larger than specified size
 - `--smaller-than <size>` - Find files smaller than specified size
+- `--include-metadata` - Include metadata blocks in size calculations (adds metablocks × 4KB to file size)
 
 **Supported size units:**
 - Decimal: B, KB, MB, GB, TB, PB
@@ -195,6 +218,8 @@ chmod +x qumulo_file_filter_mac.sh
 **Examples:** `100MB`, `1.5GiB`, `500` (bytes), `10KB`
 
 **Range filtering:** Both `--larger-than` and `--smaller-than` can be used together to find files within a size range.
+
+**Metadata overhead:** Use `--include-metadata` to account for storage metadata consumption in size-based operations. Each file consumes metadata blocks (filesystem overhead) separate from data blocks. This flag adds the metadata overhead to the total size for filtering and reporting.
 
 ### Owner Filter Options
 - `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)
@@ -214,8 +239,13 @@ chmod +x qumulo_file_filter_mac.sh
 ### Output Options
 - `--json` - Output results as JSON to stdout
 - `--json-out <file>` - Write JSON results to file (allows --verbose)
+- `--csv-out <file>` - Write results to CSV file (mutually exclusive with JSON output)
 - `--verbose` - Show detailed logging to stderr
 - `--all-attributes` - Include all file attributes in JSON output (default: path + time field only)
+- `--owner-report` - Generate storage capacity report grouped by owner
+- `--limit <N>` - Stop after finding N matching results (useful for testing/sampling)
+- `--progress` - Show real-time progress statistics (objects processed, matches, rate)
+- `--max-workers <N>` - Number of parallel workers for owner name resolution (default: 10)
 
 ### Qumulo Connection Options
 - `--host <host>` - Qumulo cluster hostname or IP
@@ -294,6 +324,30 @@ By default, JSON output includes only the file path and the selected time field.
 ```
 
 **Note:** `--all-attributes` only affects JSON output. Plain text output always shows the time field and path.
+
+## Owner Capacity Reports
+
+Generate storage capacity reports grouped by file owner with `--owner-report`. The script automatically resolves owner auth_ids to human-readable names using parallel processing for performance.
+
+**Basic usage:**
+```bash
+./qumulo_file_filter.sh --path /data --owner-report --csv-out report.csv
+```
+
+**Output columns:**
+- Without `--include-metadata`: `owner`, `auth_id`, `total_capacity_bytes`
+- With `--include-metadata`: `owner`, `auth_id`, `data_capacity_bytes`, `metadata_capacity_bytes`, `total_capacity_bytes`
+
+**Example CSV output with metadata:**
+```csv
+owner,auth_id,data_capacity_bytes,metadata_capacity_bytes,total_capacity_bytes
+AD\jdoe,25769805128,52428800000,8192000,52436992000
+AD\jane,25769805129,31457280000,4096000,31461376000
+```
+
+**Performance tuning:**
+- Use `--max-workers` to adjust parallel name resolution (default: 10 workers)
+- Combine with filters to generate targeted reports (e.g., `--older-than 365 --owner-report`)
 
 ## How It Works
 
