@@ -28,6 +28,9 @@ SMALLER_THAN=""
 QQ_HOST=""
 QQ_CREDENTIALS_STORE=""
 OWNER_REPORT=false
+MAX_WORKERS=10
+LIMIT=""
+PROGRESS=false
 
 # Field-specific time filters
 ACCESSED_OLDER_THAN=""
@@ -179,6 +182,18 @@ while [[ $# -gt 0 ]]; do
             OWNER_REPORT=true
             shift
             ;;
+        --max-workers)
+            MAX_WORKERS="$2"
+            shift 2
+            ;;
+        --limit)
+            LIMIT="$2"
+            shift 2
+            ;;
+        --progress)
+            PROGRESS=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Qumulo File Filter - Linux/GNU version
@@ -239,6 +254,9 @@ Output Options:
   --verbose                  Show detailed logging to stderr
   --all-attributes           Include all file attributes in JSON output (default: path + time field only)
   --owner-report             Generate usage report by file owner (auto-enables --all-attributes)
+  --max-workers <N>          Number of parallel workers for owner resolution (default: 10)
+  --limit <N>                Stop after finding N matching results (useful for quick sampling/testing)
+  --progress                 Show real-time progress stats (objects processed, matches found, rate)
 
 Qumulo Connection Options:
   --host <host>              Qumulo cluster hostname or IP
@@ -690,7 +708,7 @@ if [ -n "$OMIT_SUBDIRS" ]; then
         fi
         eval "$ROOT_CMD"
 
-        # Then, process subdirectories (excluding omitted ones)
+        # Then, process subdirectories (excluding omitted ones) in parallel
         $QQ_BASE fs_walk_tree --path "$PATH_TO_SEARCH" --max-depth 1 --display-all-attributes | \
         python3 -c "
 import sys
@@ -698,10 +716,12 @@ import json
 import subprocess
 import shlex
 import fnmatch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 omit_patterns = shlex.split('$OMIT_SUBDIRS')
 verbose = '$VERBOSE' == 'true'
 qq_base = '$QQ_BASE'
+max_workers = int('$MAX_WORKERS') if '$MAX_WORKERS' else 10
 data = json.load(sys.stdin)
 
 def should_omit(dirname, patterns):
@@ -711,11 +731,29 @@ def should_omit(dirname, patterns):
             return True, pattern
     return False, None
 
+def process_directory(path, dirname):
+    \"\"\"Process a single directory and return its output.\"\"\"
+    cmd = qq_base + ' fs_walk_tree --path ' + shlex.quote(path) + ' --display-all-attributes'
+    if '$FILE_ONLY' == 'true':
+        cmd += ' --file-only'
+    if '$MAX_DEPTH':
+        cmd += ' --max-depth $MAX_DEPTH'
+
+    if verbose:
+        print(f'[PROCESS] Processing subdirectory: {dirname}', file=sys.stderr)
+
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout, dirname, True
+    else:
+        return '', dirname, False
+
 if verbose:
     print(f'[INFO] Omit patterns: {omit_patterns}', file=sys.stderr)
     print(f'[INFO] Scanning subdirectories in: $PATH_TO_SEARCH', file=sys.stderr)
 
-processed_count = 0
+# First, collect all directories to process
+dirs_to_process = []
 omitted_count = 0
 
 for node in data.get('tree_nodes', []):
@@ -736,20 +774,44 @@ for node in data.get('tree_nodes', []):
                 print(f'[OMIT] Skipping directory \"{dirname}\" (matched pattern: {matched_pattern})', file=sys.stderr)
             continue
 
-        # Process this directory
+        dirs_to_process.append((path, dirname))
+
+if verbose:
+    print(f'[INFO] Processing {len(dirs_to_process)} subdirectories with {max_workers} parallel workers...', file=sys.stderr)
+
+# Process directories in parallel
+processed_count = 0
+if dirs_to_process:
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all directory processing tasks
+            future_to_dir = {
+                executor.submit(process_directory, path, dirname): (path, dirname)
+                for path, dirname in dirs_to_process
+            }
+
+            # Collect results as they complete and write immediately
+            for future in as_completed(future_to_dir):
+                path, dirname = future_to_dir[future]
+                try:
+                    output, dirname, success = future.result()
+                    if success:
+                        sys.stdout.write(output)
+                        processed_count += 1
+                        if verbose and processed_count % 10 == 0:
+                            print(f'[INFO] Processed {processed_count}/{len(dirs_to_process)} subdirectories...', file=sys.stderr)
+                except Exception as e:
+                    if verbose:
+                        print(f'[ERROR] Failed to process directory {dirname}: {e}', file=sys.stderr)
+    except Exception as e:
         if verbose:
-            print(f'[PROCESS] Processing subdirectory: {dirname}', file=sys.stderr)
-
-        processed_count += 1
-        cmd = qq_base + ' fs_walk_tree --path ' + shlex.quote(path) + ' --display-all-attributes'
-        if '$FILE_ONLY' == 'true':
-            cmd += ' --file-only'
-        if '$MAX_DEPTH':
-            cmd += ' --max-depth $MAX_DEPTH'
-
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        if result.returncode == 0:
-            sys.stdout.write(result.stdout)
+            print(f'[ERROR] Parallel processing failed: {e}, falling back to sequential', file=sys.stderr)
+        # Fallback to sequential processing if parallel fails
+        for path, dirname in dirs_to_process:
+            output, dirname, success = process_directory(path, dirname)
+            if success:
+                sys.stdout.write(output)
+                processed_count += 1
 
 if verbose:
     print(f'[INFO] Summary: {processed_count} subdirectories processed, {omitted_count} subdirectories omitted', file=sys.stderr)
@@ -762,7 +824,9 @@ fi | python3 -u -c "
 import sys
 import json
 import csv
+import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Ensure unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
@@ -781,6 +845,13 @@ verbose = '${VERBOSE}' == 'true'
 owner_report = '${OWNER_REPORT}' == 'true'
 qq_host = '$QQ_HOST'
 qq_creds = '$QQ_CREDENTIALS_STORE'
+max_workers = int('$MAX_WORKERS') if '$MAX_WORKERS' else 10
+limit = int('$LIMIT') if '$LIMIT' else 0
+match_count = 0
+progress = '${PROGRESS}' == 'true'
+progress_interval = 1000  # Report progress every N objects
+objects_processed = 0
+start_time = None
 
 # Field-specific thresholds
 accessed_threshold_older = '$ACCESSED_THRESHOLD_OLDER'
@@ -1004,6 +1075,10 @@ if csv_out_file:
     csv_file_handle = open(csv_out_file, 'w', newline='')
     csv_writer = csv.writer(csv_file_handle)
 
+# Initialize start time for progress reporting
+if progress:
+    start_time = time.time()
+
 for line in sys.stdin:
     try:
         item = json.loads(line)
@@ -1017,83 +1092,119 @@ for line in sys.stdin:
 
         # New object detected
         if idx != current_idx:
+            # Increment objects processed counter
+            objects_processed += 1
+
+            # Report progress periodically
+            if progress and objects_processed % progress_interval == 0:
+                elapsed = time.time() - start_time
+                rate = objects_processed / elapsed if elapsed > 0 else 0
+                print(f'[PROGRESS] Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Elapsed: {elapsed:.1f}s', file=sys.stderr)
             # Process previous object
             # Check if we have minimum required data (path, and time_field if time filter is used)
             has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
             if has_required_data:
-                # AND logic: all specified filters must match
-                time_match = matches_filter(current_obj.get(time_field))
-                field_time_match = matches_field_specific_time_filters(current_obj)
-                owner_match = matches_owner(current_obj.get('owner'))
-                size_match = matches_size(current_obj.get('size'))
+                # AND logic with short-circuit evaluation: check cheapest filters first
+                # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
+                if not matches_size(current_obj.get('size')):
+                    # Reset for new object
+                    current_obj = {}
+                    current_idx = idx
+                    continue
 
-                if time_match and field_time_match and owner_match and size_match:
-                    if owner_report:
-                        # Aggregate by owner instead of outputting individual files
-                        file_owner = current_obj.get('owner')
-                        file_size = current_obj.get('size', 0)
-                        if file_owner:
-                            try:
-                                size_bytes = int(file_size) if file_size else 0
-                                if file_owner not in owner_aggregates:
-                                    owner_aggregates[file_owner] = 0
-                                owner_aggregates[file_owner] += size_bytes
-                            except (ValueError, TypeError):
-                                pass  # Skip files with invalid size
-                    elif output_csv:
-                        # CSV output
-                        if all_attributes:
-                            # Write header on first row
-                            if not csv_header_written:
-                                csv_writer.writerow(sorted(current_obj.keys()))
-                                csv_header_written = True
-                            # Write values in same order as header
-                            csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
-                        else:
-                            # Write selective fields
-                            row_data = {'path': current_obj['path']}
-                            if comparison and time_field in current_obj:
-                                row_data[time_field] = current_obj[time_field]
-                            if owner_auth_id and 'owner' in current_obj:
-                                row_data['owner'] = current_obj['owner']
-                            if (size_greater or size_smaller) and 'size' in current_obj:
-                                row_data['size'] = current_obj['size']
+                if not matches_owner(current_obj.get('owner')):
+                    # Reset for new object
+                    current_obj = {}
+                    current_idx = idx
+                    continue
 
-                            if not csv_header_written:
-                                csv_writer.writerow(row_data.keys())
-                                csv_header_written = True
-                            csv_writer.writerow(row_data.values())
-                        csv_file_handle.flush()
-                    elif output_json:
-                        if all_attributes:
-                            # Include all attributes
-                            output = json.dumps(current_obj)
-                        else:
-                            # Include path and any fields used in filtering
-                            filtered_obj = {'path': current_obj['path']}
+                if not matches_filter(current_obj.get(time_field)):
+                    # Reset for new object
+                    current_obj = {}
+                    current_idx = idx
+                    continue
 
-                            # Add time field if time filter was used
-                            if comparison and time_field in current_obj:
-                                filtered_obj[time_field] = current_obj[time_field]
+                if not matches_field_specific_time_filters(current_obj):
+                    # Reset for new object
+                    current_obj = {}
+                    current_idx = idx
+                    continue
 
-                            # Add owner if owner filter was used
-                            if owner_auth_id and 'owner' in current_obj:
-                                filtered_obj['owner'] = current_obj['owner']
+                # All filters passed
+                # Check limit (skip for owner_report as it aggregates)
+                if not owner_report:
+                    match_count += 1
+                    if limit and match_count > limit:
+                        if verbose:
+                            print(f'[INFO] Reached limit of {limit} matches, stopping...', file=sys.stderr)
+                        break
 
-                            # Add size if size filter was used
-                            if (size_greater or size_smaller) and 'size' in current_obj:
-                                filtered_obj['size'] = current_obj['size']
-
-                            output = json.dumps(filtered_obj)
-                        if json_file_handle:
-                            json_file_handle.write(output + '\n')
-                            json_file_handle.flush()
-                        else:
-                            print(output)
+                if owner_report:
+                    # Aggregate by owner instead of outputting individual files
+                    file_owner = current_obj.get('owner')
+                    file_size = current_obj.get('size', 0)
+                    if file_owner:
+                        try:
+                            size_bytes = int(file_size) if file_size else 0
+                            if file_owner not in owner_aggregates:
+                                owner_aggregates[file_owner] = 0
+                            owner_aggregates[file_owner] += size_bytes
+                        except (ValueError, TypeError):
+                            pass  # Skip files with invalid size
+                elif output_csv:
+                    # CSV output
+                    if all_attributes:
+                        # Write header on first row
+                        if not csv_header_written:
+                            csv_writer.writerow(sorted(current_obj.keys()))
+                            csv_header_written = True
+                        # Write values in same order as header
+                        csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
                     else:
+                        # Write selective fields
+                        row_data = {'path': current_obj['path']}
                         if comparison and time_field in current_obj:
-                            print(current_obj[time_field])
-                        print(current_obj['path'])
+                            row_data[time_field] = current_obj[time_field]
+                        if owner_auth_id and 'owner' in current_obj:
+                            row_data['owner'] = current_obj['owner']
+                        if (size_greater or size_smaller) and 'size' in current_obj:
+                            row_data['size'] = current_obj['size']
+
+                        if not csv_header_written:
+                            csv_writer.writerow(row_data.keys())
+                            csv_header_written = True
+                        csv_writer.writerow(row_data.values())
+                    csv_file_handle.flush()
+                elif output_json:
+                    if all_attributes:
+                        # Include all attributes
+                        output = json.dumps(current_obj)
+                    else:
+                        # Include path and any fields used in filtering
+                        filtered_obj = {'path': current_obj['path']}
+
+                        # Add time field if time filter was used
+                        if comparison and time_field in current_obj:
+                            filtered_obj[time_field] = current_obj[time_field]
+
+                        # Add owner if owner filter was used
+                        if owner_auth_id and 'owner' in current_obj:
+                            filtered_obj['owner'] = current_obj['owner']
+
+                        # Add size if size filter was used
+                        if (size_greater or size_smaller) and 'size' in current_obj:
+                            filtered_obj['size'] = current_obj['size']
+
+                        output = json.dumps(filtered_obj)
+                    if json_file_handle:
+                        json_file_handle.write(output + '\n')
+                        json_file_handle.flush()
+                    else:
+                        print(output)
+                else:
+                    if comparison and time_field in current_obj:
+                        print(current_obj[time_field])
+                    print(current_obj['path'])
 
             # Reset for new object
             current_obj = {}
@@ -1109,89 +1220,144 @@ for line in sys.stdin:
 # Check if we have minimum required data (path, and time_field if time filter is used)
 has_required_data = current_obj.get('path') and (not comparison or current_obj.get(time_field))
 if has_required_data:
-    # AND logic: all specified filters must match
-    time_match = matches_filter(current_obj.get(time_field))
-    field_time_match = matches_field_specific_time_filters(current_obj)
-    owner_match = matches_owner(current_obj.get('owner'))
-    size_match = matches_size(current_obj.get('size'))
+    # AND logic with short-circuit evaluation: check cheapest filters first
+    # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
+    if matches_size(current_obj.get('size')) and \
+       matches_owner(current_obj.get('owner')) and \
+       matches_filter(current_obj.get(time_field)) and \
+       matches_field_specific_time_filters(current_obj):
+        # Check limit (skip for owner_report as it aggregates)
+        if not owner_report:
+            match_count += 1
+            # For final object, just skip output if limit reached (no loop to break)
+            if limit and match_count > limit:
+                if verbose:
+                    print(f'[INFO] Reached limit of {limit} matches (skipping final object)', file=sys.stderr)
 
-    if time_match and field_time_match and owner_match and size_match:
-        if owner_report:
-            # Aggregate by owner instead of outputting individual files
-            file_owner = current_obj.get('owner')
-            file_size = current_obj.get('size', 0)
-            if file_owner:
-                try:
-                    size_bytes = int(file_size) if file_size else 0
-                    if file_owner not in owner_aggregates:
-                        owner_aggregates[file_owner] = 0
-                    owner_aggregates[file_owner] += size_bytes
-                except (ValueError, TypeError):
-                    pass  # Skip files with invalid size
-        elif output_csv:
-            # CSV output
-            if all_attributes:
-                # Write header on first row
-                if not csv_header_written:
-                    csv_writer.writerow(sorted(current_obj.keys()))
-                    csv_header_written = True
-                # Write values in same order as header
-                csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+        # Only output if limit not exceeded (or owner_report which doesn't use limit)
+        if owner_report or not limit or match_count <= limit:
+            if owner_report:
+                # Aggregate by owner instead of outputting individual files
+                file_owner = current_obj.get('owner')
+                file_size = current_obj.get('size', 0)
+                if file_owner:
+                    try:
+                        size_bytes = int(file_size) if file_size else 0
+                        if file_owner not in owner_aggregates:
+                            owner_aggregates[file_owner] = 0
+                        owner_aggregates[file_owner] += size_bytes
+                    except (ValueError, TypeError):
+                        pass  # Skip files with invalid size
+            elif output_csv:
+                # CSV output
+                if all_attributes:
+                    # Write header on first row
+                    if not csv_header_written:
+                        csv_writer.writerow(sorted(current_obj.keys()))
+                        csv_header_written = True
+                    # Write values in same order as header
+                    csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+                else:
+                    # Write selective fields
+                    row_data = {'path': current_obj['path']}
+                    if comparison and time_field in current_obj:
+                        row_data[time_field] = current_obj[time_field]
+                    if owner_auth_id and 'owner' in current_obj:
+                        row_data['owner'] = current_obj['owner']
+                    if (size_greater or size_smaller) and 'size' in current_obj:
+                        row_data['size'] = current_obj['size']
+
+                    if not csv_header_written:
+                        csv_writer.writerow(row_data.keys())
+                        csv_header_written = True
+                    csv_writer.writerow(row_data.values())
+                csv_file_handle.flush()
+            elif output_json:
+                if all_attributes:
+                    # Include all attributes
+                    output = json.dumps(current_obj)
+                else:
+                    # Include path and any fields used in filtering
+                    filtered_obj = {'path': current_obj['path']}
+
+                    # Add time field if time filter was used
+                    if comparison and time_field in current_obj:
+                        filtered_obj[time_field] = current_obj[time_field]
+
+                    # Add owner if owner filter was used
+                    if owner_auth_id and 'owner' in current_obj:
+                        filtered_obj['owner'] = current_obj['owner']
+
+                    # Add size if size filter was used
+                    if (size_greater or size_smaller) and 'size' in current_obj:
+                        filtered_obj['size'] = current_obj['size']
+
+                    output = json.dumps(filtered_obj)
+                if json_file_handle:
+                    json_file_handle.write(output + '\n')
+                    json_file_handle.flush()
+                else:
+                    print(output)
             else:
-                # Write selective fields
-                row_data = {'path': current_obj['path']}
                 if comparison and time_field in current_obj:
-                    row_data[time_field] = current_obj[time_field]
-                if owner_auth_id and 'owner' in current_obj:
-                    row_data['owner'] = current_obj['owner']
-                if (size_greater or size_smaller) and 'size' in current_obj:
-                    row_data['size'] = current_obj['size']
-
-                if not csv_header_written:
-                    csv_writer.writerow(row_data.keys())
-                    csv_header_written = True
-                csv_writer.writerow(row_data.values())
-            csv_file_handle.flush()
-        elif output_json:
-            if all_attributes:
-                # Include all attributes
-                output = json.dumps(current_obj)
-            else:
-                # Include path and any fields used in filtering
-                filtered_obj = {'path': current_obj['path']}
-
-                # Add time field if time filter was used
-                if comparison and time_field in current_obj:
-                    filtered_obj[time_field] = current_obj[time_field]
-
-                # Add owner if owner filter was used
-                if owner_auth_id and 'owner' in current_obj:
-                    filtered_obj['owner'] = current_obj['owner']
-
-                # Add size if size filter was used
-                if (size_greater or size_smaller) and 'size' in current_obj:
-                    filtered_obj['size'] = current_obj['size']
-
-                output = json.dumps(filtered_obj)
-            if json_file_handle:
-                json_file_handle.write(output + '\n')
-                json_file_handle.flush()
-            else:
-                print(output)
-        else:
-            if comparison and time_field in current_obj:
-                print(current_obj[time_field])
-            print(current_obj['path'])
+                    print(current_obj[time_field])
+                print(current_obj['path'])
 
 # Output owner report if requested
 if owner_report and owner_aggregates:
     if verbose:
         print(f'[INFO] Generating owner report for {len(owner_aggregates)} unique owners...', file=sys.stderr)
 
-    # Resolve all owner names
+    # Resolve all owner names in parallel for better performance
+    # Use ThreadPoolExecutor to parallelize API calls (I/O bound operation)
     owner_report_data = []
+
+    # Prepare data structure for parallel processing
+    auth_ids = list(owner_aggregates.keys())
+
+    if verbose:
+        print(f'[INFO] Resolving owner names using {max_workers} parallel workers...', file=sys.stderr)
+
+    # Parallel resolution with error handling
+    owner_name_map = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all resolution tasks
+            future_to_auth_id = {
+                executor.submit(resolve_owner_name, auth_id): auth_id
+                for auth_id in auth_ids
+            }
+
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_auth_id):
+                auth_id = future_to_auth_id[future]
+                try:
+                    owner_name = future.result()
+                    owner_name_map[auth_id] = owner_name
+                    completed += 1
+                    if verbose and completed % 10 == 0:
+                        print(f'[INFO] Resolved {completed}/{len(auth_ids)} owners...', file=sys.stderr)
+                except Exception as e:
+                    if verbose:
+                        print(f'[ERROR] Failed to resolve auth_id {auth_id}: {e}', file=sys.stderr)
+                    # Fallback to auth_id as name
+                    owner_name_map[auth_id] = f'auth_id:{auth_id}'
+    except Exception as e:
+        if verbose:
+            print(f'[ERROR] Parallel resolution failed: {e}, falling back to sequential', file=sys.stderr)
+        # Fallback to sequential processing if parallel fails
+        for auth_id in auth_ids:
+            try:
+                owner_name_map[auth_id] = resolve_owner_name(auth_id)
+            except Exception as fallback_error:
+                if verbose:
+                    print(f'[ERROR] Failed to resolve {auth_id}: {fallback_error}', file=sys.stderr)
+                owner_name_map[auth_id] = f'auth_id:{auth_id}'
+
+    # Build report data using resolved names
     for auth_id, total_size in owner_aggregates.items():
-        owner_name = resolve_owner_name(auth_id)
+        owner_name = owner_name_map.get(auth_id, f'auth_id:{auth_id}')
         owner_report_data.append({
             'owner': owner_name,
             'auth_id': auth_id,
@@ -1237,6 +1403,12 @@ if owner_report and owner_aggregates:
             print(f\"{item['owner']:<40} {item['auth_id']:<20} {capacity_str:>15}\")
         print('=' * 80)
         print(f'Total owners: {len(owner_report_data)}')
+
+# Final progress report
+if progress and start_time:
+    elapsed = time.time() - start_time
+    rate = objects_processed / elapsed if elapsed > 0 else 0
+    print(f'[PROGRESS] FINAL: Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Total time: {elapsed:.1f}s', file=sys.stderr)
 
 if json_file_handle:
     json_file_handle.close()
