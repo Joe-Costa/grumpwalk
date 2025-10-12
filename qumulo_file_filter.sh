@@ -31,6 +31,7 @@ OWNER_REPORT=false
 MAX_WORKERS=10
 LIMIT=""
 PROGRESS=false
+INCLUDE_METADATA=false
 
 # Field-specific time filters
 ACCESSED_OLDER_THAN=""
@@ -194,6 +195,10 @@ while [[ $# -gt 0 ]]; do
             PROGRESS=true
             shift
             ;;
+        --include-metadata)
+            INCLUDE_METADATA=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Qumulo File Filter - Linux/GNU version
@@ -232,6 +237,7 @@ Size Filter Options (optional):
                              Both can be used together for range filtering
                              Supported units: B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB
                              Examples: 100MB, 1.5GiB, 500, 10KB
+  --include-metadata         Include metadata blocks in size calculations (metablocks * 4KB)
 
 Owner Filter Options:
   --owner <name>             Filter by file owner (can be specified multiple times for OR logic)
@@ -865,6 +871,7 @@ progress = '${PROGRESS}' == 'true'
 progress_interval = 1000  # Report progress every N objects
 objects_processed = 0
 start_time = None
+include_metadata = '${INCLUDE_METADATA}' == 'true'
 
 # Field-specific thresholds
 accessed_threshold_older = '$ACCESSED_THRESHOLD_OLDER'
@@ -993,7 +1000,25 @@ def matches_owner(file_owner):
     owner_ids = owner_auth_id.split()
     return file_owner in owner_ids
 
-def matches_size(file_size):
+def calculate_total_size(file_size, metablocks):
+    # Calculate total size including metadata if requested
+    # Each metablock is 4KB (4096 bytes)
+    size_bytes = 0
+    try:
+        size_bytes = int(file_size) if file_size else 0
+    except (ValueError, TypeError):
+        size_bytes = 0
+
+    if include_metadata and metablocks:
+        try:
+            metadata_bytes = int(metablocks) * 4096
+            size_bytes += metadata_bytes
+        except (ValueError, TypeError):
+            pass  # If metablocks is invalid, just use file size
+
+    return size_bytes
+
+def matches_size(file_size, metablocks=None):
     # If no size filter specified, match everything
     if not size_larger and not size_smaller:
         return True
@@ -1002,10 +1027,10 @@ def matches_size(file_size):
     if not file_size:
         return False
 
-    # Convert file_size to int for comparison
-    try:
-        size_bytes = int(file_size)
-    except (ValueError, TypeError):
+    # Calculate total size (file + metadata if requested)
+    size_bytes = calculate_total_size(file_size, metablocks)
+
+    if size_bytes == 0:
         return False
 
     # Check size filters (both can be specified for range filtering)
@@ -1053,7 +1078,10 @@ def flush_csv_batch():
     csv_batch.clear()
 
 # Owner report aggregation data
-owner_aggregates = {}  # auth_id -> total_size
+# When --include-metadata is used, we track data and metadata separately
+# Structure: auth_id -> {'data': bytes, 'metadata': bytes} if include_metadata
+#            auth_id -> total_bytes (int) if not include_metadata
+owner_aggregates = {}
 owner_name_cache = {}  # auth_id -> resolved_name
 
 def resolve_owner_name(auth_id):
@@ -1185,7 +1213,7 @@ for line in sys.stdin:
             if has_required_data:
                 # AND logic with short-circuit evaluation: check cheapest filters first
                 # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
-                if not matches_size(current_obj.get('size')):
+                if not matches_size(current_obj.get('size'), current_obj.get('metablocks')):
                     # Reset for new object
                     current_obj = {}
                     current_idx = idx
@@ -1223,12 +1251,25 @@ for line in sys.stdin:
                     # Aggregate by owner instead of outputting individual files
                     file_owner = current_obj.get('owner')
                     file_size = current_obj.get('size', 0)
+                    file_metablocks = current_obj.get('metablocks')
                     if file_owner:
                         try:
-                            size_bytes = int(file_size) if file_size else 0
+                            data_bytes = int(file_size) if file_size else 0
+                            metadata_bytes = 0
+                            if include_metadata and file_metablocks:
+                                metadata_bytes = int(file_metablocks) * 4096
+
                             if file_owner not in owner_aggregates:
-                                owner_aggregates[file_owner] = 0
-                            owner_aggregates[file_owner] += size_bytes
+                                if include_metadata:
+                                    owner_aggregates[file_owner] = {'data': 0, 'metadata': 0}
+                                else:
+                                    owner_aggregates[file_owner] = 0
+
+                            if include_metadata:
+                                owner_aggregates[file_owner]['data'] += data_bytes
+                                owner_aggregates[file_owner]['metadata'] += metadata_bytes
+                            else:
+                                owner_aggregates[file_owner] += data_bytes
                         except (ValueError, TypeError):
                             pass  # Skip files with invalid size
                 elif output_csv:
@@ -1299,7 +1340,7 @@ for line in sys.stdin:
         # Collect all attributes if --all-attributes, otherwise just what we need
         if all_attributes:
             current_obj[key] = val
-        elif key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner', 'size'):
+        elif key in ('path', 'creation_time', 'access_time', 'modification_time', 'change_time', 'owner', 'size', 'metablocks'):
             current_obj[key] = val
 
 # Process final object
@@ -1308,7 +1349,7 @@ has_required_data = current_obj.get('path') and (not comparison or current_obj.g
 if has_required_data:
     # AND logic with short-circuit evaluation: check cheapest filters first
     # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
-    if matches_size(current_obj.get('size')) and \
+    if matches_size(current_obj.get('size'), current_obj.get('metablocks')) and \
        matches_owner(current_obj.get('owner')) and \
        matches_filter(current_obj.get(time_field)) and \
        matches_field_specific_time_filters(current_obj):
@@ -1326,12 +1367,25 @@ if has_required_data:
                 # Aggregate by owner instead of outputting individual files
                 file_owner = current_obj.get('owner')
                 file_size = current_obj.get('size', 0)
+                file_metablocks = current_obj.get('metablocks')
                 if file_owner:
                     try:
-                        size_bytes = int(file_size) if file_size else 0
+                        data_bytes = int(file_size) if file_size else 0
+                        metadata_bytes = 0
+                        if include_metadata and file_metablocks:
+                            metadata_bytes = int(file_metablocks) * 4096
+
                         if file_owner not in owner_aggregates:
-                            owner_aggregates[file_owner] = 0
-                        owner_aggregates[file_owner] += size_bytes
+                            if include_metadata:
+                                owner_aggregates[file_owner] = {'data': 0, 'metadata': 0}
+                            else:
+                                owner_aggregates[file_owner] = 0
+
+                        if include_metadata:
+                            owner_aggregates[file_owner]['data'] += data_bytes
+                            owner_aggregates[file_owner]['metadata'] += metadata_bytes
+                        else:
+                            owner_aggregates[file_owner] += data_bytes
                     except (ValueError, TypeError):
                         pass  # Skip files with invalid size
             elif output_csv:
@@ -1446,13 +1500,28 @@ if owner_report and owner_aggregates:
                 owner_name_map[auth_id] = f'auth_id:{auth_id}'
 
     # Build report data using resolved names
-    for auth_id, total_size in owner_aggregates.items():
+    for auth_id, size_data in owner_aggregates.items():
         owner_name = owner_name_map.get(auth_id, f'auth_id:{auth_id}')
-        owner_report_data.append({
-            'owner': owner_name,
-            'auth_id': auth_id,
-            'total_capacity_bytes': total_size
-        })
+
+        if include_metadata:
+            # Separate columns for data and metadata
+            data_bytes = size_data['data']
+            metadata_bytes = size_data['metadata']
+            total_bytes = data_bytes + metadata_bytes
+            owner_report_data.append({
+                'owner': owner_name,
+                'auth_id': auth_id,
+                'data_capacity_bytes': data_bytes,
+                'metadata_capacity_bytes': metadata_bytes,
+                'total_capacity_bytes': total_bytes
+            })
+        else:
+            # Single total column
+            owner_report_data.append({
+                'owner': owner_name,
+                'auth_id': auth_id,
+                'total_capacity_bytes': size_data
+            })
 
     # Sort by total size descending
     owner_report_data.sort(key=lambda x: x['total_capacity_bytes'], reverse=True)
@@ -1463,9 +1532,15 @@ if owner_report and owner_aggregates:
             csv_file_handle = open(csv_out_file, 'w', newline='')
             csv_writer = csv.writer(csv_file_handle)
 
-        csv_writer.writerow(['owner', 'auth_id', 'total_capacity_bytes'])
-        for item in owner_report_data:
-            csv_writer.writerow([item['owner'], item['auth_id'], item['total_capacity_bytes']])
+        # Conditional header based on include_metadata flag
+        if include_metadata:
+            csv_writer.writerow(['owner', 'auth_id', 'data_capacity_bytes', 'metadata_capacity_bytes', 'total_capacity_bytes'])
+            for item in owner_report_data:
+                csv_writer.writerow([item['owner'], item['auth_id'], item['data_capacity_bytes'], item['metadata_capacity_bytes'], item['total_capacity_bytes']])
+        else:
+            csv_writer.writerow(['owner', 'auth_id', 'total_capacity_bytes'])
+            for item in owner_report_data:
+                csv_writer.writerow([item['owner'], item['auth_id'], item['total_capacity_bytes']])
         csv_file_handle.flush()
 
         if verbose:
@@ -1486,11 +1561,20 @@ if owner_report and owner_aggregates:
         # Plain text output
         print('Owner Report')
         print('=' * 80)
-        print(f'{\"Owner\":<40} {\"Auth ID\":<20} {\"Total Capacity\":>15}')
+        if include_metadata:
+            print(f'{\"Owner\":<40} {\"Auth ID\":<20} {\"Data (bytes)\":>15} {\"Metadata (bytes)\":>17} {\"Total (bytes)\":>15}')
+        else:
+            print(f'{\"Owner\":<40} {\"Auth ID\":<20} {\"Total Capacity\":>15}')
         print('-' * 80)
         for item in owner_report_data:
-            capacity_str = f\"{item['total_capacity_bytes']:,} bytes\"
-            print(f\"{item['owner']:<40} {item['auth_id']:<20} {capacity_str:>15}\")
+            if include_metadata:
+                data_str = f\"{item['data_capacity_bytes']:,}\"
+                metadata_str = f\"{item['metadata_capacity_bytes']:,}\"
+                total_str = f\"{item['total_capacity_bytes']:,}\"
+                print(f\"{item['owner']:<40} {item['auth_id']:<20} {data_str:>15} {metadata_str:>17} {total_str:>15}\")
+            else:
+                capacity_str = f\"{item['total_capacity_bytes']:,} bytes\"
+                print(f\"{item['owner']:<40} {item['auth_id']:<20} {capacity_str:>15}\")
         print('=' * 80)
         print(f'Total owners: {len(owner_report_data)}')
 
