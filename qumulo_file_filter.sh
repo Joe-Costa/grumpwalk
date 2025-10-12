@@ -696,18 +696,12 @@ process_directory() {
 if [ -n "$OMIT_SUBDIRS" ]; then
     # Use Python to handle directory filtering with proper space handling and wildcards
     {
-        # First, process the root directory itself (max-depth 1, file-only)
+        # Scan root directory once and output results + discover subdirectories for parallel processing
         if [ "$VERBOSE" = true ]; then
-            echo "[INFO] Processing root directory: $PATH_TO_SEARCH" >&2
+            echo "[INFO] Scanning root directory for filtering and subdirectory discovery: $PATH_TO_SEARCH" >&2
         fi
 
         QQ_BASE=$(build_qq_cmd)
-        ROOT_CMD="$QQ_BASE fs_walk_tree --path \"$PATH_TO_SEARCH\" --display-all-attributes --max-depth 1"
-        if [ "$FILE_ONLY" = true ]; then
-            ROOT_CMD="$ROOT_CMD --file-only"
-        fi
-        eval "$ROOT_CMD"
-
         # Then, process subdirectories (excluding omitted ones) in parallel
         $QQ_BASE fs_walk_tree --path "$PATH_TO_SEARCH" --max-depth 1 --display-all-attributes | \
         python3 -c "
@@ -725,6 +719,20 @@ qq_base = '$QQ_BASE'
 max_workers_config = int('$MAX_WORKERS') if '$MAX_WORKERS' else 10
 data = json.load(sys.stdin)
 
+# Output root-level results immediately (apply file-only filter if requested)
+if '$FILE_ONLY' == 'true':
+    # Filter out directories from tree_nodes for output
+    filtered_data = dict(data)
+    filtered_data['tree_nodes'] = [
+        node for node in data.get('tree_nodes', [])
+        if node.get('type') != 'FS_FILE_TYPE_DIRECTORY'
+    ]
+    sys.stdout.write(json.dumps(filtered_data))
+else:
+    sys.stdout.write(json.dumps(data))
+
+sys.stdout.flush()
+
 def should_omit(dirname, patterns):
     \"\"\"Check if dirname matches any pattern (supports wildcards)\"\"\"
     for pattern in patterns:
@@ -738,7 +746,11 @@ def process_directory(path, dirname):
     if '$FILE_ONLY' == 'true':
         cmd += ' --file-only'
     if '$MAX_DEPTH':
-        cmd += ' --max-depth $MAX_DEPTH'
+        # Subtract 1 from max-depth since we already descended one level from root
+        remaining_depth = int('$MAX_DEPTH') - 1
+        if remaining_depth > 0:
+            cmd += f' --max-depth {remaining_depth}'
+        # If remaining_depth <= 0, don't add max-depth flag (only process this directory)
 
     if verbose:
         print(f'[PROCESS] Processing subdirectory: {dirname}', file=sys.stderr)
@@ -760,7 +772,7 @@ omitted_count = 0
 for node in data.get('tree_nodes', []):
     if node.get('type') == 'FS_FILE_TYPE_DIRECTORY':
         path = node.get('path', '')
-        # Skip the root path itself (already processed above)
+        # Skip the root path itself (we only want its immediate subdirectories)
         if path in ['$PATH_TO_SEARCH', '$PATH_TO_SEARCH/']:
             continue
 
@@ -1185,14 +1197,14 @@ for line in sys.stdin:
                         except (ValueError, TypeError):
                             pass  # Skip files with invalid size
                 elif output_csv:
-                    # CSV output
+                    # CSV output with batching
                     if all_attributes:
                         # Write header on first row
                         if not csv_header_written:
                             csv_writer.writerow(sorted(current_obj.keys()))
                             csv_header_written = True
-                        # Write values in same order as header
-                        csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+                        # Add to batch instead of writing immediately
+                        csv_batch.append([current_obj.get(k, '') for k in sorted(current_obj.keys())])
                     else:
                         # Write selective fields
                         row_data = {'path': current_obj['path']}
@@ -1206,9 +1218,13 @@ for line in sys.stdin:
                         if not csv_header_written:
                             csv_writer.writerow(row_data.keys())
                             csv_header_written = True
-                        csv_writer.writerow(row_data.values())
-                    csv_file_handle.flush()
+                        csv_batch.append(list(row_data.values()))
+
+                    # Flush batch when it reaches batch_size
+                    if len(csv_batch) >= batch_size:
+                        flush_csv_batch()
                 elif output_json:
+                    # JSON output with batching
                     if all_attributes:
                         # Include all attributes
                         output = json.dumps(current_obj)
@@ -1229,11 +1245,13 @@ for line in sys.stdin:
                             filtered_obj['size'] = current_obj['size']
 
                         output = json.dumps(filtered_obj)
-                    if json_file_handle:
-                        json_file_handle.write(output + '\n')
-                        json_file_handle.flush()
-                    else:
-                        print(output)
+
+                    # Add to batch instead of writing immediately
+                    json_batch.append(output)
+
+                    # Flush batch when it reaches batch_size
+                    if len(json_batch) >= batch_size:
+                        flush_json_batch()
                 else:
                     if comparison and time_field in current_obj:
                         print(current_obj[time_field])
@@ -1282,14 +1300,14 @@ if has_required_data:
                     except (ValueError, TypeError):
                         pass  # Skip files with invalid size
             elif output_csv:
-                # CSV output
+                # CSV output with batching
                 if all_attributes:
                     # Write header on first row
                     if not csv_header_written:
                         csv_writer.writerow(sorted(current_obj.keys()))
                         csv_header_written = True
-                    # Write values in same order as header
-                    csv_writer.writerow([current_obj.get(k, '') for k in sorted(current_obj.keys())])
+                    # Add to batch (final flush will handle it)
+                    csv_batch.append([current_obj.get(k, '') for k in sorted(current_obj.keys())])
                 else:
                     # Write selective fields
                     row_data = {'path': current_obj['path']}
@@ -1303,9 +1321,10 @@ if has_required_data:
                     if not csv_header_written:
                         csv_writer.writerow(row_data.keys())
                         csv_header_written = True
-                    csv_writer.writerow(row_data.values())
-                csv_file_handle.flush()
+                    # Add to batch (final flush will handle it)
+                    csv_batch.append(list(row_data.values()))
             elif output_json:
+                # JSON output with batching
                 if all_attributes:
                     # Include all attributes
                     output = json.dumps(current_obj)
@@ -1326,11 +1345,9 @@ if has_required_data:
                         filtered_obj['size'] = current_obj['size']
 
                     output = json.dumps(filtered_obj)
-                if json_file_handle:
-                    json_file_handle.write(output + '\n')
-                    json_file_handle.flush()
-                else:
-                    print(output)
+
+                # Add to batch (final flush will handle it)
+                json_batch.append(output)
             else:
                 if comparison and time_field in current_obj:
                     print(current_obj[time_field])
