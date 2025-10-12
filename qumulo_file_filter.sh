@@ -716,12 +716,13 @@ import json
 import subprocess
 import shlex
 import fnmatch
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 omit_patterns = shlex.split('$OMIT_SUBDIRS')
 verbose = '$VERBOSE' == 'true'
 qq_base = '$QQ_BASE'
-max_workers = int('$MAX_WORKERS') if '$MAX_WORKERS' else 10
+max_workers_config = int('$MAX_WORKERS') if '$MAX_WORKERS' else 10
 data = json.load(sys.stdin)
 
 def should_omit(dirname, patterns):
@@ -776,14 +777,18 @@ for node in data.get('tree_nodes', []):
 
         dirs_to_process.append((path, dirname))
 
+# Smart worker scaling: Use min(max_workers_config, actual tasks, 2x CPU cores)
+cpu_count = os.cpu_count() or 1
+optimal_workers = min(max_workers_config, len(dirs_to_process), cpu_count * 2)
+
 if verbose:
-    print(f'[INFO] Processing {len(dirs_to_process)} subdirectories with {max_workers} parallel workers...', file=sys.stderr)
+    print(f'[INFO] Processing {len(dirs_to_process)} subdirectories with {optimal_workers} parallel workers (CPUs: {cpu_count}, max configured: {max_workers_config})...', file=sys.stderr)
 
 # Process directories in parallel
 processed_count = 0
 if dirs_to_process:
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
             # Submit all directory processing tasks
             future_to_dir = {
                 executor.submit(process_directory, path, dirname): (path, dirname)
@@ -1011,6 +1016,33 @@ json_file_handle = None
 csv_file_handle = None
 csv_writer = None
 csv_header_written = False
+
+# Batch processing for large result sets (100k+)
+batch_size = 1000  # Flush output every N results
+json_batch = []
+csv_batch = []
+
+def flush_json_batch():
+    \"\"\"Flush accumulated JSON results to output.\"\"\"
+    if not json_batch:
+        return
+    if json_file_handle:
+        for item in json_batch:
+            json_file_handle.write(item + '\n')
+        json_file_handle.flush()
+    else:
+        for item in json_batch:
+            print(item)
+    json_batch.clear()
+
+def flush_csv_batch():
+    \"\"\"Flush accumulated CSV rows to output.\"\"\"
+    if not csv_batch:
+        return
+    for row in csv_batch:
+        csv_writer.writerow(row)
+    csv_file_handle.flush()
+    csv_batch.clear()
 
 # Owner report aggregation data
 owner_aggregates = {}  # auth_id -> total_size
@@ -1316,13 +1348,18 @@ if owner_report and owner_aggregates:
     # Prepare data structure for parallel processing
     auth_ids = list(owner_aggregates.keys())
 
+    # Smart worker scaling: Use min(max_workers, actual tasks, 2x CPU cores)
+    import os
+    cpu_count = os.cpu_count() or 1
+    optimal_workers = min(max_workers, len(auth_ids), cpu_count * 2)
+
     if verbose:
-        print(f'[INFO] Resolving owner names using {max_workers} parallel workers...', file=sys.stderr)
+        print(f'[INFO] Resolving owner names using {optimal_workers} parallel workers (CPUs: {cpu_count}, tasks: {len(auth_ids)}, max configured: {max_workers})...', file=sys.stderr)
 
     # Parallel resolution with error handling
     owner_name_map = {}
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
             # Submit all resolution tasks
             future_to_auth_id = {
                 executor.submit(resolve_owner_name, auth_id): auth_id
@@ -1404,6 +1441,10 @@ if owner_report and owner_aggregates:
             print(f\"{item['owner']:<40} {item['auth_id']:<20} {capacity_str:>15}\")
         print('=' * 80)
         print(f'Total owners: {len(owner_report_data)}')
+
+# Flush any remaining batched output
+flush_json_batch()
+flush_csv_batch()
 
 # Final progress report
 if progress and start_time:
