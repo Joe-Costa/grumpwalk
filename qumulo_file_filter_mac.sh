@@ -1914,10 +1914,10 @@ if profile and start_time:
     
     # JSON parsing rate report
     print(f'[PROFILE] JSON parsing statistics:', file=sys.stderr)
-    total_lines_val = json_parsing_rate.get("total_lines", 0)
-    valid_json_val = json_parsing_rate.get("valid_json", 0)
-    empty_lines_val = json_parsing_rate.get("empty_lines", 0)
-    malformed_json_val = json_parsing_rate.get("malformed_json", 0)
+    total_lines_val = json_parsing_rate.get(\"total_lines\", 0)
+    valid_json_val = json_parsing_rate.get(\"valid_json\", 0)
+    empty_lines_val = json_parsing_rate.get(\"empty_lines\", 0)
+    malformed_json_val = json_parsing_rate.get(\"malformed_json\", 0)
     
     print(f'[PROFILE]   Total lines processed: {total_lines_val:,}', file=sys.stderr)
     print(f'[PROFILE]   Valid JSON lines: {valid_json_val:,}', file=sys.stderr)
