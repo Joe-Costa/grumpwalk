@@ -1529,7 +1529,7 @@ for line in sys.stdin:
                         profile_counts['output_writing'] += 1
                     update_memory_stats()
                 elif output_json:
-                    # JSON output with batching
+                    # JSON output - stream to stdout or batch to file
                     if profile:
                         output_start = time.time()
                     if all_attributes:
@@ -1553,22 +1553,26 @@ for line in sys.stdin:
 
                         output = json.dumps(filtered_obj)
 
-                    # Add to batch instead of writing immediately
-                    json_batch.append(output)
-
-                    # Flush batch when it reaches batch_size
-                    if len(json_batch) >= adaptive_batch_size:
-                        if profile:
-                            flush_start = time.time()
-                        flush_json_batch()
-                        if profile:
-                            flush_time = time.time() - flush_start
-                            profile_times['batch_flush'] += flush_time
-                            profile_counts['batch_flush'] += 1
-                            batch_performance_history.append(flush_time)
-                            # Adjust batch size periodically
-                            if objects_processed % batch_size_adjustment_interval == 0:
-                                adjust_batch_size()
+                    # Stream immediately to stdout, or batch to file
+                    if json_file_handle:
+                        # Batch writes to file for performance
+                        json_batch.append(output)
+                        # Flush batch when it reaches batch_size
+                        if len(json_batch) >= adaptive_batch_size:
+                            if profile:
+                                flush_start = time.time()
+                            flush_json_batch()
+                            if profile:
+                                flush_time = time.time() - flush_start
+                                profile_times['batch_flush'] += flush_time
+                                profile_counts['batch_flush'] += 1
+                                batch_performance_history.append(flush_time)
+                                # Adjust batch size periodically
+                                if objects_processed % batch_size_adjustment_interval == 0:
+                                    adjust_batch_size()
+                    else:
+                        # Stream immediately to stdout for real-time results
+                        print(output)
                     if profile:
                         profile_times['output_writing'] += time.time() - output_start
                         profile_counts['output_writing'] += 1
@@ -1686,7 +1690,7 @@ if has_required_data:
                                 # Add to batch (final flush will handle it)
                                 csv_batch.append(list(row_data.values()))
                         elif output_json:
-                            # JSON output with batching
+                            # JSON output - stream to stdout or batch to file
                             if all_attributes:
                                 # Include all attributes
                                 output = json.dumps(current_obj)
@@ -1708,8 +1712,13 @@ if has_required_data:
 
                                 output = json.dumps(filtered_obj)
 
-                            # Add to batch (final flush will handle it)
-                            json_batch.append(output)
+                            # Stream immediately to stdout, or batch to file
+                            if json_file_handle:
+                                # Add to batch (final flush will handle it)
+                                json_batch.append(output)
+                            else:
+                                # Stream immediately to stdout
+                                print(output)
                         else:
                             if comparison and time_field in current_obj:
                                 print(current_obj[time_field])
