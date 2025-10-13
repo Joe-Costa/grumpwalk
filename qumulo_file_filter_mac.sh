@@ -15,6 +15,7 @@ NEWER_THAN=""
 MAX_DEPTH=""
 FILE_ONLY=false
 OUTPUT_JSON=false
+OUTPUT_CSV=false
 OMIT_SUBDIRS=""
 VERBOSE=false
 JSON_OUT_FILE=""
@@ -33,6 +34,7 @@ MAX_WORKERS=10
 LIMIT=""
 PROGRESS=false
 INCLUDE_METADATA=false
+PROFILE=false
 
 # Field-specific time filters
 ACCESSED_OLDER_THAN=""
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --csv-out)
             CSV_OUT_FILE="$2"
+            OUTPUT_CSV=true
             shift 2
             ;;
         --created)
@@ -200,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             INCLUDE_METADATA=true
             shift
             ;;
+        --profile)
+            PROFILE=true
+            shift
+            ;;
         --help|-h)
             cat << 'EOF'
 Qumulo File Filter - macOS/BSD version
@@ -264,6 +271,7 @@ Output Options:
   --max-workers <N>          Number of parallel workers for owner resolution (default: 10)
   --limit <N>                Stop after finding N matching results (useful for quick sampling/testing)
   --progress                 Show real-time progress stats (objects processed, matches found, rate)
+  --profile                  Enable detailed performance profiling and timing metrics
 
 Qumulo Connection Options:
   --host <host>              Qumulo cluster hostname or IP
@@ -756,7 +764,10 @@ def process_directory(path, dirname):
         remaining_depth = int('$MAX_DEPTH') - 1
         if remaining_depth > 0:
             cmd += f' --max-depth {remaining_depth}'
-        # If remaining_depth <= 0, don't add max-depth flag (only process this directory)
+        elif remaining_depth == 0:
+            # We've reached max depth, only process the directory itself
+            cmd += ' --max-depth 0'
+        # If remaining_depth < 0, skip processing (shouldn't happen with valid input)
 
     if verbose:
         print(f'[PROCESS] Processing subdirectory: {dirname}', file=sys.stderr)
@@ -848,8 +859,25 @@ import sys
 import json
 import csv
 import time
+import os
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Try to use faster JSON parser if available
+try:
+    import ujson
+    json_parser = ujson
+    if '${PROFILE}' == 'true':
+        print('[PROFILE] Using ujson for faster JSON parsing', file=sys.stderr)
+except ImportError:
+    json_parser = json
+    if '${PROFILE}' == 'true':
+        print('[PROFILE] Using standard json parser (ujson not available)', file=sys.stderr)
+
+# Identity cache configuration
+IDENTITY_CACHE_FILE = 'file_filter_resolved_identities'
+IDENTITY_CACHE_TTL = 15 * 60  # 15 minutes in seconds
+CACHE_TIMESTAMP = int(time.time())  # Single timestamp for this run
 
 # Ensure unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
@@ -876,6 +904,92 @@ progress_interval = 1000  # Report progress every N objects
 objects_processed = 0
 start_time = None
 include_metadata = '${INCLUDE_METADATA}' == 'true'
+profile = '${PROFILE}' == 'true'
+
+# Performance profiling variables
+profile_times = {
+    'json_parsing': 0.0,
+    'size_filter': 0.0,
+    'owner_filter': 0.0,
+    'time_filter': 0.0,
+    'field_time_filter': 0.0,
+    'output_writing': 0.0,
+    'batch_flush': 0.0
+}
+profile_counts = {
+    'json_parsing': 0,
+    'size_filter': 0,
+    'owner_filter': 0,
+    'time_filter': 0,
+    'field_time_filter': 0,
+    'output_writing': 0,
+    'batch_flush': 0
+}
+
+# JSON parsing rate monitoring
+json_parsing_rate = {
+    'total_lines': 0,
+    'valid_json': 0,
+    'empty_lines': 0,
+    'malformed_json': 0,
+    'last_report_time': time.time(),
+    'report_interval': 5.0  # Report every 5 seconds
+}
+
+# Memory profiling variables
+memory_stats = {
+    'max_json_batch_size': 0,
+    'max_csv_batch_size': 0,
+    'max_owner_cache_size': 0,
+    'max_owner_aggregates_size': 0,
+    'total_objects_in_memory': 0
+}
+
+def update_memory_stats():
+    \"\"\"Update memory usage statistics.\"\"\"
+    if profile:
+        memory_stats['max_json_batch_size'] = max(memory_stats['max_json_batch_size'], len(json_batch))
+        memory_stats['max_csv_batch_size'] = max(memory_stats['max_csv_batch_size'], len(csv_batch))
+        memory_stats['max_owner_cache_size'] = max(memory_stats['max_owner_cache_size'], len(owner_name_cache))
+        memory_stats['max_owner_aggregates_size'] = max(memory_stats['max_owner_aggregates_size'], len(owner_aggregates))
+        memory_stats['total_objects_in_memory'] = len(json_batch) + len(csv_batch) + len(owner_name_cache) + len(owner_aggregates)
+
+def load_identity_cache():
+    \"\"\"Load identity cache from file, removing expired entries.\"\"\"
+    cache = {}
+    try:
+        if os.path.exists(IDENTITY_CACHE_FILE):
+            with open(IDENTITY_CACHE_FILE, 'r') as f:
+                cache_data = json_parser.load(f)
+                # Remove expired entries
+                for auth_id, entry in list(cache_data.items()):
+                    if CACHE_TIMESTAMP - entry['timestamp'] > IDENTITY_CACHE_TTL:
+                        del cache_data[auth_id]
+                    else:
+                        cache[auth_id] = entry['name']
+                # Write cleaned cache back to file
+                if len(cache_data) != len(cache):
+                    save_identity_cache(cache)
+            if verbose and cache:
+                print(f'[INFO] Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}', file=sys.stderr)
+    except Exception as e:
+        if verbose:
+            print(f'[WARN] Failed to load identity cache: {e}', file=sys.stderr)
+    return cache
+
+def save_identity_cache(cache):
+    \"\"\"Save identity cache to file.\"\"\"
+    try:
+        cache_data = {}
+        for auth_id, name in cache.items():
+            cache_data[auth_id] = {'name': name, 'timestamp': CACHE_TIMESTAMP}
+        with open(IDENTITY_CACHE_FILE, 'w') as f:
+            json_parser.dump(cache_data, f)
+        if verbose:
+            print(f'[INFO] Saved {len(cache)} identities to cache file', file=sys.stderr)
+    except Exception as e:
+        if verbose:
+            print(f'[WARN] Failed to save identity cache: {e}', file=sys.stderr)
 
 # Field-specific thresholds
 accessed_threshold_older = '$ACCESSED_THRESHOLD_OLDER'
@@ -1007,12 +1121,19 @@ def matches_owner(file_owner):
 def calculate_total_size(file_size, metablocks):
     # Calculate total size including metadata if requested
     # Each metablock is 4KB (4096 bytes)
-    size_bytes = 0
+    # Optimized version with early returns and reduced exception handling
+    
+    # Early return if no file size
+    if not file_size:
+        return 0
+    
+    # Convert file_size to int with minimal exception handling
     try:
-        size_bytes = int(file_size) if file_size else 0
+        size_bytes = int(file_size)
     except (ValueError, TypeError):
-        size_bytes = 0
+        return 0
 
+    # Add metadata if requested and available
     if include_metadata and metablocks:
         try:
             metadata_bytes = int(metablocks) * 4096
@@ -1027,13 +1148,14 @@ def matches_size(file_size, metablocks=None):
     if not size_larger and not size_smaller:
         return True
 
-    # Handle missing file_size
+    # Handle missing file_size early
     if not file_size:
         return False
 
     # Calculate total size (file + metadata if requested)
     size_bytes = calculate_total_size(file_size, metablocks)
 
+    # Early return for zero size files
     if size_bytes == 0:
         return False
 
@@ -1059,6 +1181,12 @@ batch_size = 1000  # Flush output every N results
 json_batch = []
 csv_batch = []
 
+# Adaptive batch sizing variables
+adaptive_batch_size = batch_size
+batch_performance_history = []
+last_batch_time = None
+batch_size_adjustment_interval = 10000  # Adjust every N objects
+
 def flush_json_batch():
     \"\"\"Flush accumulated JSON results to output.\"\"\"
     if not json_batch:
@@ -1081,6 +1209,26 @@ def flush_csv_batch():
     csv_file_handle.flush()
     csv_batch.clear()
 
+def adjust_batch_size():
+    \"\"\"Adjust batch size based on performance history.\"\"\"
+    global adaptive_batch_size
+    
+    if not profile or len(batch_performance_history) < 3:
+        return
+    
+    # Calculate average batch processing time
+    avg_time = sum(batch_performance_history[-3:]) / 3
+    
+    # If batches are processing quickly, increase size
+    if avg_time < 0.01:  # Less than 10ms per batch
+        adaptive_batch_size = min(adaptive_batch_size * 1.5, 10000)
+    # If batches are slow, decrease size
+    elif avg_time > 0.1:  # More than 100ms per batch
+        adaptive_batch_size = max(adaptive_batch_size * 0.8, 500)
+    
+    # Keep batch size within reasonable bounds
+    adaptive_batch_size = max(500, min(10000, int(adaptive_batch_size)))
+
 # Owner report aggregation data
 # When --include-metadata is used, we track data and metadata separately
 # Structure: auth_id -> {'data': bytes, 'metadata': bytes} if include_metadata
@@ -1088,8 +1236,16 @@ def flush_csv_batch():
 owner_aggregates = {}
 owner_name_cache = {}  # auth_id -> resolved_name
 
+# Load persistent identity cache
+persistent_cache = load_identity_cache()
+
 def resolve_owner_name(auth_id):
     \"\"\"Resolve owner auth_id to human-readable name using qq auth_find_identity with caching.\"\"\"
+    # Check persistent cache first
+    if auth_id in persistent_cache:
+        return persistent_cache[auth_id]
+    
+    # Check in-memory cache
     if auth_id in owner_name_cache:
         return owner_name_cache[auth_id]
 
@@ -1155,9 +1311,11 @@ def resolve_owner_name(auth_id):
                 # Format name nicely
                 if isinstance(name, str) and name:
                     owner_name_cache[auth_id] = name
+                    persistent_cache[auth_id] = name  # Save to persistent cache
                 else:
                     # Fall back to auth_id if no name found
                     owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+                    persistent_cache[auth_id] = f'auth_id:{auth_id}'  # Save to persistent cache
 
                 if verbose:
                     print(f'[INFO] Resolved auth_id {auth_id} to: {owner_name_cache[auth_id]}', file=sys.stderr)
@@ -1170,12 +1328,14 @@ def resolve_owner_name(auth_id):
         if verbose:
             print(f'[WARN] Could not resolve auth_id {auth_id}, using auth_id as name', file=sys.stderr)
         owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+        persistent_cache[auth_id] = f'auth_id:{auth_id}'  # Save to persistent cache
         return owner_name_cache[auth_id]
 
     except Exception as e:
         if verbose:
             print(f'[ERROR] Exception resolving auth_id {auth_id}: {e}', file=sys.stderr)
         owner_name_cache[auth_id] = f'auth_id:{auth_id}'
+        persistent_cache[auth_id] = f'auth_id:{auth_id}'  # Save to persistent cache
         return owner_name_cache[auth_id]
 
 if json_out_file:
@@ -1189,10 +1349,30 @@ if csv_out_file:
 if progress:
     start_time = time.time()
 
+# Use direct JSON streaming instead of jq --stream
 for line in sys.stdin:
+    # Track JSON parsing statistics
+    if profile:
+        json_parsing_rate['total_lines'] += 1
+        
+    # Skip empty lines to reduce unnecessary processing
+    if not line.strip():
+        if profile:
+            json_parsing_rate['empty_lines'] += 1
+        continue
+        
     try:
-        item = json.loads(line)
-    except json.JSONDecodeError:
+        if profile:
+            json_start = time.time()
+        item = json_parser.loads(line)
+        if profile:
+            profile_times['json_parsing'] += time.time() - json_start
+            profile_counts['json_parsing'] += 1
+            json_parsing_rate['valid_json'] += 1
+    except (json.JSONDecodeError, ValueError):
+        # Skip malformed JSON lines silently
+        if profile:
+            json_parsing_rate['malformed_json'] += 1
         continue
 
     if len(item) == 2 and len(item[0]) >= 3 and item[0][0] == 'tree_nodes':
@@ -1217,29 +1397,61 @@ for line in sys.stdin:
             if has_required_data:
                 # AND logic with short-circuit evaluation: check cheapest filters first
                 # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
+                if profile:
+                    size_start = time.time()
                 if not matches_size(current_obj.get('size'), current_obj.get('metablocks')):
+                    if profile:
+                        profile_times['size_filter'] += time.time() - size_start
+                        profile_counts['size_filter'] += 1
                     # Reset for new object
                     current_obj = {}
                     current_idx = idx
                     continue
+                if profile:
+                    profile_times['size_filter'] += time.time() - size_start
+                    profile_counts['size_filter'] += 1
 
+                if profile:
+                    owner_start = time.time()
                 if not matches_owner(current_obj.get('owner')):
+                    if profile:
+                        profile_times['owner_filter'] += time.time() - owner_start
+                        profile_counts['owner_filter'] += 1
                     # Reset for new object
                     current_obj = {}
                     current_idx = idx
                     continue
+                if profile:
+                    profile_times['owner_filter'] += time.time() - owner_start
+                    profile_counts['owner_filter'] += 1
 
+                if profile:
+                    time_start = time.time()
                 if not matches_filter(current_obj.get(time_field)):
+                    if profile:
+                        profile_times['time_filter'] += time.time() - time_start
+                        profile_counts['time_filter'] += 1
                     # Reset for new object
                     current_obj = {}
                     current_idx = idx
                     continue
+                if profile:
+                    profile_times['time_filter'] += time.time() - time_start
+                    profile_counts['time_filter'] += 1
 
+                if profile:
+                    field_time_start = time.time()
                 if not matches_field_specific_time_filters(current_obj):
+                    if profile:
+                        profile_times['field_time_filter'] += time.time() - field_time_start
+                        profile_counts['field_time_filter'] += 1
                     # Reset for new object
                     current_obj = {}
                     current_idx = idx
                     continue
+                if profile:
+                    profile_times['field_time_filter'] += time.time() - field_time_start
+                    profile_counts['field_time_filter'] += 1
 
                 # All filters passed
                 # Increment match count for progress reporting
@@ -1278,6 +1490,8 @@ for line in sys.stdin:
                             pass  # Skip files with invalid size
                 elif output_csv:
                     # CSV output with batching
+                    if profile:
+                        output_start = time.time()
                     if all_attributes:
                         # Write header on first row
                         if not csv_header_written:
@@ -1301,10 +1515,26 @@ for line in sys.stdin:
                         csv_batch.append(list(row_data.values()))
 
                     # Flush batch when it reaches batch_size
-                    if len(csv_batch) >= batch_size:
+                    if len(csv_batch) >= adaptive_batch_size:
+                        if profile:
+                            flush_start = time.time()
                         flush_csv_batch()
+                        if profile:
+                            flush_time = time.time() - flush_start
+                            profile_times['batch_flush'] += flush_time
+                            profile_counts['batch_flush'] += 1
+                            batch_performance_history.append(flush_time)
+                            # Adjust batch size periodically
+                            if objects_processed % batch_size_adjustment_interval == 0:
+                                adjust_batch_size()
+                    if profile:
+                        profile_times['output_writing'] += time.time() - output_start
+                        profile_counts['output_writing'] += 1
+                    update_memory_stats()
                 elif output_json:
                     # JSON output with batching
+                    if profile:
+                        output_start = time.time()
                     if all_attributes:
                         # Include all attributes
                         output = json.dumps(current_obj)
@@ -1330,8 +1560,22 @@ for line in sys.stdin:
                     json_batch.append(output)
 
                     # Flush batch when it reaches batch_size
-                    if len(json_batch) >= batch_size:
+                    if len(json_batch) >= adaptive_batch_size:
+                        if profile:
+                            flush_start = time.time()
                         flush_json_batch()
+                        if profile:
+                            flush_time = time.time() - flush_start
+                            profile_times['batch_flush'] += flush_time
+                            profile_counts['batch_flush'] += 1
+                            batch_performance_history.append(flush_time)
+                            # Adjust batch size periodically
+                            if objects_processed % batch_size_adjustment_interval == 0:
+                                adjust_batch_size()
+                    if profile:
+                        profile_times['output_writing'] += time.time() - output_start
+                        profile_counts['output_writing'] += 1
+                    update_memory_stats()
                 else:
                     if comparison and time_field in current_obj:
                         print(current_obj[time_field])
@@ -1353,108 +1597,132 @@ has_required_data = current_obj.get('path') and (not comparison or current_obj.g
 if has_required_data:
     # AND logic with short-circuit evaluation: check cheapest filters first
     # Order: size (int) -> owner (dict lookup) -> time (string) -> field-time (multiple strings)
-    if not matches_size(current_obj.get('size'), current_obj.get('metablocks')):
-        pass  # Skip this object
-    elif not matches_owner(current_obj.get('owner')):
-        pass  # Skip this object
-    elif not matches_filter(current_obj.get(time_field)):
-        pass  # Skip this object
-    elif not matches_field_specific_time_filters(current_obj):
-        pass  # Skip this object
-    else:
-        # Increment match count for progress reporting
-        match_count += 1
+    if profile:
+        size_start = time.time()
+    size_match = matches_size(current_obj.get('size'), current_obj.get('metablocks'))
+    if profile:
+        profile_times['size_filter'] += time.time() - size_start
+        profile_counts['size_filter'] += 1
+        
+    if size_match:
+        if profile:
+            owner_start = time.time()
+        owner_match = matches_owner(current_obj.get('owner'))
+        if profile:
+            profile_times['owner_filter'] += time.time() - owner_start
+            profile_counts['owner_filter'] += 1
+            
+        if owner_match:
+            if profile:
+                time_start = time.time()
+            time_match = matches_filter(current_obj.get(time_field))
+            if profile:
+                profile_times['time_filter'] += time.time() - time_start
+                profile_counts['time_filter'] += 1
+                
+            if time_match:
+                if profile:
+                    field_time_start = time.time()
+                field_time_match = matches_field_specific_time_filters(current_obj)
+                if profile:
+                    profile_times['field_time_filter'] += time.time() - field_time_start
+                    profile_counts['field_time_filter'] += 1
+                    
+                if field_time_match:
+                    # Increment match count for progress reporting
+                    match_count += 1
 
-        # Check limit (only for non-owner_report output)
-        if not owner_report and limit and match_count > limit:
-            if verbose:
-                print(f'[INFO] Reached limit of {limit} matches (skipping final object)', file=sys.stderr)
+                    # Check limit (only for non-owner_report output)
+                    if not owner_report and limit and match_count > limit:
+                        if verbose:
+                            print(f'[INFO] Reached limit of {limit} matches (skipping final object)', file=sys.stderr)
 
-        # Only output if limit not exceeded (or owner_report which doesn't use limit)
-        if owner_report or not limit or match_count <= limit:
-            if owner_report:
-                # Aggregate by owner instead of outputting individual files
-                file_owner = current_obj.get('owner')
-                file_size = current_obj.get('size', 0)
-                file_metablocks = current_obj.get('metablocks')
-                if file_owner:
-                    try:
-                        data_bytes = int(file_size) if file_size else 0
-                        metadata_bytes = 0
-                        if include_metadata and file_metablocks:
-                            metadata_bytes = int(file_metablocks) * 4096
+                    # Only output if limit not exceeded (or owner_report which doesn't use limit)
+                    if owner_report or not limit or match_count <= limit:
+                        if owner_report:
+                            # Aggregate by owner instead of outputting individual files
+                            file_owner = current_obj.get('owner')
+                            file_size = current_obj.get('size', 0)
+                            file_metablocks = current_obj.get('metablocks')
+                            if file_owner:
+                                try:
+                                    data_bytes = int(file_size) if file_size else 0
+                                    metadata_bytes = 0
+                                    if include_metadata and file_metablocks:
+                                        metadata_bytes = int(file_metablocks) * 4096
 
-                        if file_owner not in owner_aggregates:
-                            if include_metadata:
-                                owner_aggregates[file_owner] = {'data': 0, 'metadata': 0}
+                                    if file_owner not in owner_aggregates:
+                                        if include_metadata:
+                                            owner_aggregates[file_owner] = {'data': 0, 'metadata': 0}
+                                        else:
+                                            owner_aggregates[file_owner] = 0
+
+                                    if include_metadata:
+                                        owner_aggregates[file_owner]['data'] += data_bytes
+                                        owner_aggregates[file_owner]['metadata'] += metadata_bytes
+                                    else:
+                                        owner_aggregates[file_owner] += data_bytes
+                                except (ValueError, TypeError):
+                                    pass  # Skip files with invalid size
+                        elif output_csv:
+                            # CSV output with batching
+                            if all_attributes:
+                                # Write header on first row
+                                if not csv_header_written:
+                                    csv_writer.writerow(sorted(current_obj.keys()))
+                                    csv_header_written = True
+                                # Add to batch (final flush will handle it)
+                                csv_batch.append([current_obj.get(k, '') for k in sorted(current_obj.keys())])
                             else:
-                                owner_aggregates[file_owner] = 0
+                                # Write selective fields
+                                row_data = {'path': current_obj['path']}
+                                if comparison and time_field in current_obj:
+                                    row_data[time_field] = current_obj[time_field]
+                                if owner_auth_id and 'owner' in current_obj:
+                                    row_data['owner'] = current_obj['owner']
+                                if (size_larger or size_smaller) and 'size' in current_obj:
+                                    row_data['size'] = current_obj['size']
 
-                        if include_metadata:
-                            owner_aggregates[file_owner]['data'] += data_bytes
-                            owner_aggregates[file_owner]['metadata'] += metadata_bytes
+                                if not csv_header_written:
+                                    csv_writer.writerow(row_data.keys())
+                                    csv_header_written = True
+                                # Add to batch (final flush will handle it)
+                                csv_batch.append(list(row_data.values()))
+                        elif output_json:
+                            # JSON output with batching
+                            if all_attributes:
+                                # Include all attributes
+                                output = json.dumps(current_obj)
+                            else:
+                                # Include path and any fields used in filtering
+                                filtered_obj = {'path': current_obj['path']}
+
+                                # Add time field if time filter was used
+                                if comparison and time_field in current_obj:
+                                    filtered_obj[time_field] = current_obj[time_field]
+
+                                # Add owner if owner filter was used
+                                if owner_auth_id and 'owner' in current_obj:
+                                    filtered_obj['owner'] = current_obj['owner']
+
+                                # Add size if size filter was used
+                                if (size_larger or size_smaller) and 'size' in current_obj:
+                                    filtered_obj['size'] = current_obj['size']
+
+                                output = json.dumps(filtered_obj)
+
+                            # Add to batch (final flush will handle it)
+                            json_batch.append(output)
                         else:
-                            owner_aggregates[file_owner] += data_bytes
-                    except (ValueError, TypeError):
-                        pass  # Skip files with invalid size
-            elif output_csv:
-                # CSV output with batching
-                if all_attributes:
-                    # Write header on first row
-                    if not csv_header_written:
-                        csv_writer.writerow(sorted(current_obj.keys()))
-                        csv_header_written = True
-                    # Add to batch (final flush will handle it)
-                    csv_batch.append([current_obj.get(k, '') for k in sorted(current_obj.keys())])
-                else:
-                    # Write selective fields
-                    row_data = {'path': current_obj['path']}
-                    if comparison and time_field in current_obj:
-                        row_data[time_field] = current_obj[time_field]
-                    if owner_auth_id and 'owner' in current_obj:
-                        row_data['owner'] = current_obj['owner']
-                    if (size_greater or size_smaller) and 'size' in current_obj:
-                        row_data['size'] = current_obj['size']
-
-                    if not csv_header_written:
-                        csv_writer.writerow(row_data.keys())
-                        csv_header_written = True
-                    # Add to batch (final flush will handle it)
-                    csv_batch.append(list(row_data.values()))
-            elif output_json:
-                # JSON output with batching
-                if all_attributes:
-                    # Include all attributes
-                    output = json.dumps(current_obj)
-                else:
-                    # Include path and any fields used in filtering
-                    filtered_obj = {'path': current_obj['path']}
-
-                    # Add time field if time filter was used
-                    if comparison and time_field in current_obj:
-                        filtered_obj[time_field] = current_obj[time_field]
-
-                    # Add owner if owner filter was used
-                    if owner_auth_id and 'owner' in current_obj:
-                        filtered_obj['owner'] = current_obj['owner']
-
-                    # Add size if size filter was used
-                    if (size_greater or size_smaller) and 'size' in current_obj:
-                        filtered_obj['size'] = current_obj['size']
-
-                    output = json.dumps(filtered_obj)
-
-                # Add to batch (final flush will handle it)
-                json_batch.append(output)
-            else:
-                if comparison and time_field in current_obj:
-                    print(current_obj[time_field])
-                print(current_obj['path'])
+                            if comparison and time_field in current_obj:
+                                print(current_obj[time_field])
+                            print(current_obj['path'])
 
 # Output owner report if requested
 if owner_report and owner_aggregates:
     if verbose:
         print(f'[INFO] Generating owner report for {len(owner_aggregates)} unique owners...', file=sys.stderr)
+    update_memory_stats()
 
     # Resolve all owner names in parallel for better performance
     # Use ThreadPoolExecutor to parallelize API calls (I/O bound operation)
@@ -1597,6 +1865,63 @@ if progress and start_time:
     rate = objects_processed / elapsed if elapsed > 0 else 0
     # Clear the progress line and print final stats on a new line
     print(f'\r[PROGRESS] FINAL: Processed: {objects_processed:,} objects | Matches: {match_count:,} | Rate: {rate:.1f} obj/sec | Total time: {elapsed:.1f}s', file=sys.stderr)
+
+# Performance profiling report
+if profile and start_time:
+    total_time = time.time() - start_time
+    print(f'\n[PROFILE] Performance Analysis:', file=sys.stderr)
+    print(f'[PROFILE] Total runtime: {total_time:.3f}s', file=sys.stderr)
+    print(f'[PROFILE] Objects processed: {objects_processed:,}', file=sys.stderr)
+    print(f'[PROFILE] Overall rate: {objects_processed/total_time:.1f} obj/sec', file=sys.stderr)
+    print(f'[PROFILE] Breakdown by operation:', file=sys.stderr)
+    
+    for operation, time_spent in profile_times.items():
+        if profile_counts[operation] > 0:
+            avg_time = time_spent / profile_counts[operation] * 1000  # Convert to ms
+            pct_total = (time_spent / total_time) * 100
+            print(f'[PROFILE]   {operation:<20}: {time_spent:.3f}s ({pct_total:.1f}%) | {profile_counts[operation]:,} calls | {avg_time:.2f}ms avg', file=sys.stderr)
+    
+    # Identify bottlenecks
+    sorted_ops = sorted(profile_times.items(), key=lambda x: x[1], reverse=True)
+    print(f'[PROFILE] Top bottlenecks:', file=sys.stderr)
+    for i, (op, time_spent) in enumerate(sorted_ops[:3]):
+        if time_spent > 0:
+            pct = (time_spent / total_time) * 100
+            print(f'[PROFILE]   {i+1}. {op}: {pct:.1f}% of total time', file=sys.stderr)
+    
+    # Memory usage report
+    print(f'[PROFILE] Memory usage:', file=sys.stderr)
+    print(f'[PROFILE]   Max JSON batch size: {memory_stats[\"max_json_batch_size\"]:,}', file=sys.stderr)
+    print(f'[PROFILE]   Max CSV batch size: {memory_stats[\"max_csv_batch_size\"]:,}', file=sys.stderr)
+    print(f'[PROFILE]   Max owner cache size: {memory_stats[\"max_owner_cache_size\"]:,}', file=sys.stderr)
+    print(f'[PROFILE]   Max owner aggregates: {memory_stats[\"max_owner_aggregates_size\"]:,}', file=sys.stderr)
+    print(f'[PROFILE]   Peak objects in memory: {memory_stats[\"total_objects_in_memory\"]:,}', file=sys.stderr)
+    print(f'[PROFILE] Adaptive batch sizing:', file=sys.stderr)
+    print(f'[PROFILE]   Final batch size: {adaptive_batch_size:,}', file=sys.stderr)
+    print(f'[PROFILE]   Batch adjustments made: {len(batch_performance_history):,}', file=sys.stderr)
+    if batch_performance_history:
+        avg_batch_time = sum(batch_performance_history) / len(batch_performance_history) * 1000
+        print(f'[PROFILE]   Average batch flush time: {avg_batch_time:.2f}ms', file=sys.stderr)
+    
+    # JSON parsing rate report
+    print(f'[PROFILE] JSON parsing statistics:', file=sys.stderr)
+    total_lines_val = json_parsing_rate.get("total_lines", 0)
+    valid_json_val = json_parsing_rate.get("valid_json", 0)
+    empty_lines_val = json_parsing_rate.get("empty_lines", 0)
+    malformed_json_val = json_parsing_rate.get("malformed_json", 0)
+    
+    print(f'[PROFILE]   Total lines processed: {total_lines_val:,}', file=sys.stderr)
+    print(f'[PROFILE]   Valid JSON lines: {valid_json_val:,}', file=sys.stderr)
+    print(f'[PROFILE]   Empty lines skipped: {empty_lines_val:,}', file=sys.stderr)
+    print(f'[PROFILE]   Malformed JSON skipped: {malformed_json_val:,}', file=sys.stderr)
+    if total_lines_val > 0:
+        json_efficiency = (valid_json_val / total_lines_val) * 100
+        print(f'[PROFILE]   JSON parsing efficiency: {json_efficiency:.1f}%', file=sys.stderr)
+        json_to_object_ratio = valid_json_val / objects_processed if objects_processed > 0 else 0
+        print(f'[PROFILE]   JSON lines per object: {json_to_object_ratio:.1f}', file=sys.stderr)
+
+# Save persistent identity cache
+save_identity_cache(persistent_cache)
 
 if json_file_handle:
     json_file_handle.close()
