@@ -245,6 +245,7 @@ chmod +x qumulo_file_filter_mac.sh
 - `--owner-report` - Generate storage capacity report grouped by owner
 - `--limit <N>` - Stop after finding N matching results (useful for testing/sampling)
 - `--progress` - Show real-time progress statistics (objects processed, matches, rate)
+- `--profile` - Enable detailed performance profiling and timing metrics
 - `--max-workers <N>` - Number of parallel workers for owner name resolution (default: 10)
 
 ### Qumulo Connection Options
