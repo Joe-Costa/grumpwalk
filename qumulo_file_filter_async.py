@@ -124,6 +124,72 @@ class ProgressTracker:
                   file=sys.stderr)
 
 
+class Profiler:
+    """Track detailed performance metrics for profiling."""
+
+    def __init__(self):
+        self.timings = {}  # operation -> total time
+        self.counts = {}   # operation -> call count
+        self.lock = asyncio.Lock()
+
+    async def record(self, operation: str, duration: float):
+        """Record timing for an operation."""
+        async with self.lock:
+            if operation not in self.timings:
+                self.timings[operation] = 0.0
+                self.counts[operation] = 0
+            self.timings[operation] += duration
+            self.counts[operation] += 1
+
+    def record_sync(self, operation: str, duration: float):
+        """Record timing for an operation (synchronous version)."""
+        if operation not in self.timings:
+            self.timings[operation] = 0.0
+            self.counts[operation] = 0
+        self.timings[operation] += duration
+        self.counts[operation] += 1
+
+    def print_report(self, total_elapsed: float):
+        """Print profiling report."""
+        print("\n" + "=" * 80, file=sys.stderr)
+        print("PROFILING REPORT", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+
+        # Calculate total accounted time
+        total_accounted = sum(self.timings.values())
+
+        # Sort by total time descending
+        sorted_ops = sorted(self.timings.items(), key=lambda x: x[1], reverse=True)
+
+        print(f"\n{'Operation':<30} {'Total Time':>12} {'Calls':>10} {'Avg Time':>12} {'% Total':>8}", file=sys.stderr)
+        print("-" * 80, file=sys.stderr)
+
+        for operation, total_time in sorted_ops:
+            count = self.counts[operation]
+            avg_time = total_time / count if count > 0 else 0
+            pct_total = (total_time / total_elapsed * 100) if total_elapsed > 0 else 0
+
+            print(f"{operation:<30} {total_time:>11.3f}s {count:>10,} {avg_time*1000:>11.2f}ms {pct_total:>7.1f}%",
+                  file=sys.stderr)
+
+        print("-" * 80, file=sys.stderr)
+        print(f"{'Total Accounted':<30} {total_accounted:>11.3f}s", file=sys.stderr)
+        print(f"{'Total Elapsed':<30} {total_elapsed:>11.3f}s", file=sys.stderr)
+
+        unaccounted = total_elapsed - total_accounted
+        if unaccounted > 0.01:
+            pct_unaccounted = (unaccounted / total_elapsed * 100) if total_elapsed > 0 else 0
+            print(f"{'Unaccounted (overhead)':<30} {unaccounted:>11.3f}s {pct_unaccounted:>7.1f}%", file=sys.stderr)
+
+        # Identify bottlenecks
+        print(f"\nTop 3 Bottlenecks:", file=sys.stderr)
+        for i, (operation, total_time) in enumerate(sorted_ops[:3]):
+            pct = (total_time / total_elapsed * 100) if total_elapsed > 0 else 0
+            print(f"  {i+1}. {operation}: {pct:.1f}% of total time", file=sys.stderr)
+
+        print("=" * 80, file=sys.stderr)
+
+
 def extract_pagination_token(api_response: dict) -> Optional[str]:
     """Extract the pagination token from Qumulo API response."""
     if 'paging' not in api_response:
@@ -252,7 +318,8 @@ class AsyncQumuloClient:
                              progress: Optional[ProgressTracker] = None,
                              file_filter=None,
                              owner_stats: Optional[OwnerStats] = None,
-                             omit_subdirs: Optional[List[str]] = None) -> List[dict]:
+                             omit_subdirs: Optional[List[str]] = None,
+                             collect_results: bool = True) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -265,9 +332,10 @@ class AsyncQumuloClient:
             file_filter: Optional function to filter files
             owner_stats: Optional OwnerStats for collecting ownership data
             omit_subdirs: Optional list of wildcard patterns for directories to skip
+            collect_results: If False, don't accumulate matching entries (saves memory for reports)
 
         Returns:
-            List of matching file entries
+            List of matching file entries (empty if collect_results=False)
         """
         # Check depth limit
         if max_depth is not None and max_depth >= 0 and _current_depth >= max_depth:
@@ -278,6 +346,8 @@ class AsyncQumuloClient:
 
         # Filter entries and collect owner stats
         matching_entries = []
+        match_count = 0
+
         for entry in entries:
             # Collect owner statistics if enabled
             if owner_stats:
@@ -292,12 +362,19 @@ class AsyncQumuloClient:
                     is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
                     await owner_stats.add_file(owner_auth_id, file_size, is_dir)
 
-            # Apply filter
+            # Apply filter and optionally collect results
+            passes_filter = False
             if file_filter:
                 if file_filter(entry):
-                    matching_entries.append(entry)
+                    passes_filter = True
+                    match_count += 1
+                    if collect_results:
+                        matching_entries.append(entry)
             else:
-                matching_entries.append(entry)
+                passes_filter = True
+                match_count += 1
+                if collect_results:
+                    matching_entries.append(entry)
 
         # Find subdirectories and filter based on omit patterns
         subdirs = []
@@ -322,22 +399,23 @@ class AsyncQumuloClient:
 
         # Update progress tracker
         if progress:
-            await progress.update(len(entries), 1, len(matching_entries))
+            await progress.update(len(entries), 1, match_count)
 
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
             tasks = [
-                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs)
+                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs, collect_results)
                 for subdir in subdirs
             ]
 
             # Process all subdirectories concurrently
             subdir_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Collect results from subdirectories
-            for result in subdir_results:
-                if isinstance(result, list):
-                    matching_entries.extend(result)
+            # Collect results from subdirectories (only if collect_results=True)
+            if collect_results:
+                for result in subdir_results:
+                    if isinstance(result, list):
+                        matching_entries.extend(result)
 
         return matching_entries
 
@@ -937,10 +1015,18 @@ async def main_async(args):
 
     # Resolve owner filters if specified
     owner_auth_ids = None
+    profiler = Profiler() if args.profile else None
+
     if args.owners:
         print("\nResolving owner identities...", file=sys.stderr)
+        if profiler:
+            resolve_start = time.time()
+
         async with client.create_session() as session:
             owner_auth_ids = await resolve_owner_filters(client, session, args)
+
+        if profiler:
+            profiler.record_sync('owner_identity_resolution', time.time() - resolve_start)
 
         if owner_auth_ids:
             print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
@@ -961,12 +1047,22 @@ async def main_async(args):
     # Walk tree and collect matches
     start_time = time.time()
 
+    if profiler:
+        tree_walk_start = time.time()
+
+    # For owner reports, don't collect matching files to save memory
+    collect_results = not args.owner_report
+
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
             session, args.path, args.max_depth, progress=progress,
             file_filter=file_filter, owner_stats=owner_stats,
-            omit_subdirs=args.omit_subdirs
+            omit_subdirs=args.omit_subdirs, collect_results=collect_results
         )
+
+    if profiler:
+        tree_walk_time = time.time() - tree_walk_start
+        profiler.record_sync('tree_walking', tree_walk_time)
 
     elapsed = time.time() - start_time
 
@@ -976,7 +1072,12 @@ async def main_async(args):
 
     # Generate owner report if requested
     if args.owner_report and owner_stats:
+        if profiler:
+            report_start = time.time()
         await generate_owner_report(client, owner_stats, args, elapsed)
+        if profiler:
+            profiler.record_sync('owner_report_generation', time.time() - report_start)
+            profiler.print_report(elapsed)
         return  # Exit after report, don't output file list
 
     # Apply limit if specified
@@ -986,6 +1087,9 @@ async def main_async(args):
         matching_files = matching_files[:args.limit]
 
     # Output results
+    if profiler:
+        output_start = time.time()
+
     if args.csv_out:
         # CSV output
         import csv
@@ -1051,6 +1155,11 @@ async def main_async(args):
         for entry in matching_files:
             print(entry['path'])
 
+    # Record output timing
+    if profiler:
+        output_time = time.time() - output_start
+        profiler.record_sync('output_generation', output_time)
+
     # Summary
     if args.verbose:
         print(f"\n[INFO] Processed {progress.total_objects if progress else 'N/A'} objects in {elapsed:.2f}s",
@@ -1058,6 +1167,10 @@ async def main_async(args):
         print(f"[INFO] Found {len(matching_files)} matching files", file=sys.stderr)
         rate = (progress.total_objects if progress else len(matching_files)) / elapsed if elapsed > 0 else 0
         print(f"[INFO] Processing rate: {rate:.1f} obj/sec", file=sys.stderr)
+
+    # Print profiling report
+    if profiler:
+        profiler.print_report(elapsed)
 
 
 def main():
@@ -1168,6 +1281,8 @@ Examples:
                        help='Show real-time progress stats')
     parser.add_argument('--limit', type=int,
                        help='Stop after finding N matching results')
+    parser.add_argument('--profile', action='store_true',
+                       help='Enable detailed performance profiling and timing metrics')
 
     # Connection options
     parser.add_argument('--port', type=int, default=8000,
