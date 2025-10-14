@@ -9,3 +9,6 @@ PERFORMANCE_IMPROVEMENTS*
 PRIORITY_*
 file_filter_resolved*
 sample.json
+cli/
+benchmark_*
+claude_*
