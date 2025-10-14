@@ -320,6 +320,41 @@ class AsyncQumuloClient:
 
         return all_entries
 
+    async def get_directory_aggregates(self, session: aiohttp.ClientSession,
+                                       path: str) -> dict:
+        """
+        Get directory aggregate statistics.
+
+        Returns statistics for immediate children only (non-recursive).
+        All count fields are returned as strings - use int() to convert.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Directory path
+
+        Returns:
+            Dictionary with aggregates data including total_files, total_directories, etc.
+            Falls back to safe defaults if API call fails.
+        """
+        async with self.semaphore:
+            if not path.startswith('/'):
+                path = '/' + path
+
+            encoded_path = quote(path, safe='')
+            url = f"{self.base_url}/v1/files/{encoded_path}/aggregates/"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientError as e:
+                # Fall back gracefully if aggregates unavailable
+                return {
+                    'total_files': '0',
+                    'total_directories': '0',
+                    'error': str(e)
+                }
+
     async def walk_tree_async(self, session: aiohttp.ClientSession, path: str,
                              max_depth: Optional[int] = None,
                              _current_depth: int = 0,
@@ -327,7 +362,9 @@ class AsyncQumuloClient:
                              file_filter=None,
                              owner_stats: Optional[OwnerStats] = None,
                              omit_subdirs: Optional[List[str]] = None,
-                             collect_results: bool = True) -> List[dict]:
+                             collect_results: bool = True,
+                             verbose: bool = False,
+                             max_entries_per_dir: Optional[int] = None) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -341,6 +378,8 @@ class AsyncQumuloClient:
             owner_stats: Optional OwnerStats for collecting ownership data
             omit_subdirs: Optional list of wildcard patterns for directories to skip
             collect_results: If False, don't accumulate matching entries (saves memory for reports)
+            verbose: If True, emit warnings to stderr for large directories
+            max_entries_per_dir: If set, skip directories with more entries than this limit
 
         Returns:
             List of matching file entries (empty if collect_results=False)
@@ -348,6 +387,36 @@ class AsyncQumuloClient:
         # Check depth limit
         if max_depth is not None and max_depth >= 0 and _current_depth >= max_depth:
             return []
+
+        # Get directory aggregates for pre-flight intelligence
+        aggregates = await self.get_directory_aggregates(session, path)
+
+        # Check for errors in aggregates response (API may not be available)
+        has_aggregates_error = 'error' in aggregates
+
+        if not has_aggregates_error:
+            # Parse aggregate statistics (API returns strings, convert to ints)
+            try:
+                total_files = int(aggregates.get('total_files', 0))
+                total_directories = int(aggregates.get('total_directories', 0))
+                total_entries = total_files + total_directories
+
+                # Warn on large directories (100k+ entries)
+                if verbose and total_entries > 100_000:
+                    print(f"[WARN] Large directory: {path} ({total_entries:,} entries: "
+                          f"{total_files:,} files, {total_directories:,} dirs)",
+                          file=sys.stderr)
+
+                # Safety valve: skip directories exceeding max_entries_per_dir
+                if max_entries_per_dir and total_entries > max_entries_per_dir:
+                    if verbose:
+                        print(f"[SKIP] Directory exceeds limit: {path} "
+                              f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
+                              file=sys.stderr)
+                    return []
+            except (ValueError, TypeError):
+                # If we can't parse aggregates, continue without the check
+                pass
 
         # Enumerate current directory
         entries = await self.enumerate_directory(session, path)
@@ -419,7 +488,7 @@ class AsyncQumuloClient:
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
             tasks = [
-                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs, collect_results)
+                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs, collect_results, verbose, max_entries_per_dir)
                 for subdir in subdirs
             ]
 
@@ -1073,7 +1142,8 @@ async def main_async(args):
         matching_files = await client.walk_tree_async(
             session, args.path, args.max_depth, progress=progress,
             file_filter=file_filter, owner_stats=owner_stats,
-            omit_subdirs=args.omit_subdirs, collect_results=collect_results
+            omit_subdirs=args.omit_subdirs, collect_results=collect_results,
+            verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir
         )
 
     if profiler:
@@ -1285,6 +1355,8 @@ Examples:
                        help='Search files only (exclude directories)')
     parser.add_argument('--omit-subdirs', action='append',
                        help='Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)')
+    parser.add_argument('--max-entries-per-dir', type=int,
+                       help='Skip directories with more than N entries (safety valve for large directories)')
 
     # Output options
     parser.add_argument('--json', action='store_true',
