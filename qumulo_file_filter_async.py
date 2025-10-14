@@ -1275,8 +1275,8 @@ Examples:
                        help='Generate ownership report (file count and total bytes by owner)')
     parser.add_argument('--use-capacity', action='store_true', default=True,
                        help='Use actual disk capacity (datablocks + metablocks) instead of logical file size for owner reports (default: True). Handles sparse files correctly.')
-    parser.add_argument('--no-use-capacity', dest='use_capacity', action='store_false',
-                       help='Use logical file size instead of actual disk capacity for owner reports')
+    parser.add_argument('--report-logical-size', dest='use_capacity', action='store_false',
+                       help='Report logical file size instead of actual disk capacity in owner reports')
 
     # Search options
     parser.add_argument('--max-depth', type=int,
