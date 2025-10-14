@@ -586,7 +586,7 @@ class AsyncQumuloClient:
         use_streaming = total_entries >= 50000 and collect_results
 
         if verbose and use_streaming:
-            print(f"[INFO] Progressive streaming: Using streaming mode for {path} ({total_entries:,} entries)",
+            print(f"\r[INFO] Progressive streaming: Using streaming mode for {path} ({total_entries:,} entries)",
                   file=sys.stderr)
 
         matching_entries = []
@@ -742,14 +742,14 @@ class AsyncQumuloClient:
 
                 # Warn on large directories (100k+ entries)
                 if verbose and total_entries > 100_000:
-                    print(f"[WARN] Large directory: {path} ({total_entries:,} entries: "
+                    print(f"\r[WARN] Large directory: {path} ({total_entries:,} entries: "
                           f"{total_files:,} files, {total_directories:,} dirs)",
                           file=sys.stderr)
 
                 # Safety valve: skip directories exceeding max_entries_per_dir
                 if max_entries_per_dir and total_entries > max_entries_per_dir:
                     if verbose:
-                        print(f"[SKIP] Directory exceeds limit: {path} "
+                        print(f"\r[SKIP] Directory exceeds limit: {path} "
                               f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
                               file=sys.stderr)
                     return []
@@ -769,7 +769,7 @@ class AsyncQumuloClient:
                         # This looks like --file-only filter
                         if total_files == 0:
                             if verbose:
-                                print(f"[SKIP] Smart skip: {path} (0 files, --file-only active)",
+                                print(f"\r[SKIP] Smart skip: {path} (0 files, --file-only active)",
                                       file=sys.stderr)
                             return []
 
@@ -798,7 +798,7 @@ class AsyncQumuloClient:
                                 # If the NEWEST file is younger than threshold, NO files match
                                 if newest_time >= older_than_threshold:
                                     if verbose:
-                                        print(f"[SKIP] Smart skip: {path} (all files newer than threshold)",
+                                        print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
                                               file=sys.stderr)
                                     return []
 
@@ -807,7 +807,7 @@ class AsyncQumuloClient:
                                 # If the OLDEST file is older than threshold, NO files match
                                 if oldest_time <= newer_than_threshold:
                                     if verbose:
-                                        print(f"[SKIP] Smart skip: {path} (all files older than threshold)",
+                                        print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
                                               file=sys.stderr)
                                     return []
 
@@ -828,7 +828,7 @@ class AsyncQumuloClient:
                             # NO individual files can be >= min_size
                             if total_cap_bytes < min_size:
                                 if verbose:
-                                    print(f"[SKIP] Smart skip: {path} "
+                                    print(f"\r[SKIP] Smart skip: {path} "
                                           f"(total capacity {total_cap_bytes} < min {min_size})",
                                           file=sys.stderr)
                                 return []
@@ -856,7 +856,7 @@ class AsyncQumuloClient:
 
                             if not has_matching_owner:
                                 if verbose:
-                                    print(f"[SKIP] Smart skip: {path} (no files owned by target owner(s))",
+                                    print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
                                           file=sys.stderr)
                                 return []
 
@@ -874,16 +874,23 @@ class AsyncQumuloClient:
         if omit_subdirs:
             filtered_subdirs = []
             for subdir_path in subdirs:
-                subdir_name = subdir_path.split('/')[-1] if '/' in subdir_path else subdir_path
+                # Extract directory name (last component, handling trailing slashes)
+                subdir_name = subdir_path.rstrip('/').split('/')[-1] if '/' in subdir_path else subdir_path
 
                 # Check if this directory should be omitted
                 should_omit = False
+                matched_pattern = None
                 for pattern in omit_subdirs:
                     if fnmatch.fnmatch(subdir_name, pattern):
                         should_omit = True
+                        matched_pattern = pattern
                         break
 
-                if not should_omit:
+                if should_omit:
+                    if verbose:
+                        print(f"\r[SKIP] Omitting subdirectory: {subdir_path} (matched pattern: {matched_pattern})",
+                              file=sys.stderr)
+                else:
                     filtered_subdirs.append(subdir_path)
 
             subdirs = filtered_subdirs
@@ -918,7 +925,7 @@ class AsyncQumuloClient:
             batch_size = self.calculate_adaptive_concurrency(num_subdirs)
 
             if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
-                print(f"[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
+                print(f"\r[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
                       f"(reduced from {self.max_concurrent})", file=sys.stderr)
 
             # Process subdirectories in batches
@@ -927,7 +934,7 @@ class AsyncQumuloClient:
                 # Early exit: Check if limit reached before processing next batch
                 if progress and progress.should_stop():
                     if verbose:
-                        print(f"[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
+                        print(f"\r[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
                               file=sys.stderr)
                     break
 
