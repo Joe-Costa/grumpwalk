@@ -320,6 +320,45 @@ class AsyncQumuloClient:
 
         return all_entries
 
+    async def enumerate_directory_streaming(self, session: aiohttp.ClientSession,
+                                           path: str,
+                                           callback) -> int:
+        """
+        Stream directory entries without accumulating in memory.
+        Calls callback with each page of results for processing.
+
+        This is more memory-efficient for large directories (50k+ entries)
+        as it processes entries page-by-page instead of accumulating them all.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Directory path
+            callback: Async function that receives list of entries per page
+                     Returns: (matching_entries, subdirs) tuple
+
+        Returns:
+            Total number of entries processed
+        """
+        total_entries = 0
+        after_token = None
+
+        while True:
+            response = await self.get_directory_page(session, path, limit=1000, after_token=after_token)
+
+            files = response.get('files', [])
+            total_entries += len(files)
+
+            # Process this page immediately via callback
+            if callback and files:
+                await callback(files)
+
+            # Get next page token
+            after_token = extract_pagination_token(response)
+            if not after_token:
+                break
+
+        return total_entries
+
     async def get_directory_aggregates(self, session: aiohttp.ClientSession,
                                        path: str) -> dict:
         """
@@ -414,6 +453,25 @@ class AsyncQumuloClient:
                               f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
                               file=sys.stderr)
                     return []
+
+                # PHASE 2: Smart skipping - skip directories that can't possibly match filters
+                # This saves API calls by not enumerating directories we know won't have matches
+                if file_filter:
+                    # Check if file_only filter is active (file_filter rejects all directories)
+                    # We detect this by checking if args has file_only attribute
+                    # Since we don't have access to args here, we check by testing the filter
+                    # with a mock directory entry
+                    test_dir = {'type': 'FS_FILE_TYPE_DIRECTORY', 'path': '/test', 'name': 'test'}
+                    test_file = {'type': 'FS_FILE_TYPE_FILE', 'path': '/test', 'name': 'test'}
+
+                    # If filter rejects directories but might accept files, check file count
+                    if not file_filter(test_dir) and file_filter(test_file):
+                        # This looks like --file-only filter
+                        if total_files == 0:
+                            if verbose:
+                                print(f"[SKIP] Smart skip: {path} (0 files, --file-only active)",
+                                      file=sys.stderr)
+                            return []
             except (ValueError, TypeError):
                 # If we can't parse aggregates, continue without the check
                 pass
@@ -569,7 +627,8 @@ class AsyncQumuloClient:
     async def resolve_multiple_identities(self, session: aiohttp.ClientSession,
                                          auth_ids: List[str]) -> Dict[str, Dict]:
         """
-        Resolve multiple identities in parallel.
+        Resolve multiple identities in parallel, using identity expansion to find
+        the best name for POSIX UIDs that are linked to AD users.
 
         Args:
             session: aiohttp ClientSession
@@ -584,9 +643,9 @@ class AsyncQumuloClient:
         if not unique_ids:
             return {}
 
-        # Create tasks for parallel resolution
+        # Create tasks for parallel resolution with expansion
         tasks = [
-            self.resolve_identity(session, auth_id, "auth_id")
+            self._resolve_identity_with_expansion(session, auth_id)
             for auth_id in unique_ids
         ]
 
@@ -608,6 +667,84 @@ class AsyncQumuloClient:
                 identity_cache[auth_id] = result
 
         return identity_cache
+
+    async def _resolve_identity_with_expansion(self, session: aiohttp.ClientSession,
+                                               auth_id: str) -> Dict:
+        """
+        Resolve an identity using expansion to find the best displayable name.
+
+        This handles cases where a POSIX UID (like 2005) is linked to an AD user
+        (like "mark") through POSIX extensions. We want to show the AD name.
+
+        Args:
+            session: aiohttp ClientSession
+            auth_id: The auth_id to resolve
+
+        Returns:
+            Dictionary containing identity info with the best available name
+        """
+        url = f"{self.base_url}/v1/identity/expand"
+
+        # Build identity dict for the expand API
+        # The expand API expects: {"id": {"auth_id": "12884903893"}}
+        payload = {"id": {"auth_id": str(auth_id)}}
+
+        try:
+            async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+                if response.status == 200:
+                    expand_result = await response.json()
+
+                    # Extract the primary identity (the one we queried for)
+                    primary_identity = expand_result.get('id', {})
+
+                    # Check if we got a name from the primary identity
+                    best_identity = primary_identity.copy()
+                    best_identity['auth_id'] = auth_id
+                    best_identity['resolved'] = True
+
+                    # If the primary identity doesn't have a name, check equivalent identities
+                    if not primary_identity.get('name'):
+                        # Look through equivalent identities to find one with a name
+                        # Prefer AD identities over POSIX identities
+                        equivalent_ids = expand_result.get('equivalent_ids', [])
+
+                        # Sort equivalent identities by preference: AD > LOCAL > POSIX
+                        def identity_preference(identity):
+                            domain = identity.get('domain', '')
+                            if domain == 'ACTIVE_DIRECTORY':
+                                return 0
+                            elif domain == 'LOCAL':
+                                return 1
+                            elif domain in ['POSIX_USER', 'POSIX_GROUP']:
+                                return 2
+                            else:
+                                return 3
+
+                        sorted_identities = sorted(equivalent_ids, key=identity_preference)
+
+                        # Find the first equivalent identity with a name
+                        for equiv_identity in sorted_identities:
+                            if equiv_identity.get('name'):
+                                # Found a better name - use this identity info
+                                # But keep the original auth_id and domain info
+                                best_identity['name'] = equiv_identity['name']
+                                # Keep track of both domains for display
+                                if primary_identity.get('domain'):
+                                    best_identity['domain'] = primary_identity['domain']
+                                best_identity['display_domain'] = equiv_identity.get('domain')
+                                break
+
+                    return best_identity
+
+                elif response.status == 404:
+                    # Identity not found - fall back to basic resolution
+                    return await self.resolve_identity(session, auth_id, "auth_id")
+                else:
+                    response.raise_for_status()
+
+        except Exception:
+            # Fall back to basic resolution on error
+            return await self.resolve_identity(session, auth_id, "auth_id")
 
     async def expand_identity(self, session: aiohttp.ClientSession,
                              auth_id: str) -> List[str]:
