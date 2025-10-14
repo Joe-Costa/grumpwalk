@@ -159,7 +159,7 @@ class OwnerStats:
 class ProgressTracker:
     """Track progress of async tree walking with real-time updates."""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, limit: Optional[int] = None):
         self.total_objects = 0
         self.total_dirs = 0
         self.matches = 0
@@ -167,13 +167,22 @@ class ProgressTracker:
         self.verbose = verbose
         self.last_update = time.time()
         self.lock = asyncio.Lock()
+        self.limit = limit
+        self.limit_reached = False
 
     async def update(self, objects: int, dirs: int = 0, matches: int = 0):
-        """Update progress counters."""
+        """Update progress counters and check if limit reached."""
         async with self.lock:
             self.total_objects += objects
             self.total_dirs += dirs
             self.matches += matches
+
+            # Check if limit reached
+            if self.limit and self.matches >= self.limit and not self.limit_reached:
+                self.limit_reached = True
+                if self.verbose:
+                    print(f"\r[INFO] Limit reached: {self.matches} matches (limit: {self.limit})",
+                          file=sys.stderr, flush=True)
 
             # Print progress every 0.5 seconds
             if self.verbose and time.time() - self.last_update > 0.5:
@@ -184,6 +193,10 @@ class ProgressTracker:
                       f"Rate: {rate:.1f} obj/sec",
                       end='', file=sys.stderr, flush=True)
                 self.last_update = time.time()
+
+    def should_stop(self) -> bool:
+        """Check if processing should stop due to limit."""
+        return self.limit_reached
 
     def final_report(self):
         """Print final progress report."""
@@ -466,6 +479,197 @@ class AsyncQumuloClient:
                     'error': str(e)
                 }
 
+    async def get_directory_capacity(self, session: aiohttp.ClientSession,
+                                     path: str) -> dict:
+        """
+        Get directory capacity breakdown by owner.
+
+        PHASE 3.3: Used for owner filter smart skipping to check if target owner
+        has any files in the directory before enumeration.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Directory path
+
+        Returns:
+            Dictionary with capacity_by_owner data, or empty dict on error.
+            Example: {"capacity_by_owner": [{"id": "500", "capacity_usage": 1073741824}]}
+        """
+        async with self.semaphore:
+            if not path.startswith('/'):
+                path = '/' + path
+
+            encoded_path = quote(path, safe='')
+            url = f"{self.base_url}/v1/files/data/capacity/"
+
+            params = {"path": path, "by_owner": "true"}
+
+            try:
+                async with session.get(url, params=params, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        # API may not be available or path may not exist
+                        return {}
+            except aiohttp.ClientError:
+                # Fall back gracefully if capacity API unavailable
+                return {}
+
+    def calculate_adaptive_concurrency(self, total_entries: int) -> int:
+        """
+        Calculate adaptive concurrency based on directory size.
+
+        PHASE 3.2: Adaptive concurrency reduces concurrent operations for very large
+        directories to prevent overwhelming the cluster and consuming excessive memory.
+
+        Thresholds:
+        - < 10k entries: Use full concurrency
+        - 10k-50k entries: Reduce to 50% of base
+        - 50k-100k entries: Reduce to 25% of base
+        - > 100k entries: Reduce to 10% of base (min 5)
+
+        Args:
+            total_entries: Total entries in directory (files + directories)
+
+        Returns:
+            Adjusted concurrency level
+        """
+        if total_entries < 10000:
+            return self.max_concurrent
+        elif total_entries < 50000:
+            return max(5, self.max_concurrent // 2)
+        elif total_entries < 100000:
+            return max(5, self.max_concurrent // 4)
+        else:
+            return max(5, self.max_concurrent // 10)
+
+    async def enumerate_directory_adaptive(self, session: aiohttp.ClientSession,
+                                          path: str,
+                                          aggregates: dict,
+                                          file_filter=None,
+                                          owner_stats: Optional[OwnerStats] = None,
+                                          collect_results: bool = True,
+                                          verbose: bool = False) -> tuple:
+        """
+        Automatically choose between batch mode and streaming mode based on directory size.
+
+        PHASE 3.2: Progressive streaming automatically switches to streaming mode for
+        directories with 50k+ entries when collecting results to reduce memory usage.
+
+        Decision logic:
+        - < 50k entries: Use batch mode (existing behavior)
+        - >= 50k entries AND collect_results=True: Use streaming mode
+        - >= 50k entries AND collect_results=False: Use batch mode (already memory-efficient)
+
+        Args:
+            session: aiohttp ClientSession
+            path: Directory path
+            aggregates: Pre-fetched aggregates data with total_files/total_directories
+            file_filter: Optional filter function
+            owner_stats: Optional OwnerStats for collecting ownership data
+            collect_results: If False, don't accumulate matching entries
+            verbose: If True, log mode selection
+
+        Returns:
+            Tuple of (matching_entries, subdirs, match_count)
+        """
+        # Parse aggregates to determine directory size
+        try:
+            total_files = int(aggregates.get('total_files', 0))
+            total_dirs = int(aggregates.get('total_directories', 0))
+            total_entries = total_files + total_dirs
+        except (ValueError, TypeError):
+            total_entries = 0
+
+        # Decide enumeration strategy
+        use_streaming = total_entries >= 50000 and collect_results
+
+        if verbose and use_streaming:
+            print(f"[INFO] Progressive streaming: Using streaming mode for {path} ({total_entries:,} entries)",
+                  file=sys.stderr)
+
+        matching_entries = []
+        subdirs = []
+        match_count = 0
+
+        if use_streaming:
+            # Use streaming mode - process pages as they arrive
+            async def process_page(page_entries):
+                nonlocal match_count
+                for entry in page_entries:
+                    # Collect owner statistics if enabled
+                    if owner_stats:
+                        owner_details = entry.get('owner_details', {})
+                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        if owner_auth_id:
+                            try:
+                                if owner_stats.use_capacity:
+                                    datablocks = int(entry.get('datablocks', 0))
+                                    metablocks = int(entry.get('metablocks', 0))
+                                    file_size = (datablocks + metablocks) * 4096
+                                else:
+                                    file_size = int(entry.get('size', 0))
+                            except (ValueError, TypeError):
+                                file_size = 0
+                            is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+                            await owner_stats.add_file(owner_auth_id, file_size, is_dir)
+
+                    # Track subdirectories
+                    if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
+                        subdirs.append(entry['path'])
+
+                    # Apply filter and collect results
+                    if file_filter:
+                        if file_filter(entry):
+                            match_count += 1
+                            if collect_results:
+                                matching_entries.append(entry)
+                    else:
+                        match_count += 1
+                        if collect_results:
+                            matching_entries.append(entry)
+
+            # Stream directory entries
+            await self.enumerate_directory_streaming(session, path, process_page)
+        else:
+            # Use batch mode - existing behavior
+            entries = await self.enumerate_directory(session, path)
+
+            for entry in entries:
+                # Collect owner statistics if enabled
+                if owner_stats:
+                    owner_details = entry.get('owner_details', {})
+                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    if owner_auth_id:
+                        try:
+                            if owner_stats.use_capacity:
+                                datablocks = int(entry.get('datablocks', 0))
+                                metablocks = int(entry.get('metablocks', 0))
+                                file_size = (datablocks + metablocks) * 4096
+                            else:
+                                file_size = int(entry.get('size', 0))
+                        except (ValueError, TypeError):
+                            file_size = 0
+                        is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+                        await owner_stats.add_file(owner_auth_id, file_size, is_dir)
+
+                # Track subdirectories
+                if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
+                    subdirs.append(entry['path'])
+
+                # Apply filter and collect results
+                if file_filter:
+                    if file_filter(entry):
+                        match_count += 1
+                        if collect_results:
+                            matching_entries.append(entry)
+                else:
+                    match_count += 1
+                    if collect_results:
+                        matching_entries.append(entry)
+
+        return (matching_entries, subdirs, match_count)
+
     async def walk_tree_async(self, session: aiohttp.ClientSession, path: str,
                              max_depth: Optional[int] = None,
                              _current_depth: int = 0,
@@ -475,7 +679,10 @@ class AsyncQumuloClient:
                              omit_subdirs: Optional[List[str]] = None,
                              collect_results: bool = True,
                              verbose: bool = False,
-                             max_entries_per_dir: Optional[int] = None) -> List[dict]:
+                             max_entries_per_dir: Optional[int] = None,
+                             time_filter_info: Optional[Dict] = None,
+                             size_filter_info: Optional[Dict] = None,
+                             owner_filter_info: Optional[Dict] = None) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -491,12 +698,19 @@ class AsyncQumuloClient:
             collect_results: If False, don't accumulate matching entries (saves memory for reports)
             verbose: If True, emit warnings to stderr for large directories
             max_entries_per_dir: If set, skip directories with more entries than this limit
+            time_filter_info: Optional dict with time filter thresholds for smart skipping
+            size_filter_info: Optional dict with size filter thresholds for smart skipping
+            owner_filter_info: Optional dict with owner filter auth_ids for smart skipping
 
         Returns:
             List of matching file entries (empty if collect_results=False)
         """
         # Check depth limit
         if max_depth is not None and max_depth >= 0 and _current_depth >= max_depth:
+            return []
+
+        # Early exit: Check if limit reached
+        if progress and progress.should_stop():
             return []
 
         # Get directory aggregates for pre-flight intelligence
@@ -544,90 +758,167 @@ class AsyncQumuloClient:
                                 print(f"[SKIP] Smart skip: {path} (0 files, --file-only active)",
                                       file=sys.stderr)
                             return []
+
+                # PHASE 3: Enhanced smart skipping for time and size filters
+                # Use aggregates data to skip directories that cannot possibly contain matching files
+
+                # Time-based smart skipping
+                if time_filter_info:
+                    oldest_mod = aggregates.get('oldest_modification_time')
+                    newest_mod = aggregates.get('newest_modification_time')
+
+                    # Parse time filter info
+                    older_than_threshold = time_filter_info.get('older_than')
+                    newer_than_threshold = time_filter_info.get('newer_than')
+                    time_field = time_filter_info.get('time_field', 'modification_time')
+
+                    # Only apply smart skipping for modification_time (since aggregates provides mod times)
+                    if time_field == 'modification_time' and (oldest_mod and newest_mod):
+                        try:
+                            # Parse aggregates times
+                            oldest_time = datetime.fromisoformat(oldest_mod.rstrip('Z').split('.')[0])
+                            newest_time = datetime.fromisoformat(newest_mod.rstrip('Z').split('.')[0])
+
+                            # Check --older-than filter
+                            if older_than_threshold:
+                                # If the NEWEST file is younger than threshold, NO files match
+                                if newest_time >= older_than_threshold:
+                                    if verbose:
+                                        print(f"[SKIP] Smart skip: {path} (all files newer than threshold)",
+                                              file=sys.stderr)
+                                    return []
+
+                            # Check --newer-than filter
+                            if newer_than_threshold:
+                                # If the OLDEST file is older than threshold, NO files match
+                                if oldest_time <= newer_than_threshold:
+                                    if verbose:
+                                        print(f"[SKIP] Smart skip: {path} (all files older than threshold)",
+                                              file=sys.stderr)
+                                    return []
+
+                        except (ValueError, AttributeError):
+                            # If time parsing fails, continue without smart skipping
+                            pass
+
+                # Size-based smart skipping
+                if size_filter_info:
+                    total_capacity = aggregates.get('total_capacity')
+                    min_size = size_filter_info.get('min_size')
+
+                    # Check --larger-than filter (min_size)
+                    if min_size and total_capacity:
+                        try:
+                            total_cap_bytes = int(total_capacity)
+                            # If total directory capacity is less than min_size,
+                            # NO individual files can be >= min_size
+                            if total_cap_bytes < min_size:
+                                if verbose:
+                                    print(f"[SKIP] Smart skip: {path} "
+                                          f"(total capacity {total_cap_bytes} < min {min_size})",
+                                          file=sys.stderr)
+                                return []
+                        except (ValueError, TypeError):
+                            # If capacity parsing fails, continue without smart skipping
+                            pass
+
+                # PHASE 3.3: Owner-based smart skipping
+                # Use capacity API to check if target owner has any files in this directory
+                if owner_filter_info:
+                    owner_auth_ids = owner_filter_info.get('auth_ids')
+                    if owner_auth_ids:
+                        # Get capacity breakdown by owner
+                        capacity_data = await self.get_directory_capacity(session, path)
+                        if capacity_data and 'capacity_by_owner' in capacity_data:
+                            # Extract owner IDs from capacity data
+                            owners_with_files = set()
+                            for entry in capacity_data.get('capacity_by_owner', []):
+                                owner_id = entry.get('id')
+                                if owner_id:
+                                    owners_with_files.add(owner_id)
+
+                            # Check if any of our target owners have files here
+                            has_matching_owner = any(auth_id in owners_with_files for auth_id in owner_auth_ids)
+
+                            if not has_matching_owner:
+                                if verbose:
+                                    print(f"[SKIP] Smart skip: {path} (no files owned by target owner(s))",
+                                          file=sys.stderr)
+                                return []
+
             except (ValueError, TypeError):
                 # If we can't parse aggregates, continue without the check
                 pass
 
-        # Enumerate current directory
-        entries = await self.enumerate_directory(session, path)
+        # PHASE 3.2: Use adaptive enumeration (automatically chooses streaming vs batch mode)
+        matching_entries, subdirs, match_count = await self.enumerate_directory_adaptive(
+            session, path, aggregates, file_filter, owner_stats, collect_results, verbose
+        )
 
-        # Filter entries and collect owner stats
-        matching_entries = []
-        match_count = 0
-
-        for entry in entries:
-            # Collect owner statistics if enabled
-            if owner_stats:
-                owner_details = entry.get('owner_details', {})
-                owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
-                if owner_auth_id:
-                    # Calculate file size (use actual disk usage if configured)
-                    try:
-                        if owner_stats.use_capacity:
-                            # Use actual disk usage (datablocks + metablocks) * 4KB
-                            datablocks = int(entry.get('datablocks', 0))
-                            metablocks = int(entry.get('metablocks', 0))
-                            file_size = (datablocks + metablocks) * 4096
-                        else:
-                            # Use logical file size
-                            file_size = int(entry.get('size', 0))
-                    except (ValueError, TypeError):
-                        file_size = 0
-                    is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
-                    await owner_stats.add_file(owner_auth_id, file_size, is_dir)
-
-            # Apply filter and optionally collect results
-            passes_filter = False
-            if file_filter:
-                if file_filter(entry):
-                    passes_filter = True
-                    match_count += 1
-                    if collect_results:
-                        matching_entries.append(entry)
-            else:
-                passes_filter = True
-                match_count += 1
-                if collect_results:
-                    matching_entries.append(entry)
-
-        # Find subdirectories and filter based on omit patterns
-        subdirs = []
-        omitted_count = 0
-
-        for entry in entries:
-            if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
-                subdir_path = entry['path']
-                subdir_name = entry.get('name', '')
+        # Filter subdirectories based on omit patterns
+        if omit_subdirs:
+            filtered_subdirs = []
+            for subdir_path in subdirs:
+                subdir_name = subdir_path.split('/')[-1] if '/' in subdir_path else subdir_path
 
                 # Check if this directory should be omitted
                 should_omit = False
-                if omit_subdirs:
-                    for pattern in omit_subdirs:
-                        if fnmatch.fnmatch(subdir_name, pattern):
-                            should_omit = True
-                            omitted_count += 1
-                            break
+                for pattern in omit_subdirs:
+                    if fnmatch.fnmatch(subdir_name, pattern):
+                        should_omit = True
+                        break
 
                 if not should_omit:
-                    subdirs.append(subdir_path)
+                    filtered_subdirs.append(subdir_path)
+
+            subdirs = filtered_subdirs
 
         # Update progress tracker
         if progress:
-            await progress.update(len(entries), 1, match_count)
+            # Calculate total entries from aggregates for progress tracking
+            try:
+                total_entries_processed = int(aggregates.get('total_files', 0)) + int(aggregates.get('total_directories', 0))
+            except (ValueError, TypeError):
+                total_entries_processed = len(matching_entries) + len(subdirs)
+            await progress.update(total_entries_processed, 1, match_count)
 
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
-            tasks = [
-                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs, collect_results, verbose, max_entries_per_dir)
-                for subdir in subdirs
-            ]
+            # PHASE 3.2: Adaptive concurrency - process subdirectories in batches
+            # Calculate batch size based on number of subdirectories
+            num_subdirs = len(subdirs)
+            batch_size = self.calculate_adaptive_concurrency(num_subdirs)
 
-            # Process all subdirectories concurrently
-            subdir_results = await asyncio.gather(*tasks, return_exceptions=True)
+            if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
+                print(f"[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
+                      f"(reduced from {self.max_concurrent})", file=sys.stderr)
+
+            # Process subdirectories in batches
+            all_results = []
+            for i in range(0, len(subdirs), batch_size):
+                # Early exit: Check if limit reached before processing next batch
+                if progress and progress.should_stop():
+                    if verbose:
+                        print(f"[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
+                              file=sys.stderr)
+                    break
+
+                batch = subdirs[i:i + batch_size]
+                tasks = [
+                    self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress,
+                                        file_filter, owner_stats, omit_subdirs, collect_results,
+                                        verbose, max_entries_per_dir, time_filter_info, size_filter_info,
+                                        owner_filter_info)
+                    for subdir in batch
+                ]
+
+                # Process this batch concurrently
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                all_results.extend(batch_results)
 
             # Collect results from subdirectories (only if collect_results=True)
             if collect_results:
-                for result in subdir_results:
+                for result in all_results:
                     if isinstance(result, list):
                         matching_entries.extend(result)
 
@@ -835,6 +1126,76 @@ class AsyncQumuloClient:
             # Cache the fallback result
             self.persistent_identity_cache[auth_id] = result
             return result
+
+    async def show_directory_stats(self, session: aiohttp.ClientSession,
+                                   path: str,
+                                   max_depth: int = 1,
+                                   current_depth: int = 0) -> None:
+        """
+        Display directory statistics without enumerating entries.
+        Uses aggregates API for fast exploration.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Directory path
+            max_depth: Maximum depth to display (default: 1)
+            current_depth: Current recursion depth
+        """
+        # Get aggregates
+        aggregates = await self.get_directory_aggregates(session, path)
+
+        if 'error' in aggregates:
+            print(f"\nDirectory: {path}")
+            print("  (Unable to retrieve statistics)")
+            return
+
+        # Display statistics
+        total_files = int(aggregates.get('total_files', 0))
+        total_dirs = int(aggregates.get('total_directories', 0))
+        total_entries = total_files + total_dirs
+        total_capacity = int(aggregates.get('total_capacity', 0))
+        oldest_time = aggregates.get('oldest_modification_time', 'Unknown')
+        newest_time = aggregates.get('newest_modification_time', 'Unknown')
+
+        # Format times
+        if oldest_time != 'Unknown':
+            try:
+                oldest_dt = datetime.fromisoformat(oldest_time.rstrip('Z').split('.')[0])
+                oldest_time = oldest_dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                pass
+
+        if newest_time != 'Unknown':
+            try:
+                newest_dt = datetime.fromisoformat(newest_time.rstrip('Z').split('.')[0])
+                newest_time = newest_dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                pass
+
+        avg_size = total_capacity / total_files if total_files > 0 else 0
+
+        # Print with indentation based on depth
+        indent = "  " * current_depth
+        print(f"\n{indent}Directory: {path}")
+        print(f"{indent}  Total entries: {total_entries:,} ({total_files:,} files, {total_dirs:,} directories)")
+        print(f"{indent}  Total size: {format_bytes(total_capacity)}")
+        print(f"{indent}  Modification time range: {oldest_time} to {newest_time}")
+        if total_files > 0:
+            print(f"{indent}  Average file size: {format_bytes(avg_size)}")
+
+        # Recurse to subdirectories if depth permits
+        if current_depth < max_depth:
+            # Enumerate immediate children only (just to get directory names)
+            try:
+                entries = await self.enumerate_directory(session, path)
+                subdirs = [e for e in entries if e.get('type') == 'FS_FILE_TYPE_DIRECTORY']
+
+                for subdir in subdirs:
+                    subdir_path = subdir['path']
+                    await self.show_directory_stats(session, subdir_path, max_depth, current_depth + 1)
+            except Exception as e:
+                if self.verbose:
+                    print(f"{indent}  [ERROR] Failed to enumerate subdirectories: {e}", file=sys.stderr)
 
     async def expand_identity(self, session: aiohttp.ClientSession,
                              auth_id: str) -> List[str]:
@@ -1361,6 +1722,23 @@ async def main_async(args):
                                args.max_concurrent, args.connector_limit,
                                identity_cache=identity_cache, verbose=args.verbose)
 
+    # PHASE 3: Directory statistics exploration mode
+    if args.show_dir_stats:
+        print("\n[INFO] Directory statistics mode (exploration)", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        start_time = time.time()
+
+        # Use max_depth from args, default to 1 if not specified
+        depth = args.max_depth if args.max_depth else 1
+
+        async with client.create_session() as session:
+            await client.show_directory_stats(session, args.path, max_depth=depth)
+
+        elapsed = time.time() - start_time
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(f"Exploration completed in {elapsed:.2f}s", file=sys.stderr)
+        return
+
     # Resolve owner filters if specified
     owner_auth_ids = None
     profiler = Profiler() if args.profile else None
@@ -1386,8 +1764,34 @@ async def main_async(args):
     # Create file filter
     file_filter = create_file_filter(args, owner_auth_ids)
 
-    # Create progress tracker
-    progress = ProgressTracker(verbose=args.progress) if args.progress else None
+    # PHASE 3: Prepare filter info for smart skipping
+    # Build time filter info for aggregates-based smart skipping
+    time_filter_info = None
+    if args.older_than or args.newer_than:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        time_filter_info = {
+            'time_field': args.time_field,
+            'older_than': now_utc - timedelta(days=args.older_than) if args.older_than else None,
+            'newer_than': now_utc - timedelta(days=args.newer_than) if args.newer_than else None
+        }
+
+    # Build size filter info for aggregates-based smart skipping
+    size_filter_info = None
+    if args.larger_than:
+        # Only support --larger-than for smart skipping (min size threshold)
+        size_filter_info = {
+            'min_size': parse_size_to_bytes(args.larger_than)
+        }
+
+    # PHASE 3.3: Build owner filter info for aggregates-based smart skipping
+    owner_filter_info = None
+    if owner_auth_ids:
+        owner_filter_info = {
+            'auth_ids': owner_auth_ids
+        }
+
+    # Create progress tracker with optional limit for early exit
+    progress = ProgressTracker(verbose=args.progress, limit=args.limit) if args.progress else None
 
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
@@ -1407,7 +1811,9 @@ async def main_async(args):
             session, args.path, args.max_depth, progress=progress,
             file_filter=file_filter, owner_stats=owner_stats,
             omit_subdirs=args.omit_subdirs, collect_results=collect_results,
-            verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir
+            verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir,
+            time_filter_info=time_filter_info, size_filter_info=size_filter_info,
+            owner_filter_info=owner_filter_info
         )
 
     if profiler:
@@ -1627,6 +2033,8 @@ Examples:
                        help='Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)')
     parser.add_argument('--max-entries-per-dir', type=int,
                        help='Skip directories with more than N entries (safety valve for large directories)')
+    parser.add_argument('--show-dir-stats', action='store_true',
+                       help='Show directory statistics without enumerating files (exploration mode)')
 
     # Output options
     parser.add_argument('--json', action='store_true',
