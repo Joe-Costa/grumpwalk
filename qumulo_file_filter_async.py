@@ -54,6 +54,34 @@ except ImportError:
     JSON_PARSER_NAME = "json"
 
 
+class OwnerStats:
+    """Track file ownership statistics for --owner-report."""
+
+    def __init__(self):
+        self.owner_data = {}  # auth_id -> {'bytes': int, 'files': int, 'dirs': int}
+        self.lock = asyncio.Lock()
+
+    async def add_file(self, owner_auth_id: str, size: int, is_dir: bool = False):
+        """Add a file to the owner statistics."""
+        async with self.lock:
+            if owner_auth_id not in self.owner_data:
+                self.owner_data[owner_auth_id] = {'bytes': 0, 'files': 0, 'dirs': 0}
+
+            self.owner_data[owner_auth_id]['bytes'] += size
+            if is_dir:
+                self.owner_data[owner_auth_id]['dirs'] += 1
+            else:
+                self.owner_data[owner_auth_id]['files'] += 1
+
+    def get_all_owners(self) -> List[str]:
+        """Get list of all unique owner auth_ids."""
+        return list(self.owner_data.keys())
+
+    def get_stats(self, owner_auth_id: str) -> Dict:
+        """Get statistics for a specific owner."""
+        return self.owner_data.get(owner_auth_id, {'bytes': 0, 'files': 0, 'dirs': 0})
+
+
 class ProgressTracker:
     """Track progress of async tree walking with real-time updates."""
 
@@ -221,7 +249,8 @@ class AsyncQumuloClient:
                              max_depth: Optional[int] = None,
                              _current_depth: int = 0,
                              progress: Optional[ProgressTracker] = None,
-                             file_filter=None) -> List[dict]:
+                             file_filter=None,
+                             owner_stats: Optional[OwnerStats] = None) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -243,14 +272,28 @@ class AsyncQumuloClient:
         # Enumerate current directory
         entries = await self.enumerate_directory(session, path)
 
-        # Filter entries if filter function provided
+        # Filter entries and collect owner stats
         matching_entries = []
-        if file_filter:
-            for entry in entries:
+        for entry in entries:
+            # Collect owner statistics if enabled
+            if owner_stats:
+                owner_details = entry.get('owner_details', {})
+                owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                if owner_auth_id:
+                    # Convert size to int (may be string from API)
+                    try:
+                        file_size = int(entry.get('size', 0))
+                    except (ValueError, TypeError):
+                        file_size = 0
+                    is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+                    await owner_stats.add_file(owner_auth_id, file_size, is_dir)
+
+            # Apply filter
+            if file_filter:
                 if file_filter(entry):
                     matching_entries.append(entry)
-        else:
-            matching_entries = entries
+            else:
+                matching_entries.append(entry)
 
         # Find subdirectories
         subdirs = [
@@ -265,7 +308,7 @@ class AsyncQumuloClient:
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
             tasks = [
-                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter)
+                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats)
                 for subdir in subdirs
             ]
 
@@ -531,7 +574,97 @@ def parse_size_to_bytes(size_str: str) -> int:
     return int(size_num * multipliers[size_unit])
 
 
-def create_file_filter(args):
+async def resolve_owner_filters(client: AsyncQumuloClient, session: aiohttp.ClientSession, args) -> Optional[Set[str]]:
+    """
+    Resolve owner filter arguments to a set of auth_ids to match.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp ClientSession
+        args: Command-line arguments
+
+    Returns:
+        Set of auth_ids to match, or None if no owner filter specified
+    """
+    if not args.owners:
+        return None
+
+    # Determine owner type
+    owner_type = "auto"
+    if args.ad:
+        owner_type = "ad"
+    elif args.local:
+        owner_type = "local"
+    elif args.uid:
+        owner_type = "uid"
+
+    all_auth_ids = set()
+
+    for owner in args.owners:
+        # Parse the owner input based on type
+        if owner_type == "uid":
+            # UID - resolve by UID
+            try:
+                identity = await client.resolve_identity(session, owner, "uid")
+                if identity.get('resolved') and identity.get('auth_id'):
+                    all_auth_ids.add(identity['auth_id'])
+            except Exception as e:
+                print(f"[WARN] Failed to resolve UID {owner}: {e}", file=sys.stderr)
+        elif owner_type == "ad":
+            # Active Directory - resolve by name with AD domain
+            payload_info = parse_trustee(f"ad:{owner}")
+            payload = payload_info['payload']
+
+            url = f"{client.base_url}/v1/identity/find"
+            try:
+                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                    if response.status == 200:
+                        identity = await response.json()
+                        if identity.get('auth_id'):
+                            all_auth_ids.add(identity['auth_id'])
+            except Exception as e:
+                print(f"[WARN] Failed to resolve AD user {owner}: {e}", file=sys.stderr)
+        elif owner_type == "local":
+            # Local - resolve by name with LOCAL domain
+            payload_info = parse_trustee(f"local:{owner}")
+            payload = payload_info['payload']
+
+            url = f"{client.base_url}/v1/identity/find"
+            try:
+                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                    if response.status == 200:
+                        identity = await response.json()
+                        if identity.get('auth_id'):
+                            all_auth_ids.add(identity['auth_id'])
+            except Exception as e:
+                print(f"[WARN] Failed to resolve local user {owner}: {e}", file=sys.stderr)
+        else:
+            # Auto-detect - parse and resolve
+            payload_info = parse_trustee(owner)
+            payload = payload_info['payload']
+
+            url = f"{client.base_url}/v1/identity/find"
+            try:
+                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                    if response.status == 200:
+                        identity = await response.json()
+                        if identity.get('auth_id'):
+                            all_auth_ids.add(identity['auth_id'])
+            except Exception as e:
+                print(f"[WARN] Failed to resolve owner {owner}: {e}", file=sys.stderr)
+
+    # If expand-identity is enabled, expand all auth_ids
+    if args.expand_identity and all_auth_ids:
+        expanded_ids = set()
+        for auth_id in all_auth_ids:
+            equivalent_ids = await client.expand_identity(session, auth_id)
+            expanded_ids.update(equivalent_ids)
+        return expanded_ids
+
+    return all_auth_ids if all_auth_ids else None
+
+
+def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     """Create a file filter function based on command-line arguments."""
 
     # Calculate time thresholds (timezone-aware)
@@ -563,6 +696,20 @@ def create_file_filter(args):
         # File-only filter
         if args.file_only and entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
             return False
+
+        # Owner filter
+        if owner_auth_ids is not None:
+            # Get owner from entry - try owner_details first, then owner
+            owner_details = entry.get('owner_details', {})
+            file_owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+
+            if not file_owner_auth_id:
+                # No owner info, skip this file
+                return False
+
+            # Check if file owner matches any of our target auth_ids
+            if file_owner_auth_id not in owner_auth_ids:
+                return False
 
         # Size filters
         if size_larger is not None or size_smaller is not None:
@@ -602,6 +749,84 @@ def create_file_filter(args):
     return file_filter
 
 
+def format_bytes(bytes_value: int) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} EB"
+
+
+async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerStats,
+                                args, elapsed_time: float):
+    """Generate and display ownership report."""
+    print("\n" + "=" * 80, file=sys.stderr)
+    print("OWNER REPORT", file=sys.stderr)
+    print("=" * 80, file=sys.stderr)
+
+    # Get all unique owners
+    all_owners = owner_stats.get_all_owners()
+
+    if not all_owners:
+        print("No files found", file=sys.stderr)
+        return
+
+    print(f"\nResolving {len(all_owners)} unique owner identities...", file=sys.stderr)
+
+    # Resolve all owners in parallel
+    async with client.create_session() as session:
+        identity_cache = await client.resolve_multiple_identities(session, all_owners)
+
+    # Build report data
+    report_rows = []
+    total_bytes = 0
+    total_files = 0
+    total_dirs = 0
+
+    for owner_auth_id in all_owners:
+        stats = owner_stats.get_stats(owner_auth_id)
+        identity = identity_cache.get(owner_auth_id, {})
+
+        owner_name = identity.get('name', f'Unknown ({owner_auth_id})')
+        domain = identity.get('domain', 'UNKNOWN')
+
+        report_rows.append({
+            'owner': owner_name,
+            'domain': domain,
+            'auth_id': owner_auth_id,
+            'bytes': stats['bytes'],
+            'files': stats['files'],
+            'dirs': stats['dirs']
+        })
+
+        total_bytes += stats['bytes']
+        total_files += stats['files']
+        total_dirs += stats['dirs']
+
+    # Sort by bytes descending
+    report_rows.sort(key=lambda x: x['bytes'], reverse=True)
+
+    # Print report
+    print(f"\n{'Owner':<30} {'Domain':<20} {'Files':>10} {'Dirs':>8} {'Total Size':>15}", file=sys.stderr)
+    print("-" * 90, file=sys.stderr)
+
+    for row in report_rows:
+        owner = row['owner'] or 'Unknown'
+        domain = row['domain'] or 'UNKNOWN'
+        print(f"{owner:<30} {domain:<20} {row['files']:>10,} {row['dirs']:>8,} {format_bytes(row['bytes']):>15}",
+              file=sys.stderr)
+
+    print("-" * 90, file=sys.stderr)
+    print(f"{'TOTAL':<30} {'':<20} {total_files:>10,} {total_dirs:>8,} {format_bytes(total_bytes):>15}",
+          file=sys.stderr)
+
+    print(f"\nProcessing time: {elapsed_time:.2f}s", file=sys.stderr)
+    rate = (total_files + total_dirs) / elapsed_time if elapsed_time > 0 else 0
+    print(f"Processing rate: {rate:.1f} obj/sec", file=sys.stderr)
+    print("=" * 80, file=sys.stderr)
+
+
 async def main_async(args):
     """Main async function."""
     print("=" * 70, file=sys.stderr)
@@ -631,22 +856,40 @@ async def main_async(args):
 
     bearer_token = creds.bearer_token
 
-    # Create file filter
-    file_filter = create_file_filter(args)
-
     # Create client
     client = AsyncQumuloClient(args.host, args.port, bearer_token,
                                args.max_concurrent, args.connector_limit)
 
+    # Resolve owner filters if specified
+    owner_auth_ids = None
+    if args.owners:
+        print("\nResolving owner identities...", file=sys.stderr)
+        async with client.create_session() as session:
+            owner_auth_ids = await resolve_owner_filters(client, session, args)
+
+        if owner_auth_ids:
+            print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+            if args.verbose:
+                print(f"Owner auth_ids: {', '.join(owner_auth_ids)}", file=sys.stderr)
+        else:
+            print("[WARN] No valid owners resolved - no files will match!", file=sys.stderr)
+
+    # Create file filter
+    file_filter = create_file_filter(args, owner_auth_ids)
+
     # Create progress tracker
     progress = ProgressTracker(verbose=args.progress) if args.progress else None
+
+    # Create owner stats tracker if owner-report enabled
+    owner_stats = OwnerStats() if args.owner_report else None
 
     # Walk tree and collect matches
     start_time = time.time()
 
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
-            session, args.path, args.max_depth, progress=progress, file_filter=file_filter
+            session, args.path, args.max_depth, progress=progress,
+            file_filter=file_filter, owner_stats=owner_stats
         )
 
     elapsed = time.time() - start_time
@@ -654,6 +897,11 @@ async def main_async(args):
     # Final progress report
     if progress:
         progress.final_report()
+
+    # Generate owner report if requested
+    if args.owner_report and owner_stats:
+        await generate_owner_report(client, owner_stats, args, elapsed)
+        return  # Exit after report, don't output file list
 
     # Output results
     if args.json or args.json_out:
@@ -741,6 +989,20 @@ Examples:
                        help='Find files larger than specified size (e.g., 100MB, 1.5GiB)')
     parser.add_argument('--smaller-than',
                        help='Find files smaller than specified size')
+
+    # Owner filters
+    parser.add_argument('--owner', action='append', dest='owners',
+                       help='Filter by file owner (can be specified multiple times for OR logic)')
+    parser.add_argument('--ad', action='store_true',
+                       help='Owner(s) are Active Directory users')
+    parser.add_argument('--local', action='store_true',
+                       help='Owner(s) are local users')
+    parser.add_argument('--uid', action='store_true',
+                       help='Owner(s) are specified as UID numbers')
+    parser.add_argument('--expand-identity', action='store_true',
+                       help='Match all equivalent identities (e.g., AD user + NFS UID)')
+    parser.add_argument('--owner-report', action='store_true',
+                       help='Generate ownership report (file count and total bytes by owner)')
 
     # Search options
     parser.add_argument('--max-depth', type=int,
