@@ -571,7 +571,7 @@ class AsyncQumuloClient:
             verbose: If True, log mode selection
 
         Returns:
-            Tuple of (matching_entries, subdirs, match_count)
+            Tuple of (matching_entries, subdirs, match_count, total_entries_processed)
         """
         # Parse aggregates to determine directory size
         try:
@@ -591,11 +591,13 @@ class AsyncQumuloClient:
         matching_entries = []
         subdirs = []
         match_count = 0
+        total_processed = 0  # Track total entries processed (all files + dirs)
 
         if use_streaming:
             # Use streaming mode - process pages as they arrive
             async def process_page(page_entries):
-                nonlocal match_count
+                nonlocal match_count, total_processed
+                total_processed += len(page_entries)
                 for entry in page_entries:
                     # Collect owner statistics if enabled
                     if owner_stats:
@@ -634,6 +636,7 @@ class AsyncQumuloClient:
         else:
             # Use batch mode - existing behavior
             entries = await self.enumerate_directory(session, path)
+            total_processed = len(entries)
 
             for entry in entries:
                 # Collect owner statistics if enabled
@@ -668,7 +671,7 @@ class AsyncQumuloClient:
                     if collect_results:
                         matching_entries.append(entry)
 
-        return (matching_entries, subdirs, match_count)
+        return (matching_entries, subdirs, match_count, total_processed)
 
     async def walk_tree_async(self, session: aiohttp.ClientSession, path: str,
                              max_depth: Optional[int] = None,
@@ -682,7 +685,8 @@ class AsyncQumuloClient:
                              max_entries_per_dir: Optional[int] = None,
                              time_filter_info: Optional[Dict] = None,
                              size_filter_info: Optional[Dict] = None,
-                             owner_filter_info: Optional[Dict] = None) -> List[dict]:
+                             owner_filter_info: Optional[Dict] = None,
+                             output_callback=None) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -851,7 +855,7 @@ class AsyncQumuloClient:
                 pass
 
         # PHASE 3.2: Use adaptive enumeration (automatically chooses streaming vs batch mode)
-        matching_entries, subdirs, match_count = await self.enumerate_directory_adaptive(
+        matching_entries, subdirs, match_count, total_processed = await self.enumerate_directory_adaptive(
             session, path, aggregates, file_filter, owner_stats, collect_results, verbose
         )
 
@@ -873,14 +877,17 @@ class AsyncQumuloClient:
 
             subdirs = filtered_subdirs
 
+        # Output matches immediately if callback provided
+        if output_callback and matching_entries:
+            for entry in matching_entries:
+                await output_callback(entry)
+
         # Update progress tracker
         if progress:
-            # Calculate total entries from aggregates for progress tracking
-            try:
-                total_entries_processed = int(aggregates.get('total_files', 0)) + int(aggregates.get('total_directories', 0))
-            except (ValueError, TypeError):
-                total_entries_processed = len(matching_entries) + len(subdirs)
-            await progress.update(total_entries_processed, 1, match_count)
+            # Count ACTUAL entries processed (not recursive aggregates)
+            # This is the total number of immediate children in THIS directory:
+            # all entries (files + directories) that were enumerated and examined
+            await progress.update(total_processed, 1, match_count)
 
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
@@ -908,7 +915,7 @@ class AsyncQumuloClient:
                     self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress,
                                         file_filter, owner_stats, omit_subdirs, collect_results,
                                         verbose, max_entries_per_dir, time_filter_info, size_filter_info,
-                                        owner_filter_info)
+                                        owner_filter_info, output_callback)
                     for subdir in batch
                 ]
 
@@ -1806,6 +1813,21 @@ async def main_async(args):
     # For owner reports, don't collect matching files to save memory
     collect_results = not args.owner_report
 
+    # Create output callback for streaming results to stdout (plain text mode only)
+    output_callback = None
+    if not args.owner_report and not args.csv_out and not args.json_out:
+        # Plain text output - stream results as found
+        if args.json:
+            # JSON to stdout
+            async def output_callback(entry):
+                print(json_parser.dumps(entry))
+                sys.stdout.flush()
+        else:
+            # Plain text to stdout
+            async def output_callback(entry):
+                print(entry['path'])
+                sys.stdout.flush()
+
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
             session, args.path, args.max_depth, progress=progress,
@@ -1813,7 +1835,7 @@ async def main_async(args):
             omit_subdirs=args.omit_subdirs, collect_results=collect_results,
             verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir,
             time_filter_info=time_filter_info, size_filter_info=size_filter_info,
-            owner_filter_info=owner_filter_info
+            owner_filter_info=owner_filter_info, output_callback=output_callback
         )
 
     if profiler:
