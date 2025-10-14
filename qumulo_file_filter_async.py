@@ -549,7 +549,8 @@ class AsyncQumuloClient:
                                           file_filter=None,
                                           owner_stats: Optional[OwnerStats] = None,
                                           collect_results: bool = True,
-                                          verbose: bool = False) -> tuple:
+                                          verbose: bool = False,
+                                          progress: Optional['ProgressTracker'] = None) -> tuple:
         """
         Automatically choose between batch mode and streaming mode based on directory size.
 
@@ -597,7 +598,10 @@ class AsyncQumuloClient:
             # Use streaming mode - process pages as they arrive
             async def process_page(page_entries):
                 nonlocal match_count, total_processed
-                total_processed += len(page_entries)
+                page_size = len(page_entries)
+                page_matches = 0
+
+                total_processed += page_size
                 for entry in page_entries:
                     # Collect owner statistics if enabled
                     if owner_stats:
@@ -624,12 +628,18 @@ class AsyncQumuloClient:
                     if file_filter:
                         if file_filter(entry):
                             match_count += 1
+                            page_matches += 1
                             if collect_results:
                                 matching_entries.append(entry)
                     else:
                         match_count += 1
+                        page_matches += 1
                         if collect_results:
                             matching_entries.append(entry)
+
+                # Update progress after each page in streaming mode
+                if progress:
+                    await progress.update(page_size, 0, page_matches)
 
             # Stream directory entries
             await self.enumerate_directory_streaming(session, path, process_page)
@@ -855,8 +865,9 @@ class AsyncQumuloClient:
                 pass
 
         # PHASE 3.2: Use adaptive enumeration (automatically chooses streaming vs batch mode)
+        # Pass progress tracker for per-page updates in streaming mode
         matching_entries, subdirs, match_count, total_processed = await self.enumerate_directory_adaptive(
-            session, path, aggregates, file_filter, owner_stats, collect_results, verbose
+            session, path, aggregates, file_filter, owner_stats, collect_results, verbose, progress
         )
 
         # Filter subdirectories based on omit patterns
@@ -882,11 +893,21 @@ class AsyncQumuloClient:
             for entry in matching_entries:
                 await output_callback(entry)
 
-        # Update progress tracker
-        if progress:
+        # Update progress tracker for batch mode
+        # In streaming mode, progress is already updated per-page inside enumerate_directory_adaptive
+        # In batch mode, we update once with the total for this directory
+        # We determine the mode by checking if total_entries >= 50000 (streaming threshold)
+        try:
+            total_files = int(aggregates.get('total_files', 0))
+            total_dirs = int(aggregates.get('total_directories', 0))
+            total_entries = total_files + total_dirs
+            used_streaming = total_entries >= 50000 and collect_results
+        except (ValueError, TypeError):
+            used_streaming = False
+
+        if progress and not used_streaming:
+            # Batch mode: update progress once for this directory
             # Count ACTUAL entries processed (not recursive aggregates)
-            # This is the total number of immediate children in THIS directory:
-            # all entries (files + directories) that were enumerated and examined
             await progress.update(total_processed, 1, match_count)
 
         # Recursively process subdirectories concurrently
