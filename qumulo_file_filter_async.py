@@ -58,9 +58,17 @@ except ImportError:
 class OwnerStats:
     """Track file ownership statistics for --owner-report."""
 
-    def __init__(self):
+    def __init__(self, use_capacity: bool = False):
+        """
+        Initialize owner statistics tracker.
+
+        Args:
+            use_capacity: If True, use actual disk usage (datablocks + metablocks).
+                         If False, use logical file size. Set to True to handle sparse files correctly.
+        """
         self.owner_data = {}  # auth_id -> {'bytes': int, 'files': int, 'dirs': int}
         self.lock = asyncio.Lock()
+        self.use_capacity = use_capacity
 
     async def add_file(self, owner_auth_id: str, size: int, is_dir: bool = False):
         """Add a file to the owner statistics."""
@@ -354,9 +362,16 @@ class AsyncQumuloClient:
                 owner_details = entry.get('owner_details', {})
                 owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
                 if owner_auth_id:
-                    # Convert size to int (may be string from API)
+                    # Calculate file size (use actual disk usage if configured)
                     try:
-                        file_size = int(entry.get('size', 0))
+                        if owner_stats.use_capacity:
+                            # Use actual disk usage (datablocks + metablocks) * 4KB
+                            datablocks = int(entry.get('datablocks', 0))
+                            metablocks = int(entry.get('metablocks', 0))
+                            file_size = (datablocks + metablocks) * 4096
+                        else:
+                            # Use logical file size
+                            file_size = int(entry.get('size', 0))
                     except (ValueError, TypeError):
                         file_size = 0
                     is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
@@ -1042,7 +1057,8 @@ async def main_async(args):
     progress = ProgressTracker(verbose=args.progress) if args.progress else None
 
     # Create owner stats tracker if owner-report enabled
-    owner_stats = OwnerStats() if args.owner_report else None
+    # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
+    owner_stats = OwnerStats(use_capacity=args.use_capacity) if args.owner_report else None
 
     # Walk tree and collect matches
     start_time = time.time()
@@ -1257,6 +1273,10 @@ Examples:
                        help='Match all equivalent identities (e.g., AD user + NFS UID)')
     parser.add_argument('--owner-report', action='store_true',
                        help='Generate ownership report (file count and total bytes by owner)')
+    parser.add_argument('--use-capacity', action='store_true', default=True,
+                       help='Use actual disk capacity (datablocks + metablocks) instead of logical file size for owner reports (default: True). Handles sparse files correctly.')
+    parser.add_argument('--no-use-capacity', dest='use_capacity', action='store_false',
+                       help='Use logical file size instead of actual disk capacity for owner reports')
 
     # Search options
     parser.add_argument('--max-depth', type=int,
