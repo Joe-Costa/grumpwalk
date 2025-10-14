@@ -54,6 +54,71 @@ except ImportError:
     import json as json_parser
     JSON_PARSER_NAME = "json"
 
+# Identity cache configuration
+IDENTITY_CACHE_FILE = 'file_filter_resolved_identities'
+IDENTITY_CACHE_TTL = 15 * 60  # 15 minutes in seconds
+import os
+
+
+def load_identity_cache(verbose: bool = False) -> Dict:
+    """Load identity cache from file, removing expired entries."""
+    cache = {}
+    cache_timestamp = int(time.time())
+
+    try:
+        if os.path.exists(IDENTITY_CACHE_FILE):
+            with open(IDENTITY_CACHE_FILE, 'r') as f:
+                cache_data = json_parser.load(f)
+
+                # Remove expired entries
+                expired_count = 0
+                for auth_id, entry in list(cache_data.items()):
+                    if cache_timestamp - entry.get('timestamp', 0) > IDENTITY_CACHE_TTL:
+                        expired_count += 1
+                        del cache_data[auth_id]
+                    else:
+                        # Store full identity data, not just name
+                        cache[auth_id] = entry.get('identity', {})
+
+                # Write cleaned cache back to file if entries were expired
+                if expired_count > 0:
+                    save_identity_cache(cache, verbose=False)
+
+            if verbose and cache:
+                print(f'[INFO] Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}',
+                      file=sys.stderr)
+                if expired_count > 0:
+                    print(f'[INFO] Removed {expired_count} expired cache entries',
+                          file=sys.stderr)
+    except Exception as e:
+        if verbose:
+            print(f'[WARN] Failed to load identity cache: {e}', file=sys.stderr)
+
+    return cache
+
+
+def save_identity_cache(identity_cache: Dict, verbose: bool = False):
+    """Save identity cache to file."""
+    try:
+        cache_data = {}
+        cache_timestamp = int(time.time())
+
+        for auth_id, identity in identity_cache.items():
+            cache_data[auth_id] = {
+                'identity': identity,
+                'timestamp': cache_timestamp
+            }
+
+        with open(IDENTITY_CACHE_FILE, 'w') as f:
+            json_parser.dump(cache_data, f, indent=2)
+
+        if verbose:
+            print(f'[INFO] Saved {len(identity_cache)} identities to cache file',
+                  file=sys.stderr)
+    except Exception as e:
+        if verbose:
+            print(f'[WARN] Failed to save identity cache: {e}', file=sys.stderr)
+
 
 class OwnerStats:
     """Track file ownership statistics for --owner-report."""
@@ -224,12 +289,14 @@ class AsyncQumuloClient:
     """Async Qumulo API client using aiohttp with optimized connection pooling."""
 
     def __init__(self, host: str, port: int, bearer_token: str,
-                 max_concurrent: int = 100, connector_limit: int = 100):
+                 max_concurrent: int = 100, connector_limit: int = 100,
+                 identity_cache: Optional[Dict] = None, verbose: bool = False):
         self.host = host
         self.port = port
         self.base_url = f"https://{host}:{port}"
         self.bearer_token = bearer_token
         self.max_concurrent = max_concurrent
+        self.verbose = verbose
 
         # Create SSL context that doesn't verify certificates (for self-signed certs)
         self.ssl_context = ssl.create_default_context()
@@ -246,6 +313,11 @@ class AsyncQumuloClient:
 
         # Semaphore to limit concurrent operations
         self.semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Persistent identity cache for performance
+        self.persistent_identity_cache = identity_cache if identity_cache is not None else {}
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def create_session(self) -> aiohttp.ClientSession:
         """Create optimized ClientSession with connection pooling."""
@@ -676,6 +748,8 @@ class AsyncQumuloClient:
         This handles cases where a POSIX UID (like 2005) is linked to an AD user
         (like "mark") through POSIX extensions. We want to show the AD name.
 
+        Checks persistent cache first to avoid redundant API calls.
+
         Args:
             session: aiohttp ClientSession
             auth_id: The auth_id to resolve
@@ -683,6 +757,13 @@ class AsyncQumuloClient:
         Returns:
             Dictionary containing identity info with the best available name
         """
+        # Check persistent cache first
+        if auth_id in self.persistent_identity_cache:
+            self.cache_hits += 1
+            return self.persistent_identity_cache[auth_id]
+
+        self.cache_misses += 1
+
         url = f"{self.base_url}/v1/identity/expand"
 
         # Build identity dict for the expand API
@@ -734,17 +815,26 @@ class AsyncQumuloClient:
                                 best_identity['display_domain'] = equiv_identity.get('domain')
                                 break
 
+                    # Store in cache for future use
+                    self.persistent_identity_cache[auth_id] = best_identity
+
                     return best_identity
 
                 elif response.status == 404:
                     # Identity not found - fall back to basic resolution
-                    return await self.resolve_identity(session, auth_id, "auth_id")
+                    result = await self.resolve_identity(session, auth_id, "auth_id")
+                    # Cache the result
+                    self.persistent_identity_cache[auth_id] = result
+                    return result
                 else:
                     response.raise_for_status()
 
         except Exception:
             # Fall back to basic resolution on error
-            return await self.resolve_identity(session, auth_id, "auth_id")
+            result = await self.resolve_identity(session, auth_id, "auth_id")
+            # Cache the fallback result
+            self.persistent_identity_cache[auth_id] = result
+            return result
 
     async def expand_identity(self, session: aiohttp.ClientSession,
                              auth_id: str) -> List[str]:
@@ -1223,6 +1313,14 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
     print(f"\nProcessing time: {elapsed_time:.2f}s", file=sys.stderr)
     rate = (total_files + total_dirs) / elapsed_time if elapsed_time > 0 else 0
     print(f"Processing rate: {rate:.1f} obj/sec", file=sys.stderr)
+
+    # Print cache statistics
+    total_lookups = client.cache_hits + client.cache_misses
+    if total_lookups > 0:
+        hit_rate = (client.cache_hits / total_lookups) * 100
+        print(f"\nIdentity cache: {client.cache_hits} hits, {client.cache_misses} misses ({hit_rate:.1f}% hit rate)",
+              file=sys.stderr)
+
     print("=" * 80, file=sys.stderr)
 
 
@@ -1255,9 +1353,13 @@ async def main_async(args):
 
     bearer_token = creds.bearer_token
 
-    # Create client
+    # Load persistent identity cache
+    identity_cache = load_identity_cache(verbose=args.verbose)
+
+    # Create client with identity cache
     client = AsyncQumuloClient(args.host, args.port, bearer_token,
-                               args.max_concurrent, args.connector_limit)
+                               args.max_concurrent, args.connector_limit,
+                               identity_cache=identity_cache, verbose=args.verbose)
 
     # Resolve owner filters if specified
     owner_auth_ids = None
@@ -1326,6 +1428,9 @@ async def main_async(args):
         if profiler:
             profiler.record_sync('owner_report_generation', time.time() - report_start)
             profiler.print_report(elapsed)
+
+        # Save identity cache before exiting
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after report, don't output file list
 
     # Apply limit if specified
@@ -1419,6 +1524,9 @@ async def main_async(args):
     # Print profiling report
     if profiler:
         profiler.print_report(elapsed)
+
+    # Save identity cache before exiting
+    save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
 
 
 def main():
