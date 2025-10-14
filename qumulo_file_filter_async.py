@@ -1025,8 +1025,33 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
         stats = owner_stats.get_stats(owner_auth_id)
         identity = identity_cache.get(owner_auth_id, {})
 
+        # Extract owner name, including UID/GID for POSIX users
         owner_name = identity.get('name', f'Unknown ({owner_auth_id})')
         domain = identity.get('domain', 'UNKNOWN')
+
+        # For POSIX_USER domain, show UID if available
+        if domain == 'POSIX_USER' and 'uid' in identity:
+            uid = identity.get('uid')
+            # If name is generic "Unknown", replace with UID
+            if owner_name and owner_name.startswith('Unknown'):
+                owner_name = f'UID {uid}'
+            elif owner_name:
+                # Append UID to name
+                owner_name = f'{owner_name} (UID {uid})'
+            else:
+                # No name at all, use UID
+                owner_name = f'UID {uid}'
+
+        # For POSIX_GROUP domain, show GID if available
+        elif domain == 'POSIX_GROUP' and 'gid' in identity:
+            gid = identity.get('gid')
+            if owner_name and owner_name.startswith('Unknown'):
+                owner_name = f'GID {gid}'
+            elif owner_name:
+                owner_name = f'{owner_name} (GID {gid})'
+            else:
+                # No name at all, use GID
+                owner_name = f'GID {gid}'
 
         report_rows.append({
             'owner': owner_name,
