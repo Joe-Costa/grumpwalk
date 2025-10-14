@@ -19,6 +19,7 @@ Key improvements over bash version:
 
 import argparse
 import asyncio
+import fnmatch
 import json
 import ssl
 import sys
@@ -26,7 +27,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Dict, Set
 from urllib.parse import quote, urlparse, parse_qs
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Add the Qumulo CLI directory to path to import auth modules
 CLI_PATH = Path(__file__).parent / 'cli' / 'cli'
@@ -250,7 +251,8 @@ class AsyncQumuloClient:
                              _current_depth: int = 0,
                              progress: Optional[ProgressTracker] = None,
                              file_filter=None,
-                             owner_stats: Optional[OwnerStats] = None) -> List[dict]:
+                             owner_stats: Optional[OwnerStats] = None,
+                             omit_subdirs: Optional[List[str]] = None) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -261,6 +263,8 @@ class AsyncQumuloClient:
             _current_depth: Internal tracking of current depth
             progress: Optional ProgressTracker for reporting progress
             file_filter: Optional function to filter files
+            owner_stats: Optional OwnerStats for collecting ownership data
+            omit_subdirs: Optional list of wildcard patterns for directories to skip
 
         Returns:
             List of matching file entries
@@ -295,11 +299,26 @@ class AsyncQumuloClient:
             else:
                 matching_entries.append(entry)
 
-        # Find subdirectories
-        subdirs = [
-            entry['path'] for entry in entries
-            if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
-        ]
+        # Find subdirectories and filter based on omit patterns
+        subdirs = []
+        omitted_count = 0
+
+        for entry in entries:
+            if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
+                subdir_path = entry['path']
+                subdir_name = entry.get('name', '')
+
+                # Check if this directory should be omitted
+                should_omit = False
+                if omit_subdirs:
+                    for pattern in omit_subdirs:
+                        if fnmatch.fnmatch(subdir_name, pattern):
+                            should_omit = True
+                            omitted_count += 1
+                            break
+
+                if not should_omit:
+                    subdirs.append(subdir_path)
 
         # Update progress tracker
         if progress:
@@ -308,7 +327,7 @@ class AsyncQumuloClient:
         # Recursively process subdirectories concurrently
         if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
             tasks = [
-                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats)
+                self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress, file_filter, owner_stats, omit_subdirs)
                 for subdir in subdirs
             ]
 
@@ -667,20 +686,47 @@ async def resolve_owner_filters(client: AsyncQumuloClient, session: aiohttp.Clie
 def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     """Create a file filter function based on command-line arguments."""
 
-    # Calculate time thresholds (timezone-aware)
+    # Calculate time thresholds (using current UTC time)
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)  # Convert to timezone-naive for comparison
     time_threshold_older = None
     time_threshold_newer = None
 
     if args.older_than:
-        # Use timezone-naive datetime for comparison
-        time_threshold_older = datetime.utcnow() - timedelta(days=args.older_than)
+        time_threshold_older = now_utc - timedelta(days=args.older_than)
     if args.newer_than:
-        # Use timezone-naive datetime for comparison
-        time_threshold_newer = datetime.utcnow() - timedelta(days=args.newer_than)
+        time_threshold_newer = now_utc - timedelta(days=args.newer_than)
+
+    # Calculate field-specific time thresholds
+    field_time_filters = {}
+
+    if args.accessed_older_than or args.accessed_newer_than:
+        field_time_filters['access_time'] = {
+            'older': now_utc - timedelta(days=args.accessed_older_than) if args.accessed_older_than else None,
+            'newer': now_utc - timedelta(days=args.accessed_newer_than) if args.accessed_newer_than else None
+        }
+
+    if args.modified_older_than or args.modified_newer_than:
+        field_time_filters['modification_time'] = {
+            'older': now_utc - timedelta(days=args.modified_older_than) if args.modified_older_than else None,
+            'newer': now_utc - timedelta(days=args.modified_newer_than) if args.modified_newer_than else None
+        }
+
+    if args.created_older_than or args.created_newer_than:
+        field_time_filters['creation_time'] = {
+            'older': now_utc - timedelta(days=args.created_older_than) if args.created_older_than else None,
+            'newer': now_utc - timedelta(days=args.created_newer_than) if args.created_newer_than else None
+        }
+
+    if args.changed_older_than or args.changed_newer_than:
+        field_time_filters['change_time'] = {
+            'older': now_utc - timedelta(days=args.changed_older_than) if args.changed_older_than else None,
+            'newer': now_utc - timedelta(days=args.changed_newer_than) if args.changed_newer_than else None
+        }
 
     # Parse size filters
     size_larger = None
     size_smaller = None
+    include_metadata = args.include_metadata
 
     if args.larger_than:
         size_larger = parse_size_to_bytes(args.larger_than)
@@ -719,6 +765,17 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
 
             try:
                 size_bytes = int(file_size)
+
+                # Add metadata size if requested
+                if include_metadata:
+                    metablocks = entry.get('metablocks')
+                    if metablocks:
+                        try:
+                            metadata_bytes = int(metablocks) * 4096
+                            size_bytes += metadata_bytes
+                        except (ValueError, TypeError):
+                            pass  # If metablocks is invalid, just use file size
+
                 if size_larger is not None and size_bytes <= size_larger:
                     return False
                 if size_smaller is not None and size_bytes >= size_smaller:
@@ -743,6 +800,24 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
                     return False
             except (ValueError, AttributeError):
                 return False
+
+        # Field-specific time filters (AND logic - all must match)
+        for field_name, thresholds in field_time_filters.items():
+            time_value = entry.get(field_name)
+            if not time_value:
+                return False  # If field is missing, reject the file
+
+            try:
+                # Parse Qumulo timestamp format
+                file_time = datetime.fromisoformat(time_value.rstrip('Z').split('.')[0])
+
+                # Check both older and newer thresholds if specified
+                if thresholds['older'] is not None and file_time >= thresholds['older']:
+                    return False
+                if thresholds['newer'] is not None and file_time <= thresholds['newer']:
+                    return False
+            except (ValueError, AttributeError):
+                return False  # If parsing fails, reject the file
 
         return True
 
@@ -889,7 +964,8 @@ async def main_async(args):
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
             session, args.path, args.max_depth, progress=progress,
-            file_filter=file_filter, owner_stats=owner_stats
+            file_filter=file_filter, owner_stats=owner_stats,
+            omit_subdirs=args.omit_subdirs
         )
 
     elapsed = time.time() - start_time
@@ -903,8 +979,53 @@ async def main_async(args):
         await generate_owner_report(client, owner_stats, args, elapsed)
         return  # Exit after report, don't output file list
 
+    # Apply limit if specified
+    if args.limit and len(matching_files) > args.limit:
+        if args.verbose:
+            print(f"\n[INFO] Limiting results to {args.limit} files (found {len(matching_files)})", file=sys.stderr)
+        matching_files = matching_files[:args.limit]
+
     # Output results
-    if args.json or args.json_out:
+    if args.csv_out:
+        # CSV output
+        import csv
+        with open(args.csv_out, 'w', newline='') as csv_file:
+            if not matching_files:
+                if args.verbose:
+                    print(f"[INFO] No matching files found, CSV file will be empty", file=sys.stderr)
+                return
+
+            if args.all_attributes:
+                # Write all attributes
+                fieldnames = sorted(matching_files[0].keys())
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for entry in matching_files:
+                    writer.writerow(entry)
+            else:
+                # Write selective fields
+                fieldnames = ['path']
+
+                # Add time field if time filter was used
+                if args.older_than or args.newer_than:
+                    fieldnames.append(args.time_field)
+
+                # Add owner if owner filter was used
+                if args.owners:
+                    fieldnames.append('owner')
+
+                # Add size if size filter was used
+                if args.larger_than or args.smaller_than:
+                    fieldnames.append('size')
+
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for entry in matching_files:
+                    writer.writerow(entry)
+
+        if args.verbose:
+            print(f"\n[INFO] Wrote {len(matching_files)} results to {args.csv_out}", file=sys.stderr)
+    elif args.json or args.json_out:
         # JSON output
         output_handle = sys.stdout
         if args.json_out:
@@ -984,11 +1105,31 @@ Examples:
     parser.add_argument('--changed', action='store_const', const='change_time', dest='time_field',
                        help='Filter by change time')
 
+    # Field-specific time filters (all use AND logic)
+    parser.add_argument('--accessed-older-than', type=int,
+                       help='Find files with access time older than N days')
+    parser.add_argument('--accessed-newer-than', type=int,
+                       help='Find files with access time newer than N days')
+    parser.add_argument('--modified-older-than', type=int,
+                       help='Find files with modification time older than N days')
+    parser.add_argument('--modified-newer-than', type=int,
+                       help='Find files with modification time newer than N days')
+    parser.add_argument('--created-older-than', type=int,
+                       help='Find files with creation time older than N days')
+    parser.add_argument('--created-newer-than', type=int,
+                       help='Find files with creation time newer than N days')
+    parser.add_argument('--changed-older-than', type=int,
+                       help='Find files with change time older than N days')
+    parser.add_argument('--changed-newer-than', type=int,
+                       help='Find files with change time newer than N days')
+
     # Size filters
     parser.add_argument('--larger-than',
                        help='Find files larger than specified size (e.g., 100MB, 1.5GiB)')
     parser.add_argument('--smaller-than',
                        help='Find files smaller than specified size')
+    parser.add_argument('--include-metadata', action='store_true',
+                       help='Include metadata blocks in size calculations (metablocks * 4KB)')
 
     # Owner filters
     parser.add_argument('--owner', action='append', dest='owners',
@@ -1009,18 +1150,24 @@ Examples:
                        help='Maximum directory depth to search')
     parser.add_argument('--file-only', action='store_true',
                        help='Search files only (exclude directories)')
+    parser.add_argument('--omit-subdirs', action='append',
+                       help='Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)')
 
     # Output options
     parser.add_argument('--json', action='store_true',
                        help='Output results as JSON to stdout')
     parser.add_argument('--json-out',
                        help='Write JSON results to file')
+    parser.add_argument('--csv-out',
+                       help='Write results to CSV file (mutually exclusive with --json/--json-out)')
     parser.add_argument('--all-attributes', action='store_true',
                        help='Include all file attributes in JSON output')
     parser.add_argument('--verbose', action='store_true',
                        help='Show detailed logging')
     parser.add_argument('--progress', action='store_true',
                        help='Show real-time progress stats')
+    parser.add_argument('--limit', type=int,
+                       help='Stop after finding N matching results')
 
     # Connection options
     parser.add_argument('--port', type=int, default=8000,
@@ -1039,6 +1186,14 @@ Examples:
     # Validate arguments
     if args.older_than and args.newer_than and args.newer_than >= args.older_than:
         print("Error: --newer-than must be less than --older-than for a valid time range",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Check for mutually exclusive CSV and JSON output
+    if args.csv_out and (args.json or args.json_out):
+        print("Error: --csv-out cannot be used with --json or --json-out",
+              file=sys.stderr)
+        print("Please choose either CSV or JSON output format",
               file=sys.stderr)
         sys.exit(1)
 
