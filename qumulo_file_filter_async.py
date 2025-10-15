@@ -191,11 +191,12 @@ class ProgressTracker:
             if self.verbose and time.time() - self.last_update > 0.5:
                 elapsed = time.time() - self.start_time
                 rate = self.total_objects / elapsed if elapsed > 0 else 0
+                time_str = format_time(elapsed)
                 print(f"\r[PROGRESS] {self.total_objects:,} objects processed | "
                       f"{self.matches:,} matches | "
                       f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
                       f"{rate:.1f} obj/sec | "
-                      f"{elapsed:.1f}s total",
+                      f"Run time: {time_str}",
                       end='', file=sys.stderr, flush=True)
                 self.last_update = time.time()
 
@@ -221,11 +222,12 @@ class ProgressTracker:
         if self.verbose:
             elapsed = time.time() - self.start_time
             rate = self.total_objects / elapsed if elapsed > 0 else 0
+            time_str = format_time(elapsed)
             print(f"\r[PROGRESS] FINAL: {self.total_objects:,} objects processed | "
                   f"{self.matches:,} matches | "
                   f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
                   f"{rate:.1f} obj/sec | "
-                  f"{elapsed:.1f}s total",
+                  f"Run time: {time_str}",
                   file=sys.stderr)
 
 
@@ -1125,7 +1127,8 @@ class AsyncQumuloClient:
             }
 
     async def resolve_multiple_identities(self, session: aiohttp.ClientSession,
-                                         auth_ids: List[str]) -> Dict[str, Dict]:
+                                         auth_ids: List[str],
+                                         show_progress: bool = False) -> Dict[str, Dict]:
         """
         Resolve multiple identities in parallel, using identity expansion to find
         the best name for POSIX UIDs that are linked to AD users.
@@ -1133,6 +1136,7 @@ class AsyncQumuloClient:
         Args:
             session: aiohttp ClientSession
             auth_ids: List of auth_id values to resolve
+            show_progress: If True, display progress updates during resolution
 
         Returns:
             Dictionary mapping auth_id to resolved identity info
@@ -1143,6 +1147,15 @@ class AsyncQumuloClient:
         if not unique_ids:
             return {}
 
+        # Track how many are already cached
+        cached_count = sum(1 for auth_id in unique_ids if auth_id in self.persistent_identity_cache)
+        to_resolve_count = len(unique_ids) - cached_count
+
+        if show_progress:
+            print(f"[INFO] Resolving {len(unique_ids)} unique owner identities ({cached_count} cached, {to_resolve_count} to fetch)...", file=sys.stderr)
+
+        start_time = time.time()
+
         # Create tasks for parallel resolution with expansion
         tasks = [
             self._resolve_identity_with_expansion(session, auth_id)
@@ -1151,6 +1164,12 @@ class AsyncQumuloClient:
 
         # Execute all resolutions in parallel
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        if show_progress:
+            elapsed = time.time() - start_time
+            avg_time = elapsed / len(unique_ids) if len(unique_ids) > 0 else 0
+            print(f"[INFO] Identity resolution completed in {elapsed:.1f}s ({avg_time*1000:.1f}ms per identity)", file=sys.stderr)
+            print(f"[INFO] Cache stats - Hits: {self.cache_hits}, Misses: {self.cache_misses}, Hit rate: {self.cache_hits/(self.cache_hits+self.cache_misses)*100:.1f}%", file=sys.stderr)
 
         # Build cache mapping auth_id to result
         identity_cache = {}
@@ -1720,6 +1739,38 @@ def format_bytes(bytes_value: int) -> str:
     return f"{bytes_value:.2f} EB"
 
 
+def format_time(seconds: float) -> str:
+    """
+    Format elapsed time in human-friendly format with total seconds.
+
+    Examples:
+        5.2s (5.2s)
+        72.3s -> 1m 12s (72.3s)
+        3665.7s -> 1h 1m 5s (3665.7s)
+    """
+    total_seconds = seconds
+
+    if seconds < 60:
+        # Less than a minute - just show seconds
+        return f"{seconds:.1f}s"
+
+    hours = int(seconds // 3600)
+    seconds = seconds % 3600
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 or not parts:
+        parts.append(f"{secs}s")
+
+    friendly = " ".join(parts)
+    return f"{friendly} ({total_seconds:.1f}s)"
+
+
 def format_owner_name(identity: Dict) -> str:
     """Format owner name from resolved identity."""
     if not identity:
@@ -1765,11 +1816,9 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
         print("No files found", file=sys.stderr)
         return
 
-    print(f"\nResolving {len(all_owners)} unique owner identities...", file=sys.stderr)
-
     # Resolve all owners in parallel
     async with client.create_session() as session:
-        identity_cache = await client.resolve_multiple_identities(session, all_owners)
+        identity_cache = await client.resolve_multiple_identities(session, all_owners, show_progress=True)
 
     # Build report data
     report_rows = []
@@ -2037,11 +2086,10 @@ async def main_async(args):
                 unique_owners.add(owner_auth_id)
 
         if unique_owners:
-            if args.verbose:
-                print(f"\n[INFO] Resolving {len(unique_owners)} unique owner identities...", file=sys.stderr)
-
             async with client.create_session() as session:
-                identity_cache_for_output = await client.resolve_multiple_identities(session, list(unique_owners))
+                identity_cache_for_output = await client.resolve_multiple_identities(
+                    session, list(unique_owners), show_progress=args.verbose or args.progress
+                )
 
     # Generate owner report if requested
     if args.owner_report and owner_stats:
