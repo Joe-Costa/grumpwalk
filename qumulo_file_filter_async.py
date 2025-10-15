@@ -210,6 +210,77 @@ class ProgressTracker:
                   file=sys.stderr)
 
 
+class BatchedOutputHandler:
+    """Handle batched output with identity resolution for --show-owner streaming."""
+
+    def __init__(self, client: 'AsyncQumuloClient', batch_size: int = 100,
+                 show_owner: bool = False, output_format: str = 'text'):
+        self.client = client
+        self.batch_size = batch_size
+        self.show_owner = show_owner
+        self.output_format = output_format  # 'text' or 'json'
+        self.batch = []
+        self.lock = asyncio.Lock()
+
+    async def add_entry(self, entry: dict):
+        """Add entry to batch and flush if batch is full."""
+        async with self.lock:
+            self.batch.append(entry)
+
+            if len(self.batch) >= self.batch_size:
+                await self._flush_batch()
+
+    async def _flush_batch(self):
+        """Resolve identities for current batch and output."""
+        if not self.batch:
+            return
+
+        identity_cache = {}
+
+        if self.show_owner:
+            # Collect unique owner auth_ids from batch
+            unique_owners = set()
+            for entry in self.batch:
+                owner_details = entry.get('owner_details', {})
+                owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                if owner_auth_id:
+                    unique_owners.add(owner_auth_id)
+
+            # Resolve all owners in parallel
+            if unique_owners:
+                async with self.client.create_session() as session:
+                    identity_cache = await self.client.resolve_multiple_identities(
+                        session, list(unique_owners)
+                    )
+
+        # Output batch
+        for entry in self.batch:
+            if self.output_format == 'json':
+                print(json_parser.dumps(entry))
+            else:
+                # Plain text
+                output_line = entry['path']
+                if self.show_owner:
+                    owner_details = entry.get('owner_details', {})
+                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    if owner_auth_id and owner_auth_id in identity_cache:
+                        identity = identity_cache[owner_auth_id]
+                        owner_name = format_owner_name(identity)
+                        output_line = f"{output_line}\t{owner_name}"
+                    else:
+                        output_line = f"{output_line}\tUnknown"
+                print(output_line)
+            sys.stdout.flush()
+
+        # Clear batch
+        self.batch = []
+
+    async def flush(self):
+        """Flush any remaining entries in batch."""
+        async with self.lock:
+            await self._flush_batch()
+
+
 class Profiler:
     """Track detailed performance metrics for profiling."""
 
@@ -1618,6 +1689,37 @@ def format_bytes(bytes_value: int) -> str:
     return f"{bytes_value:.2f} EB"
 
 
+def format_owner_name(identity: Dict) -> str:
+    """Format owner name from resolved identity."""
+    if not identity:
+        return "Unknown"
+
+    owner_name = identity.get('name', 'Unknown')
+    domain = identity.get('domain', 'UNKNOWN')
+
+    # For POSIX_USER domain, show UID if available
+    if domain == 'POSIX_USER' and 'uid' in identity:
+        uid = identity.get('uid')
+        if owner_name and owner_name.startswith('Unknown'):
+            return f'UID {uid}'
+        elif owner_name:
+            return f'{owner_name} (UID {uid})'
+        else:
+            return f'UID {uid}'
+
+    # For POSIX_GROUP domain, show GID if available
+    elif domain == 'POSIX_GROUP' and 'gid' in identity:
+        gid = identity.get('gid')
+        if owner_name and owner_name.startswith('Unknown'):
+            return f'GID {gid}'
+        elif owner_name:
+            return f'{owner_name} (GID {gid})'
+        else:
+            return f'GID {gid}'
+
+    return owner_name
+
+
 async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerStats,
                                 args, elapsed_time: float):
     """Generate and display ownership report."""
@@ -1843,18 +1945,29 @@ async def main_async(args):
 
     # Create output callback for streaming results to stdout (plain text mode only)
     output_callback = None
+    batched_handler = None
+
     if not args.owner_report and not args.csv_out and not args.json_out:
-        # Plain text output - stream results as found
-        if args.json:
-            # JSON to stdout
+        if args.show_owner:
+            # Use batched output handler for streaming with owner resolution
+            output_format = 'json' if args.json else 'text'
+            batched_handler = BatchedOutputHandler(
+                client, batch_size=100, show_owner=True, output_format=output_format
+            )
             async def output_callback(entry):
-                print(json_parser.dumps(entry))
-                sys.stdout.flush()
+                await batched_handler.add_entry(entry)
         else:
-            # Plain text to stdout
-            async def output_callback(entry):
-                print(entry['path'])
-                sys.stdout.flush()
+            # Direct streaming output (no owner resolution needed)
+            if args.json:
+                # JSON to stdout
+                async def output_callback(entry):
+                    print(json_parser.dumps(entry))
+                    sys.stdout.flush()
+            else:
+                # Plain text to stdout
+                async def output_callback(entry):
+                    print(entry['path'])
+                    sys.stdout.flush()
 
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
@@ -1875,6 +1988,29 @@ async def main_async(args):
     # Final progress report
     if progress:
         progress.final_report()
+
+    # Flush any remaining batched output
+    if batched_handler:
+        await batched_handler.flush()
+
+    # Resolve owner identities if --show-owner is enabled (for non-streaming modes only)
+    # Skip if batched_handler was used (streaming mode)
+    identity_cache_for_output = {}
+    if args.show_owner and matching_files and not batched_handler:
+        # Collect unique owner auth_ids from matching files
+        unique_owners = set()
+        for entry in matching_files:
+            owner_details = entry.get('owner_details', {})
+            owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+            if owner_auth_id:
+                unique_owners.add(owner_auth_id)
+
+        if unique_owners:
+            if args.verbose:
+                print(f"\n[INFO] Resolving {len(unique_owners)} unique owner identities...", file=sys.stderr)
+
+            async with client.create_session() as session:
+                identity_cache_for_output = await client.resolve_multiple_identities(session, list(unique_owners))
 
     # Generate owner report if requested
     if args.owner_report and owner_stats:
@@ -1909,6 +2045,17 @@ async def main_async(args):
                 return
 
             if args.all_attributes:
+                # Add resolved owner name to entries if --show-owner is enabled
+                if args.show_owner:
+                    for entry in matching_files:
+                        owner_details = entry.get('owner_details', {})
+                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[owner_auth_id]
+                            entry['owner_name'] = format_owner_name(identity)
+                        else:
+                            entry['owner_name'] = 'Unknown'
+
                 # Write all attributes
                 fieldnames = sorted(matching_files[0].keys())
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1923,46 +2070,95 @@ async def main_async(args):
                 if args.older_than or args.newer_than:
                     fieldnames.append(args.time_field)
 
-                # Add owner if owner filter was used
-                if args.owners:
-                    fieldnames.append('owner')
-
                 # Add size if size filter was used
                 if args.larger_than or args.smaller_than:
                     fieldnames.append('size')
 
+                # Add owner if --show-owner is enabled
+                if args.show_owner:
+                    fieldnames.append('owner')
+
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 for entry in matching_files:
-                    writer.writerow(entry)
+                    row = {'path': entry['path']}
+                    if args.older_than or args.newer_than:
+                        row[args.time_field] = entry.get(args.time_field)
+                    if args.larger_than or args.smaller_than:
+                        row['size'] = entry.get('size')
+                    if args.show_owner:
+                        owner_details = entry.get('owner_details', {})
+                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[owner_auth_id]
+                            row['owner'] = format_owner_name(identity)
+                        else:
+                            row['owner'] = 'Unknown'
+                    writer.writerow(row)
 
         if args.verbose:
             print(f"\n[INFO] Wrote {len(matching_files)} results to {args.csv_out}", file=sys.stderr)
     elif args.json or args.json_out:
         # JSON output
-        output_handle = sys.stdout
-        if args.json_out:
-            output_handle = open(args.json_out, 'w')
+        # Skip if batched_handler was used (already output via streaming)
+        if batched_handler:
+            pass  # Already handled by batched streaming
+        else:
+            output_handle = sys.stdout
+            if args.json_out:
+                output_handle = open(args.json_out, 'w')
 
-        for entry in matching_files:
-            if args.all_attributes:
-                output_handle.write(json_parser.dumps(entry) + '\n')
-            else:
-                # Minimal output: path and filtered fields
-                minimal_entry = {'path': entry['path']}
-                if args.older_than or args.newer_than:
-                    minimal_entry[args.time_field] = entry.get(args.time_field)
-                if args.larger_than or args.smaller_than:
-                    minimal_entry['size'] = entry.get('size')
-                output_handle.write(json_parser.dumps(minimal_entry) + '\n')
+            for entry in matching_files:
+                if args.all_attributes:
+                    # Add resolved owner name to entry if --show-owner is enabled
+                    if args.show_owner:
+                        owner_details = entry.get('owner_details', {})
+                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[owner_auth_id]
+                            entry['owner_name'] = format_owner_name(identity)
+                        else:
+                            entry['owner_name'] = 'Unknown'
+                    output_handle.write(json_parser.dumps(entry) + '\n')
+                else:
+                    # Minimal output: path and filtered fields
+                    minimal_entry = {'path': entry['path']}
+                    if args.older_than or args.newer_than:
+                        minimal_entry[args.time_field] = entry.get(args.time_field)
+                    if args.larger_than or args.smaller_than:
+                        minimal_entry['size'] = entry.get('size')
+                    if args.show_owner:
+                        owner_details = entry.get('owner_details', {})
+                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[owner_auth_id]
+                            minimal_entry['owner'] = format_owner_name(identity)
+                        else:
+                            minimal_entry['owner'] = 'Unknown'
+                    output_handle.write(json_parser.dumps(minimal_entry) + '\n')
 
-        if args.json_out:
-            output_handle.close()
-            print(f"\n[INFO] Results written to {args.json_out}", file=sys.stderr)
+            if args.json_out:
+                output_handle.close()
+                print(f"\n[INFO] Results written to {args.json_out}", file=sys.stderr)
     else:
         # Plain text output
-        for entry in matching_files:
-            print(entry['path'])
+        # Only output if we didn't use streaming callback (which already printed results)
+        if output_callback is None:
+            for entry in matching_files:
+                output_line = entry['path']
+
+                # Add owner information if --show-owner is enabled
+                if args.show_owner:
+                    owner_details = entry.get('owner_details', {})
+                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                        identity = identity_cache_for_output[owner_auth_id]
+                        owner_name = format_owner_name(identity)
+                        output_line = f"{output_line}\t{owner_name}"
+                    else:
+                        output_line = f"{output_line}\tUnknown"
+
+                print(output_line)
 
     # Record output timing
     if profiler:
@@ -2067,6 +2263,8 @@ Examples:
                        help='Owner(s) are specified as UID numbers')
     parser.add_argument('--expand-identity', action='store_true',
                        help='Match all equivalent identities (e.g., AD user + NFS UID)')
+    parser.add_argument('--show-owner', action='store_true',
+                       help='Display owner information for matching files')
     parser.add_argument('--owner-report', action='store_true',
                        help='Generate ownership report (file count and total bytes by owner)')
     parser.add_argument('--use-capacity', action='store_true', default=True,
