@@ -164,7 +164,8 @@ class ProgressTracker:
         self.total_dirs = 0
         self.matches = 0
         self.skipped_dirs = 0  # Count of directories skipped via smart skipping
-        self.skipped_objects = 0  # Count of objects (files + dirs) avoided by smart skipping
+        self.skipped_files = 0  # Count of files avoided by smart skipping
+        self.skipped_subdirs = 0  # Count of subdirectories avoided by smart skipping
         self.start_time = time.time()
         self.verbose = verbose
         self.last_update = time.time()
@@ -192,22 +193,24 @@ class ProgressTracker:
                 rate = self.total_objects / elapsed if elapsed > 0 else 0
                 print(f"\r[PROGRESS] {self.total_objects:,} objects processed | "
                       f"{self.matches:,} matches | "
-                      f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_objects:,} objects) | "
+                      f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
                       f"{rate:.1f} obj/sec | "
                       f"{elapsed:.1f}s total",
                       end='', file=sys.stderr, flush=True)
                 self.last_update = time.time()
 
-    async def increment_skipped(self, objects_skipped: int = 0):
+    async def increment_skipped(self, files_skipped: int = 0, subdirs_skipped: int = 0):
         """
         Increment the skipped directory counter.
 
         Args:
-            objects_skipped: Number of objects (files + subdirs) in the skipped directory
+            files_skipped: Number of files in the skipped directory
+            subdirs_skipped: Number of subdirectories in the skipped directory
         """
         async with self.lock:
             self.skipped_dirs += 1
-            self.skipped_objects += objects_skipped
+            self.skipped_files += files_skipped
+            self.skipped_subdirs += subdirs_skipped
 
     def should_stop(self) -> bool:
         """Check if processing should stop due to limit."""
@@ -220,7 +223,7 @@ class ProgressTracker:
             rate = self.total_objects / elapsed if elapsed > 0 else 0
             print(f"\r[PROGRESS] FINAL: {self.total_objects:,} objects processed | "
                   f"{self.matches:,} matches | "
-                  f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_objects:,} objects) | "
+                  f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
                   f"{rate:.1f} obj/sec | "
                   f"{elapsed:.1f}s total",
                   file=sys.stderr)
@@ -840,7 +843,7 @@ class AsyncQumuloClient:
                               f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
                               file=sys.stderr)
                     if progress:
-                        await progress.increment_skipped(total_entries)
+                        await progress.increment_skipped(total_files, total_directories)
                     return []
 
                 # PHASE 2: Smart skipping - skip directories that can't possibly match filters
@@ -861,7 +864,7 @@ class AsyncQumuloClient:
                                 print(f"\r[SKIP] Smart skip: {path} (0 files, --file-only active)",
                                       file=sys.stderr)
                             if progress:
-                                await progress.increment_skipped(total_entries)
+                                await progress.increment_skipped(total_files, total_directories)
                             return []
 
                 # PHASE 3: Enhanced smart skipping for time and size filters
@@ -892,7 +895,7 @@ class AsyncQumuloClient:
                                         print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
                                               file=sys.stderr)
                                     if progress:
-                                        await progress.increment_skipped(total_entries)
+                                        await progress.increment_skipped(total_files, total_directories)
                                     return []
 
                             # Check --newer-than filter
@@ -903,7 +906,7 @@ class AsyncQumuloClient:
                                         print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
                                               file=sys.stderr)
                                     if progress:
-                                        await progress.increment_skipped(total_entries)
+                                        await progress.increment_skipped(total_files, total_directories)
                                     return []
 
                         except (ValueError, AttributeError):
@@ -927,7 +930,7 @@ class AsyncQumuloClient:
                                           f"(total capacity {total_cap_bytes} < min {min_size})",
                                           file=sys.stderr)
                                 if progress:
-                                    await progress.increment_skipped(total_entries)
+                                    await progress.increment_skipped(total_files, total_directories)
                                 return []
                         except (ValueError, TypeError):
                             # If capacity parsing fails, continue without smart skipping
@@ -956,7 +959,7 @@ class AsyncQumuloClient:
                                     print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
                                           file=sys.stderr)
                                 if progress:
-                                    await progress.increment_skipped(total_entries)
+                                    await progress.increment_skipped(total_files, total_directories)
                                 return []
 
             except (ValueError, TypeError):
