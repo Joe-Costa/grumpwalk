@@ -840,10 +840,11 @@ class AsyncQumuloClient:
 
                 # Safety valve: skip directories exceeding max_entries_per_dir
                 if max_entries_per_dir and total_entries > max_entries_per_dir:
-                    if verbose:
-                        print(f"\r[SKIP] Directory exceeds limit: {path} "
-                              f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
-                              file=sys.stderr)
+                    # if verbose:
+                    #     print(f"\r[SKIP] Directory exceeds limit: {path} "
+                    #           f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
+                    #           file=sys.stderr)
+                    pass
                     if progress:
                         await progress.increment_skipped(total_files, total_directories)
                     return []
@@ -862,9 +863,10 @@ class AsyncQumuloClient:
                     if not file_filter(test_dir) and file_filter(test_file):
                         # This looks like --file-only filter
                         if total_files == 0:
-                            if verbose:
-                                print(f"\r[SKIP] Smart skip: {path} (0 files, --file-only active)",
-                                      file=sys.stderr)
+                            # if verbose:
+                            #     print(f"\r[SKIP] Smart skip: {path} (0 files, --file-only active)",
+                            #           file=sys.stderr)
+                            pass
                             if progress:
                                 await progress.increment_skipped(total_files, total_directories)
                             return []
@@ -893,9 +895,9 @@ class AsyncQumuloClient:
                             if older_than_threshold:
                                 # If the NEWEST file is younger than threshold, NO files match
                                 if newest_time >= older_than_threshold:
-                                    if verbose:
-                                        print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
-                                              file=sys.stderr)
+                                    # if verbose:
+                                    #     print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
+                                    #           file=sys.stderr)
                                     if progress:
                                         await progress.increment_skipped(total_files, total_directories)
                                     return []
@@ -904,9 +906,9 @@ class AsyncQumuloClient:
                             if newer_than_threshold:
                                 # If the OLDEST file is older than threshold, NO files match
                                 if oldest_time <= newer_than_threshold:
-                                    if verbose:
-                                        print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
-                                              file=sys.stderr)
+                                    # if verbose:
+                                    #     print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
+                                    #           file=sys.stderr)
                                     if progress:
                                         await progress.increment_skipped(total_files, total_directories)
                                     return []
@@ -927,10 +929,10 @@ class AsyncQumuloClient:
                             # If total directory capacity is less than min_size,
                             # NO individual files can be >= min_size
                             if total_cap_bytes < min_size:
-                                if verbose:
-                                    print(f"\r[SKIP] Smart skip: {path} "
-                                          f"(total capacity {total_cap_bytes} < min {min_size})",
-                                          file=sys.stderr)
+                                # if verbose:
+                                #     print(f"\r[SKIP] Smart skip: {path} "
+                                #           f"(total capacity {total_cap_bytes} < min {min_size})",
+                                #           file=sys.stderr)
                                 if progress:
                                     await progress.increment_skipped(total_files, total_directories)
                                 return []
@@ -957,9 +959,9 @@ class AsyncQumuloClient:
                             has_matching_owner = any(auth_id in owners_with_files for auth_id in owner_auth_ids)
 
                             if not has_matching_owner:
-                                if verbose:
-                                    print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
-                                          file=sys.stderr)
+                                # if verbose:
+                                #     print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
+                                #           file=sys.stderr)
                                 if progress:
                                     await progress.increment_skipped(total_files, total_directories)
                                 return []
@@ -991,9 +993,10 @@ class AsyncQumuloClient:
                         break
 
                 if should_omit:
-                    if verbose:
-                        print(f"\r[SKIP] Omitting subdirectory: {subdir_path} (matched pattern: {matched_pattern})",
-                              file=sys.stderr)
+                    # if verbose:
+                    #     print(f"\r[SKIP] Omitting subdirectory: {subdir_path} (matched pattern: {matched_pattern})",
+                    #           file=sys.stderr)
+                    pass
                 else:
                     filtered_subdirs.append(subdir_path)
 
@@ -1034,6 +1037,12 @@ class AsyncQumuloClient:
 
             # Process subdirectories in batches
             all_results = []
+
+            # Track progress for large subdirectory sets
+            show_batch_progress = progress and num_subdirs > 10000
+            last_progress_time = time.time()
+            batch_progress_interval = 10.0  # Show progress every 10 seconds
+
             for i in range(0, len(subdirs), batch_size):
                 # Early exit: Check if limit reached before processing next batch
                 if progress and progress.should_stop():
@@ -1055,11 +1064,58 @@ class AsyncQumuloClient:
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
                 all_results.extend(batch_results)
 
+                # Show batch progress for large directories
+                if show_batch_progress:
+                    current_time = time.time()
+                    elapsed_since_last = current_time - last_progress_time
+                    batch_num = (i // batch_size) + 1
+                    total_batches = (num_subdirs + batch_size - 1) // batch_size
+
+                    # Show progress every 100 batches or every 10 seconds
+                    if batch_num % 100 == 0 or elapsed_since_last >= batch_progress_interval or batch_num == total_batches:
+                        percent = (i + batch_size) / num_subdirs * 100
+                        subdirs_processed = min(i + batch_size, num_subdirs)
+
+                        # Shorten path for display
+                        display_path = path if len(path) <= 50 else "..." + path[-47:]
+
+                        elapsed_total = current_time - progress.start_time
+                        time_str = format_time(elapsed_total)
+
+                        print(f"\r[PROGRESS] Scanning subdirs in {display_path}: "
+                              f"{subdirs_processed:,}/{num_subdirs:,} ({percent:.1f}%) | "
+                              f"Run time: {time_str}",
+                              end='', file=sys.stderr)
+
+                        last_progress_time = current_time
+
+            # Clear the batch progress line if we showed it
+            if show_batch_progress:
+                print(file=sys.stderr)  # Newline to finish the progress line
+
             # Collect results from subdirectories (only if collect_results=True)
             if collect_results:
-                for result in all_results:
-                    if isinstance(result, list):
-                        matching_entries.extend(result)
+                # Optimize: At the top level, use efficient concatenation for large result sets
+                # At deeper levels, use simple extend to avoid memory overhead
+                if _current_depth == 0 and len(all_results) > 1000:
+                    if verbose:
+                        print(f"\r[INFO] Collecting results from {len(all_results)} subdirectory batches...",
+                              file=sys.stderr)
+
+                    # Use itertools.chain for efficient concatenation
+                    import itertools
+                    result_lists = [result for result in all_results if isinstance(result, list)]
+                    if result_lists:
+                        matching_entries.extend(itertools.chain.from_iterable(result_lists))
+
+                    if verbose:
+                        print(f"\r[INFO] Collection complete, {len(matching_entries)} total matches          ",
+                              file=sys.stderr)
+                else:
+                    # For smaller result sets or nested levels, simple extend is fine
+                    for result in all_results:
+                        if isinstance(result, list):
+                            matching_entries.extend(result)
 
         return matching_entries
 
@@ -2068,6 +2124,10 @@ async def main_async(args):
     # Final progress report
     if progress:
         progress.final_report()
+
+    # Add diagnostic timing
+    if args.progress or args.verbose:
+        print(f"[INFO] Tree walk completed, collected {len(matching_files)} matching files", file=sys.stderr)
 
     # Flush any remaining batched output
     if batched_handler:
