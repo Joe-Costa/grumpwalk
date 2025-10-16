@@ -12,3 +12,4 @@ sample.json
 cli/
 benchmark_*
 claude_*
+__pycache__/
