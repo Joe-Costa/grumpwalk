@@ -2622,7 +2622,20 @@ async def main_async(args):
             for entry in matching_files:
                 if entry.get("type") == "FS_FILE_TYPE_SYMLINK":
                     target = await client.read_symlink(session, entry["path"])
-                    entry["symlink_target"] = target if target else "(unreadable)"
+                    if target:
+                        # Convert relative paths to absolute paths
+                        if not target.startswith('/'):
+                            # Relative path - resolve relative to symlink's directory
+                            import os.path
+                            symlink_dir = os.path.dirname(entry["path"])
+                            # Normalize path to handle .. and . components
+                            absolute_target = os.path.normpath(os.path.join(symlink_dir, target))
+                            entry["symlink_target"] = absolute_target
+                        else:
+                            # Already absolute
+                            entry["symlink_target"] = target
+                    else:
+                        entry["symlink_target"] = "(unreadable)"
 
     # Generate owner report if requested
     if args.owner_report and owner_stats:
