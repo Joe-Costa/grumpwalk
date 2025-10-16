@@ -138,6 +138,18 @@ pip install aiohttp qumulo_api ujson
 
 **Auto-detection:** Patterns with `/`, `^`, `$`, or regex chars are treated as regex. Others as glob.
 
+### Combining Patterns (--name vs --name-and)
+```bash
+# OR logic: Match files containing 'backup' OR '2024'
+--name '*backup*' --name '*2024*'
+
+# AND logic: Match files containing 'backup' AND '2024'
+--name-and '*backup*' --name-and '*2024*'
+
+# Mixed logic: (report OR summary) AND 2024 AND .pdf
+--name '*report*' --name '*summary*' --name-and '*2024*' --name-and '*.pdf'
+```
+
 ### Path Matching (--omit-subdirs)
 ```bash
 --omit-subdirs temp             # Skip any directory named "temp"
