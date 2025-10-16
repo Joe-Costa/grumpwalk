@@ -13,3 +13,4 @@ cli/
 benchmark_*
 claude_*
 __pycache__/
+test_range_*.py
