@@ -1,386 +1,239 @@
-# Qumulo File Filter
+# grump_walk.py
 
-A memory-efficient streaming utility for filtering files on Qumulo storage systems by timestamps, size and ownership. This tool uses `jq` streaming to process large directory trees efficiently, even via remote `qq` CLI
-
-**Two versions available:**
-- `qumulo_file_filter.sh` - For Linux/GNU systems (uses GNU date)
-- `qumulo_file_filter_mac.sh` - For macOS/BSD systems (uses BSD date)
+High-performance async file search tool for Qumulo storage systems.
 
 ## Features
 
-- **Memory-safe streaming**: Processes files one at a time using jq streaming, avoiding OOM issues on large directory trees
-- **File listing**: List all files in a directory tree with optional filtering
-- **Time-based filtering**: Optionally filter by creation, access, modification, or change time
-- **Size-based filtering**: Filter by file size with support for decimal (KB, MB, GB, TB, PB) and binary (KiB, MiB, GiB, TiB, PiB) units
-- **Metadata overhead tracking**: Include storage metadata consumption in size calculations and reports
-- **Owner filtering**: Filter by file owner with support for AD users, local users, and UIDs (supports multiple owners with OR logic)
-- **Owner usage reports**: Generate storage capacity reports by owner with parallel name resolution
-- **Identity expansion**: Automatically match equivalent identities (e.g., AD user + corresponding NFS UID)
-- **Selective directory omission**: Skip directories using wildcard patterns
-- **Flexible output**: Plain text, JSON, or CSV output with optional file output for verbose mode
-- **All attributes output**: Include all file metadata in JSON output when needed
-- **Real-time results**: Streaming architecture outputs results as they're found with progress reporting
+- **Fast async operations** - Direct REST API calls with concurrent requests
+- **Name pattern matching** - Glob wildcards and regex support
+- **Time-based filtering** - Search by creation, modification, access, or change time
+- **Size-based filtering** - Find files by size with smart directory skipping
+- **Owner filtering** - Filter by user/group with identity expansion
+- **Type filtering** - Search files, directories, or symlinks
+- **Symlink resolution** - Display symlink targets as absolute paths
+- **Progress tracking** - Real-time statistics with smart skip counters
+- **Multiple output formats** - Plain text, JSON, or CSV
+- **Directory scope preview** - Shows total subdirs/files before search
+- **Owner reports** - Generate storage capacity breakdowns by owner
 
 ## Requirements
 
-- Linux, Mac or Windows with Linux Subsystem
-- `qq` CLI (`pip install qumulo_api`)
-- `jq` (JSON processor)
-- Python 3
-- Bash (I've not tested it in other shells...)
-- **Note**: Use `qumulo_file_filter_mac.sh` on macOS/BSD systems (Also one `bash`, I have not tested it with `zsh`)
+- Python 3.8+
+- `aiohttp` - Install with: `pip install aiohttp`
+- `qumulo_api` - Install with: `pip install qumulo_api`
+- `ujson` (optional) - For faster JSON parsing: `pip install ujson`
+- Qumulo cluster credentials (use `qq login`)
 
 ## Installation
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/Joe-Costa/qumulo-file-filter.git
-cd qumulo-file-filter
+git clone https://github.com/Joe-Costa/grump-walk.git
+cd grump-walk
+chmod +x grump_walk.py
+pip install aiohttp qumulo_api ujson
 ```
 
-2. Make the script executable:
-```bash
-# For Linux/GNU systems:
-chmod +x qumulo_file_filter.sh
-
-# For macOS/BSD systems:
-chmod +x qumulo_file_filter_mac.sh
-```
-
-## Usage
-
-### Basic Syntax
+## Quick Examples
 
 ```bash
-# Linux/GNU:
-./qumulo_file_filter.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
+# List all files in a directory
+./grump_walk.py --host cluster.example.com --path /home
 
-# macOS/BSD:
-./qumulo_file_filter_mac.sh --path <path> [--older-than <days>] [--newer-than <days>] [OPTIONS]
+# Find files older than 30 days
+./grump_walk.py --host cluster.example.com --path /home --older-than 30
+
+# Find large log files with progress
+./grump_walk.py --host cluster.example.com --path /var --name '*.log' --larger-than 100MB --progress
+
+# Search for Python test files
+./grump_walk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+
+# Find symlinks and show their targets
+./grump_walk.py --host cluster.example.com --path /home --type symlink --resolve-links
+
+# Generate owner capacity report
+./grump_walk.py --host cluster.example.com --path /data --owner-report --csv-out report.csv
 ```
 
-**Connect to specific Qumulo cluster: (For remote qq CLI use)**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 30 \
-  --host 10.1.1.100 --credentials-store ~/.qumulo_creds
-```
+## Command Reference
 
-*You may alternatively run `qq --host YOUR_QUMULO login -u YOUR_USER` in advance instead of using a `.qumulo_creds` file*
+### Required
+- `--host` - Qumulo cluster hostname or IP
+- `--path` - Path to search
 
-### Common Examples
+### Name/Type Filters
+- `--name PATTERN` - Match by name (glob/regex, OR logic, repeatable)
+- `--name-and PATTERN` - Match by name (AND logic, repeatable)
+- `--name-case-sensitive` - Case-sensitive name matching
+- `--type {file,directory,symlink}` - Filter by object type
+- `--file-only` - Search files only (deprecated, use `--type file`)
 
-**List all files in a directory:**
-```bash
-./qumulo_file_filter.sh --path /home
-```
+### Time Filters
+- `--older-than N` - Files older than N days
+- `--newer-than N` - Files newer than N days
+- `--time-field {creation_time,modification_time,access_time,change_time}` - Time field to use (default: modification_time)
 
-**List all files owned by a specific user:**
-```bash
-./qumulo_file_filter.sh --path /home --owner jdoe --ad
-```
+**Field-specific time filters (AND logic):**
+- `--accessed-older-than N` / `--accessed-newer-than N`
+- `--modified-older-than N` / `--modified-newer-than N`
+- `--created-older-than N` / `--created-newer-than N`
+- `--changed-older-than N` / `--changed-newer-than N`
 
-**Find files created more than 30 days ago:**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 30
-```
+### Size Filters
+- `--larger-than SIZE` - Larger than size (e.g., `100MB`, `1.5GiB`)
+- `--smaller-than SIZE` - Smaller than size
+- `--include-metadata` - Include metadata blocks in size calculations
 
-**Find files accessed in the last 7 days:**
-```bash
-./qumulo_file_filter.sh --path /home --newer-than 7 --accessed
-```
+**Supported units:** B, KB, MB, GB, TB, PB, KiB, MiB, GiB, TiB, PiB
 
-**Find old files, exclude temp directories, save to JSON with logging:**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 90 \
-  --omit-subdirs "temp cache 100k*" \
-  --json-out old-files.json --verbose
-```
+### Owner Filters
+- `--owner NAME` - Filter by owner (OR logic, repeatable)
+- `--ad` - Owner is Active Directory user
+- `--local` - Owner is local user
+- `--uid` - Owner is UID number
+- `--expand-identity` - Match equivalent identities (AD user + NFS UID)
+- `--show-owner` - Display owner information in output
+- `--owner-report` - Generate capacity report by owner
 
-**Find files owned by a specific user (with identity expansion - Match Names to UID Numbers or vice versa):**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 30 \
-  --owner jdoe --expand-identity
-```
+### Directory Options
+- `--max-depth N` - Maximum directory depth
+- `--omit-subdirs PATTERN` - Skip directories (supports glob and paths, repeatable)
+- `--max-entries-per-dir N` - Skip directories exceeding N entries
 
-**Find files owned by multiple users (OR logic):**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 30 \
-  --owner jdoe --owner jane --owner bob --ad
-```
-
-**Find recently modified files with depth limit:**
-```bash
-./qumulo_file_filter.sh --path /data --newer-than 1 \
-  --modified --max-depth 3
-```
-
-**Output all file attributes in JSON:**
-```bash
-./qumulo_file_filter.sh --path /home --older-than 30 \
-  --json-out results.json --all-attributes
-```
-
-**Find files larger than 100MB:**
-```bash
-./qumulo_file_filter.sh --path /home --larger-than 100MB
-```
-
-**Find files smaller than 1GiB and older than 30 days:**
-```bash
-./qumulo_file_filter.sh --path /home --smaller-than 1GiB --older-than 30
-```
-
-**Find files in a size range (between 100MB and 1GB):**
-```bash
-./qumulo_file_filter.sh --path /home --larger-than 100MB --smaller-than 1GB
-```
-
-**Find files in a time range (between 7 and 30 days old):**
-```bash
-./qumulo_file_filter.sh --path /home --newer-than 7 --older-than 30
-```
-
-**Find files in both time and size ranges:**
-```bash
-./qumulo_file_filter.sh --path /home --newer-than 30 --older-than 90 \
-  --larger-than 1GB --smaller-than 10GB
-```
-
-**Generate storage capacity report by owner:**
-```bash
-./qumulo_file_filter.sh --path /data --owner-report --csv-out capacity_report.csv
-```
-
-**Generate capacity report with metadata breakdown:**
-```bash
-./qumulo_file_filter.sh --path /data --owner-report --include-metadata --csv-out report.csv
-```
-
-**Filter by size including metadata overhead:**
-```bash
-./qumulo_file_filter.sh --path /data --larger-than 1GB --include-metadata --json-out results.json
-```
-
-**Complex multi-field query with progress reporting:**
-```bash
-./qumulo_file_filter.sh --path /home \
-  --accessed-newer-than 10 --accessed-older-than 30 \
-  --modified-newer-than 20 --modified-older-than 22 \
-  --created-older-than 100 \
-  --owner joe --progress
-```
-
-**Quick sampling - find first 100 matches:**
-```bash
-./qumulo_file_filter.sh --path /data --older-than 365 --limit 100
-```
-
-## Options
-
-### Required Arguments
-- `--path <path>` - Path to search
-
-### Time Filter Options (optional)
-- `--older-than <days>` - Find files older than N days
-- `--newer-than <days>` - Find files newer than N days
-
-**Time range filtering:** Both `--older-than` and `--newer-than` can be used together to find files within a specific age range (e.g., files between 7 and 30 days old).
-
-**Note:** If neither time filter is specified, all files will be returned (filtered only by owner/size if specified).
-
-### Time Field Options (for use with --older-than/--newer-than)
-- `--created` - Filter by creation time (default)
-- `--accessed` - Filter by last access time
-- `--modified` - Filter by last modification time
-- `--changed` - Filter by last metadata change time
-
-### Field-Specific Time Filters (for complex multi-field queries)
-- `--accessed-older-than <days>` - Files accessed older than N days
-- `--accessed-newer-than <days>` - Files accessed newer than N days
-- `--modified-older-than <days>` - Files modified older than N days
-- `--modified-newer-than <days>` - Files modified newer than N days
-- `--created-older-than <days>` - Files created older than N days
-- `--created-newer-than <days>` - Files created newer than N days
-- `--changed-older-than <days>` - Files with metadata changed older than N days
-- `--changed-newer-than <days>` - Files with metadata changed newer than N days
-
-**Note:** All field-specific filters use AND logic. This allows complex queries like "files accessed 10-30 days ago AND modified 20-22 days ago AND created >100 days ago".
-
-### Size Filter Options (optional)
-- `--larger-than <size>` - Find files larger than specified size
-- `--smaller-than <size>` - Find files smaller than specified size
-- `--include-metadata` - Include metadata blocks in size calculations (adds metablocks × 4KB to file size)
-
-**Supported size units:**
-- Decimal: B, KB, MB, GB, TB, PB
-- Binary: KiB, MiB, GiB, TiB, PiB
-
-**Examples:** `100MB`, `1.5GiB`, `500` (bytes), `10KB`
-
-**Range filtering:** Both `--larger-than` and `--smaller-than` can be used together to find files within a size range.
-
-**Metadata overhead:** Use `--include-metadata` to account for storage metadata consumption in size-based operations. Each file consumes metadata blocks (filesystem overhead) separate from data blocks. This flag adds the metadata overhead to the total size for filtering and reporting.
-
-### Owner Filter Options
-- `--owner <name>` - Filter by file owner (can be specified multiple times for OR logic)
-- `--ad` - Owner(s) are Active Directory users
-- `--local` - Owner(s) are local users
-- `--uid` - Owner(s) are specified as UID numbers
-- `--expand-identity` - Match all equivalent identities (e.g., AD user + NFS UID)
-
-**Note:** You cannot mix `--uid` with `--ad` or `--local` for simplicity. All owners must be of the same type.
-
-### Search Options
-- `--max-depth <N>` - Maximum directory depth to search (default: unlimited)
-- `--file-only` - Search files only (default)
-- `--all` - Search both files and directories
-- `--omit-subdirs "patterns"` - Space-separated patterns to omit (supports wildcards)
+### Symlink Options
+- `--resolve-links` - Show symlink targets as absolute paths
 
 ### Output Options
-- `--json` - Output results as JSON to stdout
-- `--json-out <file>` - Write JSON results to file (allows --verbose)
-- `--csv-out <file>` - Write results to CSV file (mutually exclusive with JSON output)
-- `--verbose` - Show detailed logging to stderr
-- `--all-attributes` - Include all file attributes in JSON output (default: path + time field only)
-- `--owner-report` - Generate storage capacity report grouped by owner
-- `--limit <N>` - Stop after finding N matching results (useful for testing/sampling)
-- `--progress` - Show real-time progress statistics (objects processed, matches, rate)
-- `--profile` - Enable detailed performance profiling and timing metrics
-- `--max-workers <N>` - Number of parallel workers for owner name resolution (default: 10)
+- `--json` - JSON output to stdout
+- `--json-out FILE` - JSON output to file
+- `--csv-out FILE` - CSV output to file
+- `--all-attributes` - Include all file attributes in output
+- `--limit N` - Stop after N matches
+- `--progress` - Show real-time progress
+- `--verbose` - Detailed logging
 
-### Qumulo Connection Options
-- `--host <host>` - Qumulo cluster hostname or IP
-- `--credentials-store <path>` - Path to credentials file (default: ~/.qfsd_cred)
+### Performance Options
+- `--max-concurrent N` - Concurrent operations (default: 100)
+- `--connector-limit N` - HTTP connection pool size (default: 100)
+- `--profile` - Performance profiling
 
-## Identity Expansion
+### Connection Options
+- `--port PORT` - API port (default: 8000)
+- `--credentials-store PATH` - Credentials file path
 
-The `--expand-identity` flag leverages Qumulo's `qq auth_expand_identity` to find all equivalent representations of a user across different protocols:
+## Pattern Matching
 
+### Glob Patterns (shell-style)
 ```bash
-./file_filter.sh --path /home --older-than 30 \
-  --owner joe --expand-identity --verbose
+--name '*.log'           # All log files
+--name 'test_*'          # Files starting with test_
+--name 'file?.txt'       # file1.txt, fileA.txt, etc.
 ```
 
-**Verbose output example:**
-```
-[INFO] Resolving owner identity: joe (type: auto)
-[INFO] Resolved owner auth_id: 25769805128
-[INFO] Expanding identity to find equivalent auth_ids...
-[INFO] Found equivalent auth_ids: 25769805128 12884903999 85899348031
-```
-
-This will match files owned by:
-- joe's AD identity (SID-based)
-- joe's NFS UID (e.g., 3030)
-- Any other equivalent identity
-
-## Multiple Owner Filtering
-
-You can specify multiple `--owner` flags to filter files owned by any of the specified users (OR logic):
-
+### Regex Patterns
 ```bash
-./file_filter.sh --path /home --older-than 30 \
-  --owner joe --owner jane --owner bob --ad --verbose
+--name '^test_.*\.py$'   # Python test files (anchored)
+--name '.*\.(jpg|png)$'  # Image files
 ```
 
-**Verbose output example:**
-```
-[INFO] Resolving 3 owner(s)...
-[INFO] Resolving owner identity: joe (type: ad)
-[INFO] Resolved owner auth_id: 25769805128
-[INFO] Resolving owner identity: jane (type: ad)
-[INFO] Resolved owner auth_id: 25769805129
-[INFO] Resolving owner identity: bob (type: ad)
-[INFO] Resolved owner auth_id: 25769805130
-[INFO] Final auth_id list (OR filter): 25769805128 25769805129 25769805130
-```
+**Auto-detection:** Patterns with `/`, `^`, `$`, or regex chars are treated as regex. Others as glob.
 
-When combined with `--expand-identity`, each owner's equivalent identities are also included:
-
+### Path Matching (--omit-subdirs)
 ```bash
-./file_filter.sh --path /home --older-than 30 \
-  --owner joe --owner jane --expand-identity --verbose
+--omit-subdirs temp             # Skip any directory named "temp"
+--omit-subdirs /home/bob        # Skip specific path
+--omit-subdirs '/home/*/backup' # Skip backup dirs in all home directories
 ```
 
-This will match files owned by joe OR jane, including all their equivalent identities (AD, NFS UID, etc.).
+## Advanced Examples
 
-## All Attributes Output
-
-By default, JSON output includes only the file path and the selected time field. Use `--all-attributes` to include all available file attributes:
-
+### Complex time range query
 ```bash
-./file_filter.sh --path /home --older-than 30 \
-  --json --all-attributes
+./grump_walk.py --host cluster.example.com --path /data \
+  --accessed-newer-than 30 --accessed-older-than 90 \
+  --modified-older-than 180 \
+  --larger-than 1GB --progress
 ```
 
-**Default output (path + selected time field only):**
-```json
-{"path": "/home/joe/file1.txt", "creation_time": "2024-01-15T10:30:00.000000000Z"}
-{"path": "/home/jane/file2.txt", "creation_time": "2024-01-10T14:20:00.000000000Z"}
-```
-
-**With --all-attributes:**
-```json
-{"path": "/home/joe/file1.txt", "name": "file1.txt", "type": "FS_FILE_TYPE_FILE", "owner": "25769805128", "group": "25769805200", "size": "1024", "creation_time": "2024-01-15T10:30:00.000000000Z", "access_time": "2024-03-01T09:15:00.000000000Z", "modification_time": "2024-02-20T16:45:00.000000000Z", "change_time": "2024-02-20T16:45:00.000000000Z", "num_links": "1", "mode": "0644"}
-```
-
-**Note:** `--all-attributes` only affects JSON output. Plain text output always shows the time field and path.
-
-## Owner Capacity Reports
-
-Generate storage capacity reports grouped by file owner with `--owner-report`. The script automatically resolves owner auth_ids to human-readable names using parallel processing for performance.
-
-**Basic usage:**
+### Find stale backups, exclude users
 ```bash
-./qumulo_file_filter.sh --path /data --owner-report --csv-out report.csv
+./grump_walk.py --host cluster.example.com --path /backups \
+  --name '*backup*' --name-and '*2024*' \
+  --older-than 365 --larger-than 100MB \
+  --omit-subdirs /backups/alice --omit-subdirs /backups/bob \
+  --csv-out stale-backups.csv
 ```
 
-**Output columns:**
-- Without `--include-metadata`: `owner`, `auth_id`, `total_capacity_bytes`
-- With `--include-metadata`: `owner`, `auth_id`, `data_capacity_bytes`, `metadata_capacity_bytes`, `total_capacity_bytes`
+### Capacity report for specific owners
+```bash
+./grump_walk.py --host cluster.example.com --path /projects \
+  --owner joe --owner jane --expand-identity \
+  --owner-report --csv-out capacity.csv
+```
 
-**Example CSV output with metadata:**
+### Find all symlinks and their targets
+```bash
+./grump_walk.py --host cluster.example.com --path /home \
+  --type symlink --resolve-links --max-depth 2 \
+  --csv-out symlinks.csv
+```
+
+## Performance Tips
+
+1. **Use --max-depth** to limit search scope
+2. **Enable --progress** to monitor large searches
+3. **Use --omit-subdirs** to skip known large directories
+4. **Combine filters** - More filters = fewer results to process
+5. **Use --limit** for testing before full runs
+6. **Smart skipping** automatically avoids directories that can't match your filters
+
+## Output Formats
+
+### Plain Text (default)
+```
+/home/joe/file1.txt
+/home/jane/file2.log
+```
+
+### With --show-owner
+```
+/home/joe/file1.txt    joe (UID 1000)
+/home/jane/file2.log   AD\jane
+```
+
+### With --resolve-links
+```
+/home/joe/link_to_docs → /shared/documentation
+```
+
+### CSV
 ```csv
-owner,auth_id,data_capacity_bytes,metadata_capacity_bytes,total_capacity_bytes
-AD\jdoe,25769805128,52428800000,8192000,52436992000
-AD\jane,25769805129,31457280000,4096000,31461376000
+path,modification_time,size
+/home/joe/file1.txt,2024-01-15T10:30:00Z,1024
 ```
 
-**Performance tuning:**
-- Use `--max-workers` to adjust parallel name resolution (default: 10 workers)
-- Combine with filters to generate targeted reports (e.g., `--older-than 365 --owner-report`)
+### JSON
+```json
+{"path":"/home/joe/file1.txt","modification_time":"2024-01-15T10:30:00Z"}
+```
 
-## How It Works
+## Architecture
 
-1. **Streaming Architecture**: Uses `qq fs_walk_tree` piped to `jq --stream` to process JSON incrementally
-2. **Python Processing**: Reads streamed JSON line-by-line, maintaining only one file object in memory at a time
-3. **Immediate Output**: Results are output as soon as they match, allowing real-time monitoring
-4. **Subdirectory Filtering**: When using `--omit-subdirs`, discovers subdirectories first, then processes only non-omitted ones
-
-## Performance
-
-- **Memory Usage**: O(1) - Constant memory regardless of tree size
-- **Streaming**: Outputs results immediately as files are processed
-- **Selective Processing**: `--omit-subdirs` avoids scanning entire directory trees
+- **Async I/O** - aiohttp for concurrent HTTP requests
+- **Connection pooling** - Reuses connections for efficiency
+- **Smart directory skipping** - Uses aggregates API to skip entire directory trees
+- **Streaming output** - Results output as found (non-blocking)
+- **Adaptive concurrency** - Automatically adjusts based on directory size
+- **Identity caching** - Caches owner name resolutions
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-For issues or questions:
-- Open an issue on GitHub
-- Consult Qumulo documentation for `qq` CLI usage
+MIT License
 
 ## Author
 
 Joe Costa
 
-## Acknowledgments
+## Contributing
 
-Built for Qumulo storage systems using the `qq` CLI toolset.
+Pull requests welcome at https://github.com/Joe-Costa/grump-walk
