@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import fnmatch
 import json
+import re
 import ssl
 import sys
 import time
@@ -662,6 +663,35 @@ class AsyncQumuloClient:
             except aiohttp.ClientError:
                 # Fall back gracefully if capacity API unavailable
                 return {}
+
+    async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
+        """
+        Read the target of a symlink.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the symlink
+
+        Returns:
+            The target path that the symlink points to, or None if read fails
+        """
+        async with self.semaphore:
+            if not path.startswith('/'):
+                path = '/' + path
+
+            encoded_path = quote(path, safe='')
+            url = f"{self.base_url}/v1/files/{encoded_path}/data"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        # Read the symlink target (returns as plain text)
+                        target = await response.text()
+                        return target.strip() if target else None
+                    else:
+                        return None
+            except aiohttp.ClientError:
+                return None
 
     def calculate_adaptive_concurrency(self, total_entries: int) -> int:
         """
@@ -1857,6 +1887,46 @@ async def resolve_owner_filters(
     return all_auth_ids if all_auth_ids else None
 
 
+def glob_to_regex(pattern: str) -> str:
+    """
+    Convert a glob pattern to a regex pattern.
+    Supports common glob wildcards: *, ?, [seq], [!seq]
+
+    If the pattern is already a valid regex (contains regex special chars
+    that aren't glob chars), return it as-is.
+
+    Args:
+        pattern: Glob or regex pattern
+
+    Returns:
+        Regex pattern string
+    """
+    # Check if this looks like a regex pattern (contains regex-specific chars)
+    # that aren't also glob chars. If so, assume it's already regex.
+    regex_specific_chars = {'^', '$', '.', '+', '(', ')', '|', '{', '}', '\\'}
+
+    # If pattern starts with common regex anchors or contains regex-specific syntax,
+    # treat it as regex
+    if pattern.startswith('^') or pattern.endswith('$'):
+        return pattern
+
+    # Check for regex-specific characters (excluding those used in globs)
+    has_regex_chars = any(char in pattern for char in regex_specific_chars)
+
+    # If it has regex chars, try to compile it as regex first
+    if has_regex_chars:
+        try:
+            re.compile(pattern)
+            # If it compiles successfully, it's likely a regex pattern
+            return pattern
+        except re.error:
+            # If it fails, fall through to glob conversion
+            pass
+
+    # Convert glob to regex using fnmatch
+    return fnmatch.translate(pattern)
+
+
 def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     """Create a file filter function based on command-line arguments."""
 
@@ -1944,10 +2014,75 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     # Determine time field
     time_field = args.time_field
 
+    # Compile name patterns (OR logic)
+    name_patterns_or = []
+    if args.name_patterns:
+        regex_flags = 0 if args.name_case_sensitive else re.IGNORECASE
+        for pattern in args.name_patterns:
+            try:
+                # Convert glob to regex if needed
+                regex_pattern = glob_to_regex(pattern)
+                name_patterns_or.append(re.compile(regex_pattern, regex_flags))
+            except re.error as e:
+                print(f"[ERROR] Invalid pattern '{pattern}': {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # Compile name patterns (AND logic)
+    name_patterns_and = []
+    if args.name_patterns_and:
+        regex_flags = 0 if args.name_case_sensitive else re.IGNORECASE
+        for pattern in args.name_patterns_and:
+            try:
+                # Convert glob to regex if needed
+                regex_pattern = glob_to_regex(pattern)
+                name_patterns_and.append(re.compile(regex_pattern, regex_flags))
+            except re.error as e:
+                print(f"[ERROR] Invalid pattern '{pattern}': {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # Map type argument to Qumulo API type
+    target_type = None
+    if args.type:
+        type_mapping = {
+            'file': 'FS_FILE_TYPE_FILE',
+            'f': 'FS_FILE_TYPE_FILE',
+            'directory': 'FS_FILE_TYPE_DIRECTORY',
+            'dir': 'FS_FILE_TYPE_DIRECTORY',
+            'd': 'FS_FILE_TYPE_DIRECTORY',
+            'symlink': 'FS_FILE_TYPE_SYMLINK',
+            'link': 'FS_FILE_TYPE_SYMLINK',
+            'l': 'FS_FILE_TYPE_SYMLINK',
+        }
+        target_type = type_mapping.get(args.type)
+
     def file_filter(entry: dict) -> bool:
         """Filter function that returns True if entry matches all criteria."""
 
-        # File-only filter
+        # Type filter
+        if target_type and entry.get("type") != target_type:
+            return False
+
+        # Name pattern filters (OR logic - any pattern can match)
+        if name_patterns_or:
+            # Extract basename from path
+            path = entry.get("path", "")
+            name = path.rstrip('/').split('/')[-1] if '/' in path else path
+
+            # Check if any pattern matches
+            if not any(pattern.search(name) for pattern in name_patterns_or):
+                return False
+
+        # Name pattern filters (AND logic - all patterns must match)
+        if name_patterns_and:
+            # Extract basename from path
+            path = entry.get("path", "")
+            name = path.rstrip('/').split('/')[-1] if '/' in path else path
+
+            # Check if all patterns match
+            if not all(pattern.search(name) for pattern in name_patterns_and):
+                return False
+
+        # File-only filter (deprecated - use --type file instead)
         if args.file_only and entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
             return False
 
@@ -2351,6 +2486,31 @@ async def main_async(args):
         else None
     )
 
+    # Fetch and display directory aggregates to inform user of search scope
+    async with client.create_session() as session:
+        try:
+            aggregates = await client.get_directory_aggregates(session, args.path)
+            total_files = aggregates.get('total_files', 'unknown')
+            total_dirs = aggregates.get('total_directories', 'unknown')
+
+            # Format numbers with commas
+            if isinstance(total_files, str):
+                files_str = total_files
+            else:
+                files_str = f"{int(total_files):,}"
+
+            if isinstance(total_dirs, str):
+                dirs_str = total_dirs
+            else:
+                dirs_str = f"{int(total_dirs):,}"
+
+            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files)",
+                  file=sys.stderr)
+        except Exception as e:
+            # If aggregates fail, just continue without displaying them
+            if args.verbose:
+                print(f"[WARN] Could not fetch directory aggregates: {e}", file=sys.stderr)
+
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
     owner_stats = (
@@ -2364,13 +2524,15 @@ async def main_async(args):
         tree_walk_start = time.time()
 
     # For owner reports, don't collect matching files to save memory
-    collect_results = not args.owner_report
+    # Also collect results if we need to resolve symlinks
+    collect_results = not args.owner_report or args.resolve_links
 
     # Create output callback for streaming results to stdout (plain text mode only)
+    # Disable streaming if --resolve-links is enabled (need to resolve after collection)
     output_callback = None
     batched_handler = None
 
-    if not args.owner_report and not args.csv_out and not args.json_out:
+    if not args.owner_report and not args.csv_out and not args.json_out and not args.resolve_links:
         if args.show_owner:
             # Use batched output handler for streaming with owner resolution
             output_format = "json" if args.json else "text"
@@ -2454,6 +2616,14 @@ async def main_async(args):
                     show_progress=args.verbose or args.progress,
                 )
 
+    # Resolve symlinks if --resolve-links is enabled
+    if args.resolve_links and matching_files and not batched_handler:
+        async with client.create_session() as session:
+            for entry in matching_files:
+                if entry.get("type") == "FS_FILE_TYPE_SYMLINK":
+                    target = await client.read_symlink(session, entry["path"])
+                    entry["symlink_target"] = target if target else "(unreadable)"
+
     # Generate owner report if requested
     if args.owner_report and owner_stats:
         if profiler:
@@ -2529,6 +2699,10 @@ async def main_async(args):
                 if args.show_owner:
                     fieldnames.append("owner")
 
+                # Add symlink_target if --resolve-links is enabled
+                if args.resolve_links:
+                    fieldnames.append("symlink_target")
+
                 writer = csv.DictWriter(
                     csv_file, fieldnames=fieldnames, extrasaction="ignore"
                 )
@@ -2549,6 +2723,8 @@ async def main_async(args):
                             row["owner"] = format_owner_name(identity)
                         else:
                             row["owner"] = "Unknown"
+                    if args.resolve_links and "symlink_target" in entry:
+                        row["symlink_target"] = entry["symlink_target"]
                     writer.writerow(row)
 
         if args.verbose:
@@ -2597,6 +2773,8 @@ async def main_async(args):
                             minimal_entry["owner"] = format_owner_name(identity)
                         else:
                             minimal_entry["owner"] = "Unknown"
+                    if args.resolve_links and "symlink_target" in entry:
+                        minimal_entry["symlink_target"] = entry["symlink_target"]
                     output_handle.write(json_parser.dumps(minimal_entry) + "\n")
 
             if args.json_out:
@@ -2608,6 +2786,10 @@ async def main_async(args):
         if output_callback is None:
             for entry in matching_files:
                 output_line = entry["path"]
+
+                # Add symlink target if --resolve-links is enabled and this is a symlink
+                if args.resolve_links and "symlink_target" in entry:
+                    output_line = f"{output_line} → {entry['symlink_target']}"
 
                 # Add owner information if --show-owner is enabled
                 if args.show_owner:
@@ -2660,6 +2842,21 @@ Examples:
 
   # Find large files with progress tracking
   ./qumulo_file_filter_async.py --host cluster.example.com --path /data --larger-than 1GB --progress
+
+  # Search for log files or temporary files (OR logic, glob wildcards)
+  ./qumulo_file_filter_async.py --host cluster.example.com --path /var --name '*.log' --name '*.tmp'
+
+  # Search for backup files from 2024 (AND logic)
+  ./qumulo_file_filter_async.py --host cluster.example.com --path /backups --name-and '*backup*' --name-and '*2024*'
+
+  # Find all Python test files (glob pattern)
+  ./qumulo_file_filter_async.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+
+  # Find all directories starting with "temp" (regex pattern)
+  ./qumulo_file_filter_async.py --host cluster.example.com --path /data --name '^temp.*' --type directory
+
+  # Case-sensitive search for README files
+  ./qumulo_file_filter_async.py --host cluster.example.com --path /docs --name '^README$' --name-case-sensitive
 
   # High-performance mode with increased concurrency
   ./qumulo_file_filter_async.py --host cluster.example.com --path /home --older-than 90 --max-concurrent 200 --connector-limit 200
@@ -2796,6 +2993,40 @@ Examples:
         action="store_true",
         help="Generate ownership report (file count and total bytes by owner)",
     )
+
+    # Name search filters
+    parser.add_argument(
+        "--name",
+        action="append",
+        dest="name_patterns",
+        help="Filter by name pattern (supports glob wildcards and regex, can be specified multiple times for OR logic). "
+             "Glob examples: --name '*.log' --name 'test_*'. "
+             "Regex examples: --name '.*\\.log$' --name '^test_.*'",
+    )
+    parser.add_argument(
+        "--name-and",
+        action="append",
+        dest="name_patterns_and",
+        help="Filter by name pattern using AND logic (all patterns must match, supports glob and regex). "
+             "Examples: --name-and '*backup*' --name-and '*2024*'",
+    )
+    parser.add_argument(
+        "--name-case-sensitive",
+        action="store_true",
+        help="Make name pattern matching case-sensitive (default: case-insensitive)",
+    )
+    parser.add_argument(
+        "--type",
+        choices=["file", "f", "directory", "dir", "d", "symlink", "link", "l"],
+        help="Filter by object type: file/f, directory/dir/d, or symlink/link/l",
+    )
+    parser.add_argument(
+        "--resolve-links",
+        action="store_true",
+        help="Resolve and display symlink targets (shows 'link → target' in output). "
+             "Does not follow symlinks during traversal.",
+    )
+
     parser.add_argument(
         "--use-capacity",
         action="store_true",
