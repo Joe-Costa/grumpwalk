@@ -30,7 +30,7 @@ from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 
 # Add the Qumulo CLI directory to path to import auth modules
-CLI_PATH = Path(__file__).parent / 'cli' / 'cli'
+CLI_PATH = Path(__file__).parent / "cli" / "cli"
 sys.path.insert(0, str(CLI_PATH))
 
 try:
@@ -43,19 +43,24 @@ except ImportError as e:
 try:
     import aiohttp
 except ImportError:
-    print("[ERROR] aiohttp not installed. Install with: pip install aiohttp", file=sys.stderr)
+    print(
+        "[ERROR] aiohttp not installed. Install with: pip install aiohttp",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # Try to use ujson for faster parsing
 try:
     import ujson as json_parser
+
     JSON_PARSER_NAME = "ujson"
 except ImportError:
     import json as json_parser
+
     JSON_PARSER_NAME = "json"
 
 # Identity cache configuration
-IDENTITY_CACHE_FILE = 'file_filter_resolved_identities'
+IDENTITY_CACHE_FILE = "file_filter_resolved_identities"
 IDENTITY_CACHE_TTL = 15 * 60  # 15 minutes in seconds
 import os
 
@@ -67,32 +72,36 @@ def load_identity_cache(verbose: bool = False) -> Dict:
 
     try:
         if os.path.exists(IDENTITY_CACHE_FILE):
-            with open(IDENTITY_CACHE_FILE, 'r') as f:
+            with open(IDENTITY_CACHE_FILE, "r") as f:
                 cache_data = json_parser.load(f)
 
                 # Remove expired entries
                 expired_count = 0
                 for auth_id, entry in list(cache_data.items()):
-                    if cache_timestamp - entry.get('timestamp', 0) > IDENTITY_CACHE_TTL:
+                    if cache_timestamp - entry.get("timestamp", 0) > IDENTITY_CACHE_TTL:
                         expired_count += 1
                         del cache_data[auth_id]
                     else:
                         # Store full identity data, not just name
-                        cache[auth_id] = entry.get('identity', {})
+                        cache[auth_id] = entry.get("identity", {})
 
                 # Write cleaned cache back to file if entries were expired
                 if expired_count > 0:
                     save_identity_cache(cache, verbose=False)
 
             if verbose and cache:
-                print(f'[INFO] Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}',
-                      file=sys.stderr)
+                print(
+                    f"[INFO] Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}",
+                    file=sys.stderr,
+                )
                 if expired_count > 0:
-                    print(f'[INFO] Removed {expired_count} expired cache entries',
-                          file=sys.stderr)
+                    print(
+                        f"[INFO] Removed {expired_count} expired cache entries",
+                        file=sys.stderr,
+                    )
     except Exception as e:
         if verbose:
-            print(f'[WARN] Failed to load identity cache: {e}', file=sys.stderr)
+            print(f"[WARN] Failed to load identity cache: {e}", file=sys.stderr)
 
     return cache
 
@@ -104,20 +113,19 @@ def save_identity_cache(identity_cache: Dict, verbose: bool = False):
         cache_timestamp = int(time.time())
 
         for auth_id, identity in identity_cache.items():
-            cache_data[auth_id] = {
-                'identity': identity,
-                'timestamp': cache_timestamp
-            }
+            cache_data[auth_id] = {"identity": identity, "timestamp": cache_timestamp}
 
-        with open(IDENTITY_CACHE_FILE, 'w') as f:
+        with open(IDENTITY_CACHE_FILE, "w") as f:
             json_parser.dump(cache_data, f, indent=2)
 
         if verbose:
-            print(f'[INFO] Saved {len(identity_cache)} identities to cache file',
-                  file=sys.stderr)
+            print(
+                f"[INFO] Saved {len(identity_cache)} identities to cache file",
+                file=sys.stderr,
+            )
     except Exception as e:
         if verbose:
-            print(f'[WARN] Failed to save identity cache: {e}', file=sys.stderr)
+            print(f"[WARN] Failed to save identity cache: {e}", file=sys.stderr)
 
 
 class OwnerStats:
@@ -139,13 +147,13 @@ class OwnerStats:
         """Add a file to the owner statistics."""
         async with self.lock:
             if owner_auth_id not in self.owner_data:
-                self.owner_data[owner_auth_id] = {'bytes': 0, 'files': 0, 'dirs': 0}
+                self.owner_data[owner_auth_id] = {"bytes": 0, "files": 0, "dirs": 0}
 
-            self.owner_data[owner_auth_id]['bytes'] += size
+            self.owner_data[owner_auth_id]["bytes"] += size
             if is_dir:
-                self.owner_data[owner_auth_id]['dirs'] += 1
+                self.owner_data[owner_auth_id]["dirs"] += 1
             else:
-                self.owner_data[owner_auth_id]['files'] += 1
+                self.owner_data[owner_auth_id]["files"] += 1
 
     def get_all_owners(self) -> List[str]:
         """Get list of all unique owner auth_ids."""
@@ -153,7 +161,7 @@ class OwnerStats:
 
     def get_stats(self, owner_auth_id: str) -> Dict:
         """Get statistics for a specific owner."""
-        return self.owner_data.get(owner_auth_id, {'bytes': 0, 'files': 0, 'dirs': 0})
+        return self.owner_data.get(owner_auth_id, {"bytes": 0, "files": 0, "dirs": 0})
 
 
 class ProgressTracker:
@@ -184,20 +192,27 @@ class ProgressTracker:
             if self.limit and self.matches >= self.limit and not self.limit_reached:
                 self.limit_reached = True
                 if self.verbose:
-                    print(f"\r[INFO] Limit reached: {self.matches} matches (limit: {self.limit})",
-                          file=sys.stderr, flush=True)
+                    print(
+                        f"\r[INFO] Limit reached: {self.matches} matches (limit: {self.limit})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
             # Print progress every 0.5 seconds
             if self.verbose and time.time() - self.last_update > 0.5:
                 elapsed = time.time() - self.start_time
                 rate = self.total_objects / elapsed if elapsed > 0 else 0
                 time_str = format_time(elapsed)
-                print(f"\r[PROGRESS] {self.total_objects:,} objects processed | "
-                      f"{self.matches:,} matches | "
-                      f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
-                      f"{rate:.1f} obj/sec | "
-                      f"Run time: {time_str}",
-                      end='', file=sys.stderr, flush=True)
+                print(
+                    f"\r[PROGRESS] {self.total_objects:,} objects processed | "
+                    f"{self.matches:,} matches | "
+                    f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
+                    f"{rate:.1f} obj/sec | "
+                    f"Run time: {time_str}",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self.last_update = time.time()
 
     async def increment_skipped(self, files_skipped: int = 0, subdirs_skipped: int = 0):
@@ -223,19 +238,26 @@ class ProgressTracker:
             elapsed = time.time() - self.start_time
             rate = self.total_objects / elapsed if elapsed > 0 else 0
             time_str = format_time(elapsed)
-            print(f"\r[PROGRESS] FINAL: {self.total_objects:,} objects processed | "
-                  f"{self.matches:,} matches | "
-                  f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
-                  f"{rate:.1f} obj/sec | "
-                  f"Run time: {time_str}",
-                  file=sys.stderr)
+            print(
+                f"\r[PROGRESS] FINAL: {self.total_objects:,} objects processed | "
+                f"{self.matches:,} matches | "
+                f"Smart Skip: {self.skipped_dirs:,} dirs ({self.skipped_files:,} files, {self.skipped_subdirs:,} subdirs) | "
+                f"{rate:.1f} obj/sec | "
+                f"Run time: {time_str}",
+                file=sys.stderr,
+            )
 
 
 class BatchedOutputHandler:
     """Handle batched output with identity resolution for --show-owner streaming."""
 
-    def __init__(self, client: 'AsyncQumuloClient', batch_size: int = 100,
-                 show_owner: bool = False, output_format: str = 'text'):
+    def __init__(
+        self,
+        client: "AsyncQumuloClient",
+        batch_size: int = 100,
+        show_owner: bool = False,
+        output_format: str = "text",
+    ):
         self.client = client
         self.batch_size = batch_size
         self.show_owner = show_owner
@@ -262,8 +284,8 @@ class BatchedOutputHandler:
             # Collect unique owner auth_ids from batch
             unique_owners = set()
             for entry in self.batch:
-                owner_details = entry.get('owner_details', {})
-                owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                owner_details = entry.get("owner_details", {})
+                owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                 if owner_auth_id:
                     unique_owners.add(owner_auth_id)
 
@@ -276,14 +298,14 @@ class BatchedOutputHandler:
 
         # Output batch
         for entry in self.batch:
-            if self.output_format == 'json':
+            if self.output_format == "json":
                 print(json_parser.dumps(entry))
             else:
                 # Plain text
-                output_line = entry['path']
+                output_line = entry["path"]
                 if self.show_owner:
-                    owner_details = entry.get('owner_details', {})
-                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                     if owner_auth_id and owner_auth_id in identity_cache:
                         identity = identity_cache[owner_auth_id]
                         owner_name = format_owner_name(identity)
@@ -307,7 +329,7 @@ class Profiler:
 
     def __init__(self):
         self.timings = {}  # operation -> total time
-        self.counts = {}   # operation -> call count
+        self.counts = {}  # operation -> call count
         self.lock = asyncio.Lock()
 
     async def record(self, operation: str, duration: float):
@@ -339,7 +361,10 @@ class Profiler:
         # Sort by total time descending
         sorted_ops = sorted(self.timings.items(), key=lambda x: x[1], reverse=True)
 
-        print(f"\n{'Operation':<30} {'Total Time':>12} {'Calls':>10} {'Avg Time':>12} {'% Total':>8}", file=sys.stderr)
+        print(
+            f"\n{'Operation':<30} {'Total Time':>12} {'Calls':>10} {'Avg Time':>12} {'% Total':>8}",
+            file=sys.stderr,
+        )
         print("-" * 80, file=sys.stderr)
 
         for operation, total_time in sorted_ops:
@@ -347,8 +372,10 @@ class Profiler:
             avg_time = total_time / count if count > 0 else 0
             pct_total = (total_time / total_elapsed * 100) if total_elapsed > 0 else 0
 
-            print(f"{operation:<30} {total_time:>11.3f}s {count:>10,} {avg_time*1000:>11.2f}ms {pct_total:>7.1f}%",
-                  file=sys.stderr)
+            print(
+                f"{operation:<30} {total_time:>11.3f}s {count:>10,} {avg_time*1000:>11.2f}ms {pct_total:>7.1f}%",
+                file=sys.stderr,
+            )
 
         print("-" * 80, file=sys.stderr)
         print(f"{'Total Accounted':<30} {total_accounted:>11.3f}s", file=sys.stderr)
@@ -356,8 +383,13 @@ class Profiler:
 
         unaccounted = total_elapsed - total_accounted
         if unaccounted > 0.01:
-            pct_unaccounted = (unaccounted / total_elapsed * 100) if total_elapsed > 0 else 0
-            print(f"{'Unaccounted (overhead)':<30} {unaccounted:>11.3f}s {pct_unaccounted:>7.1f}%", file=sys.stderr)
+            pct_unaccounted = (
+                (unaccounted / total_elapsed * 100) if total_elapsed > 0 else 0
+            )
+            print(
+                f"{'Unaccounted (overhead)':<30} {unaccounted:>11.3f}s {pct_unaccounted:>7.1f}%",
+                file=sys.stderr,
+            )
 
         # Identify bottlenecks
         print(f"\nTop 3 Bottlenecks:", file=sys.stderr)
@@ -370,10 +402,10 @@ class Profiler:
 
 def extract_pagination_token(api_response: dict) -> Optional[str]:
     """Extract the pagination token from Qumulo API response."""
-    if 'paging' not in api_response:
+    if "paging" not in api_response:
         return None
 
-    next_url = api_response['paging'].get('next')
+    next_url = api_response["paging"].get("next")
     if not next_url:
         return None
 
@@ -381,8 +413,8 @@ def extract_pagination_token(api_response: dict) -> Optional[str]:
         parsed = urlparse(next_url)
         query_params = parse_qs(parsed.query)
 
-        if 'after' in query_params:
-            return query_params['after'][0]
+        if "after" in query_params:
+            return query_params["after"][0]
         else:
             return None
 
@@ -393,9 +425,16 @@ def extract_pagination_token(api_response: dict) -> Optional[str]:
 class AsyncQumuloClient:
     """Async Qumulo API client using aiohttp with optimized connection pooling."""
 
-    def __init__(self, host: str, port: int, bearer_token: str,
-                 max_concurrent: int = 100, connector_limit: int = 100,
-                 identity_cache: Optional[Dict] = None, verbose: bool = False):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        bearer_token: str,
+        max_concurrent: int = 100,
+        connector_limit: int = 100,
+        identity_cache: Optional[Dict] = None,
+        verbose: bool = False,
+    ):
         self.host = host
         self.port = port
         self.base_url = f"https://{host}:{port}"
@@ -412,15 +451,17 @@ class AsyncQumuloClient:
         self.connector_limit = connector_limit
 
         self.headers = {
-            'accept': 'application/json',
-            'Authorization': f'Bearer {bearer_token}'
+            "accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
         }
 
         # Semaphore to limit concurrent operations
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
         # Persistent identity cache for performance
-        self.persistent_identity_cache = identity_cache if identity_cache is not None else {}
+        self.persistent_identity_cache = (
+            identity_cache if identity_cache is not None else {}
+        )
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -430,12 +471,17 @@ class AsyncQumuloClient:
             limit=self.connector_limit,
             limit_per_host=self.connector_limit,
             ttl_dns_cache=300,
-            ssl=self.ssl_context
+            ssl=self.ssl_context,
         )
         return aiohttp.ClientSession(connector=connector, headers=self.headers)
 
-    async def get_directory_page(self, session: aiohttp.ClientSession, path: str,
-                                 limit: int = 1000, after_token: Optional[str] = None) -> dict:
+    async def get_directory_page(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        limit: int = 1000,
+        after_token: Optional[str] = None,
+    ) -> dict:
         """
         Fetch a single page of directory contents from Qumulo API.
 
@@ -449,22 +495,28 @@ class AsyncQumuloClient:
             Dictionary containing 'files' and 'paging' metadata
         """
         async with self.semaphore:
-            if not path.startswith('/'):
-                path = '/' + path
+            if not path.startswith("/"):
+                path = "/" + path
 
-            encoded_path = quote(path, safe='')
+            encoded_path = quote(path, safe="")
             url = f"{self.base_url}/v1/files/{encoded_path}/entries/"
 
-            params = {'limit': limit}
+            params = {"limit": limit}
             if after_token:
-                params['after'] = after_token
+                params["after"] = after_token
 
-            async with session.get(url, params=params, ssl=self.ssl_context) as response:
+            async with session.get(
+                url, params=params, ssl=self.ssl_context
+            ) as response:
                 response.raise_for_status()
                 return await response.json()
 
-    async def enumerate_directory(self, session: aiohttp.ClientSession, path: str,
-                                  max_entries: Optional[int] = None) -> List[dict]:
+    async def enumerate_directory(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        max_entries: Optional[int] = None,
+    ) -> List[dict]:
         """
         Enumerate all entries in a directory, following pagination.
 
@@ -480,9 +532,11 @@ class AsyncQumuloClient:
         after_token = None
 
         while True:
-            response = await self.get_directory_page(session, path, limit=1000, after_token=after_token)
+            response = await self.get_directory_page(
+                session, path, limit=1000, after_token=after_token
+            )
 
-            files = response.get('files', [])
+            files = response.get("files", [])
             all_entries.extend(files)
 
             # Check if we've reached the max entries limit
@@ -497,9 +551,9 @@ class AsyncQumuloClient:
 
         return all_entries
 
-    async def enumerate_directory_streaming(self, session: aiohttp.ClientSession,
-                                           path: str,
-                                           callback) -> int:
+    async def enumerate_directory_streaming(
+        self, session: aiohttp.ClientSession, path: str, callback
+    ) -> int:
         """
         Stream directory entries without accumulating in memory.
         Calls callback with each page of results for processing.
@@ -520,9 +574,11 @@ class AsyncQumuloClient:
         after_token = None
 
         while True:
-            response = await self.get_directory_page(session, path, limit=1000, after_token=after_token)
+            response = await self.get_directory_page(
+                session, path, limit=1000, after_token=after_token
+            )
 
-            files = response.get('files', [])
+            files = response.get("files", [])
             total_entries += len(files)
 
             # Process this page immediately via callback
@@ -536,8 +592,9 @@ class AsyncQumuloClient:
 
         return total_entries
 
-    async def get_directory_aggregates(self, session: aiohttp.ClientSession,
-                                       path: str) -> dict:
+    async def get_directory_aggregates(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> dict:
         """
         Get directory aggregate statistics.
 
@@ -553,10 +610,10 @@ class AsyncQumuloClient:
             Falls back to safe defaults if API call fails.
         """
         async with self.semaphore:
-            if not path.startswith('/'):
-                path = '/' + path
+            if not path.startswith("/"):
+                path = "/" + path
 
-            encoded_path = quote(path, safe='')
+            encoded_path = quote(path, safe="")
             url = f"{self.base_url}/v1/files/{encoded_path}/aggregates/"
 
             try:
@@ -565,14 +622,11 @@ class AsyncQumuloClient:
                     return await response.json()
             except aiohttp.ClientError as e:
                 # Fall back gracefully if aggregates unavailable
-                return {
-                    'total_files': '0',
-                    'total_directories': '0',
-                    'error': str(e)
-                }
+                return {"total_files": "0", "total_directories": "0", "error": str(e)}
 
-    async def get_directory_capacity(self, session: aiohttp.ClientSession,
-                                     path: str) -> dict:
+    async def get_directory_capacity(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> dict:
         """
         Get directory capacity breakdown by owner.
 
@@ -588,16 +642,18 @@ class AsyncQumuloClient:
             Example: {"capacity_by_owner": [{"id": "500", "capacity_usage": 1073741824}]}
         """
         async with self.semaphore:
-            if not path.startswith('/'):
-                path = '/' + path
+            if not path.startswith("/"):
+                path = "/" + path
 
-            encoded_path = quote(path, safe='')
+            encoded_path = quote(path, safe="")
             url = f"{self.base_url}/v1/files/data/capacity/"
 
             params = {"path": path, "by_owner": "true"}
 
             try:
-                async with session.get(url, params=params, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=params, ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
@@ -635,14 +691,17 @@ class AsyncQumuloClient:
         else:
             return max(5, self.max_concurrent // 10)
 
-    async def enumerate_directory_adaptive(self, session: aiohttp.ClientSession,
-                                          path: str,
-                                          aggregates: dict,
-                                          file_filter=None,
-                                          owner_stats: Optional[OwnerStats] = None,
-                                          collect_results: bool = True,
-                                          verbose: bool = False,
-                                          progress: Optional['ProgressTracker'] = None) -> tuple:
+    async def enumerate_directory_adaptive(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        aggregates: dict,
+        file_filter=None,
+        owner_stats: Optional[OwnerStats] = None,
+        collect_results: bool = True,
+        verbose: bool = False,
+        progress: Optional["ProgressTracker"] = None,
+    ) -> tuple:
         """
         Automatically choose between batch mode and streaming mode based on directory size.
 
@@ -668,8 +727,8 @@ class AsyncQumuloClient:
         """
         # Parse aggregates to determine directory size
         try:
-            total_files = int(aggregates.get('total_files', 0))
-            total_dirs = int(aggregates.get('total_directories', 0))
+            total_files = int(aggregates.get("total_files", 0))
+            total_dirs = int(aggregates.get("total_directories", 0))
             total_entries = total_files + total_dirs
         except (ValueError, TypeError):
             total_entries = 0
@@ -678,8 +737,10 @@ class AsyncQumuloClient:
         use_streaming = total_entries >= 50000 and collect_results
 
         if verbose and use_streaming:
-            print(f"\r[INFO] Progressive streaming: Using streaming mode for {path} ({total_entries:,} entries)",
-                  file=sys.stderr)
+            print(
+                f"\r[INFO] Progressive streaming: Using streaming mode for {path} ({total_entries:,} entries)",
+                file=sys.stderr,
+            )
 
         matching_entries = []
         subdirs = []
@@ -697,24 +758,26 @@ class AsyncQumuloClient:
                 for entry in page_entries:
                     # Collect owner statistics if enabled
                     if owner_stats:
-                        owner_details = entry.get('owner_details', {})
-                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get(
+                            "owner"
+                        )
                         if owner_auth_id:
                             try:
                                 if owner_stats.use_capacity:
-                                    datablocks = int(entry.get('datablocks', 0))
-                                    metablocks = int(entry.get('metablocks', 0))
+                                    datablocks = int(entry.get("datablocks", 0))
+                                    metablocks = int(entry.get("metablocks", 0))
                                     file_size = (datablocks + metablocks) * 4096
                                 else:
-                                    file_size = int(entry.get('size', 0))
+                                    file_size = int(entry.get("size", 0))
                             except (ValueError, TypeError):
                                 file_size = 0
-                            is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+                            is_dir = entry.get("type") == "FS_FILE_TYPE_DIRECTORY"
                             await owner_stats.add_file(owner_auth_id, file_size, is_dir)
 
                     # Track subdirectories
-                    if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
-                        subdirs.append(entry['path'])
+                    if entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
+                        subdirs.append(entry["path"])
 
                     # Apply filter and collect results
                     if file_filter:
@@ -743,24 +806,24 @@ class AsyncQumuloClient:
             for entry in entries:
                 # Collect owner statistics if enabled
                 if owner_stats:
-                    owner_details = entry.get('owner_details', {})
-                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                     if owner_auth_id:
                         try:
                             if owner_stats.use_capacity:
-                                datablocks = int(entry.get('datablocks', 0))
-                                metablocks = int(entry.get('metablocks', 0))
+                                datablocks = int(entry.get("datablocks", 0))
+                                metablocks = int(entry.get("metablocks", 0))
                                 file_size = (datablocks + metablocks) * 4096
                             else:
-                                file_size = int(entry.get('size', 0))
+                                file_size = int(entry.get("size", 0))
                         except (ValueError, TypeError):
                             file_size = 0
-                        is_dir = entry.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+                        is_dir = entry.get("type") == "FS_FILE_TYPE_DIRECTORY"
                         await owner_stats.add_file(owner_auth_id, file_size, is_dir)
 
                 # Track subdirectories
-                if entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
-                    subdirs.append(entry['path'])
+                if entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
+                    subdirs.append(entry["path"])
 
                 # Apply filter and collect results
                 if file_filter:
@@ -775,20 +838,24 @@ class AsyncQumuloClient:
 
         return (matching_entries, subdirs, match_count, total_processed)
 
-    async def walk_tree_async(self, session: aiohttp.ClientSession, path: str,
-                             max_depth: Optional[int] = None,
-                             _current_depth: int = 0,
-                             progress: Optional[ProgressTracker] = None,
-                             file_filter=None,
-                             owner_stats: Optional[OwnerStats] = None,
-                             omit_subdirs: Optional[List[str]] = None,
-                             collect_results: bool = True,
-                             verbose: bool = False,
-                             max_entries_per_dir: Optional[int] = None,
-                             time_filter_info: Optional[Dict] = None,
-                             size_filter_info: Optional[Dict] = None,
-                             owner_filter_info: Optional[Dict] = None,
-                             output_callback=None) -> List[dict]:
+    async def walk_tree_async(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        max_depth: Optional[int] = None,
+        _current_depth: int = 0,
+        progress: Optional[ProgressTracker] = None,
+        file_filter=None,
+        owner_stats: Optional[OwnerStats] = None,
+        omit_subdirs: Optional[List[str]] = None,
+        collect_results: bool = True,
+        verbose: bool = False,
+        max_entries_per_dir: Optional[int] = None,
+        time_filter_info: Optional[Dict] = None,
+        size_filter_info: Optional[Dict] = None,
+        owner_filter_info: Optional[Dict] = None,
+        output_callback=None,
+    ) -> List[dict]:
         """
         Recursively walk directory tree with concurrent directory enumeration.
 
@@ -823,20 +890,22 @@ class AsyncQumuloClient:
         aggregates = await self.get_directory_aggregates(session, path)
 
         # Check for errors in aggregates response (API may not be available)
-        has_aggregates_error = 'error' in aggregates
+        has_aggregates_error = "error" in aggregates
 
         if not has_aggregates_error:
             # Parse aggregate statistics (API returns strings, convert to ints)
             try:
-                total_files = int(aggregates.get('total_files', 0))
-                total_directories = int(aggregates.get('total_directories', 0))
+                total_files = int(aggregates.get("total_files", 0))
+                total_directories = int(aggregates.get("total_directories", 0))
                 total_entries = total_files + total_directories
 
                 # Warn on large directories (100k+ entries)
                 if verbose and total_entries > 100_000:
-                    print(f"\r[WARN] Large directory: {path} ({total_entries:,} entries: "
-                          f"{total_files:,} files, {total_directories:,} dirs)",
-                          file=sys.stderr)
+                    print(
+                        f"\r[WARN] Large directory: {path} ({total_entries:,} entries: "
+                        f"{total_files:,} files, {total_directories:,} dirs)",
+                        file=sys.stderr,
+                    )
 
                 # Safety valve: skip directories exceeding max_entries_per_dir
                 if max_entries_per_dir and total_entries > max_entries_per_dir:
@@ -856,8 +925,16 @@ class AsyncQumuloClient:
                     # We detect this by checking if args has file_only attribute
                     # Since we don't have access to args here, we check by testing the filter
                     # with a mock directory entry
-                    test_dir = {'type': 'FS_FILE_TYPE_DIRECTORY', 'path': '/test', 'name': 'test'}
-                    test_file = {'type': 'FS_FILE_TYPE_FILE', 'path': '/test', 'name': 'test'}
+                    test_dir = {
+                        "type": "FS_FILE_TYPE_DIRECTORY",
+                        "path": "/test",
+                        "name": "test",
+                    }
+                    test_file = {
+                        "type": "FS_FILE_TYPE_FILE",
+                        "path": "/test",
+                        "name": "test",
+                    }
 
                     # If filter rejects directories but might accept files, check file count
                     if not file_filter(test_dir) and file_filter(test_file):
@@ -868,7 +945,9 @@ class AsyncQumuloClient:
                             #           file=sys.stderr)
                             pass
                             if progress:
-                                await progress.increment_skipped(total_files, total_directories)
+                                await progress.increment_skipped(
+                                    total_files, total_directories
+                                )
                             return []
 
                 # PHASE 3: Enhanced smart skipping for time and size filters
@@ -876,20 +955,26 @@ class AsyncQumuloClient:
 
                 # Time-based smart skipping
                 if time_filter_info:
-                    oldest_mod = aggregates.get('oldest_modification_time')
-                    newest_mod = aggregates.get('newest_modification_time')
+                    oldest_mod = aggregates.get("oldest_modification_time")
+                    newest_mod = aggregates.get("newest_modification_time")
 
                     # Parse time filter info
-                    older_than_threshold = time_filter_info.get('older_than')
-                    newer_than_threshold = time_filter_info.get('newer_than')
-                    time_field = time_filter_info.get('time_field', 'modification_time')
+                    older_than_threshold = time_filter_info.get("older_than")
+                    newer_than_threshold = time_filter_info.get("newer_than")
+                    time_field = time_filter_info.get("time_field", "modification_time")
 
                     # Only apply smart skipping for modification_time (since aggregates provides mod times)
-                    if time_field == 'modification_time' and (oldest_mod and newest_mod):
+                    if time_field == "modification_time" and (
+                        oldest_mod and newest_mod
+                    ):
                         try:
                             # Parse aggregates times
-                            oldest_time = datetime.fromisoformat(oldest_mod.rstrip('Z').split('.')[0])
-                            newest_time = datetime.fromisoformat(newest_mod.rstrip('Z').split('.')[0])
+                            oldest_time = datetime.fromisoformat(
+                                oldest_mod.rstrip("Z").split(".")[0]
+                            )
+                            newest_time = datetime.fromisoformat(
+                                newest_mod.rstrip("Z").split(".")[0]
+                            )
 
                             # Check --older-than filter
                             if older_than_threshold:
@@ -899,7 +984,9 @@ class AsyncQumuloClient:
                                     #     print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
                                     #           file=sys.stderr)
                                     if progress:
-                                        await progress.increment_skipped(total_files, total_directories)
+                                        await progress.increment_skipped(
+                                            total_files, total_directories
+                                        )
                                     return []
 
                             # Check --newer-than filter
@@ -910,7 +997,9 @@ class AsyncQumuloClient:
                                     #     print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
                                     #           file=sys.stderr)
                                     if progress:
-                                        await progress.increment_skipped(total_files, total_directories)
+                                        await progress.increment_skipped(
+                                            total_files, total_directories
+                                        )
                                     return []
 
                         except (ValueError, AttributeError):
@@ -919,8 +1008,8 @@ class AsyncQumuloClient:
 
                 # Size-based smart skipping
                 if size_filter_info:
-                    total_capacity = aggregates.get('total_capacity')
-                    min_size = size_filter_info.get('min_size')
+                    total_capacity = aggregates.get("total_capacity")
+                    min_size = size_filter_info.get("min_size")
 
                     # Check --larger-than filter (min_size)
                     if min_size and total_capacity:
@@ -934,7 +1023,9 @@ class AsyncQumuloClient:
                                 #           f"(total capacity {total_cap_bytes} < min {min_size})",
                                 #           file=sys.stderr)
                                 if progress:
-                                    await progress.increment_skipped(total_files, total_directories)
+                                    await progress.increment_skipped(
+                                        total_files, total_directories
+                                    )
                                 return []
                         except (ValueError, TypeError):
                             # If capacity parsing fails, continue without smart skipping
@@ -943,27 +1034,32 @@ class AsyncQumuloClient:
                 # PHASE 3.3: Owner-based smart skipping
                 # Use capacity API to check if target owner has any files in this directory
                 if owner_filter_info:
-                    owner_auth_ids = owner_filter_info.get('auth_ids')
+                    owner_auth_ids = owner_filter_info.get("auth_ids")
                     if owner_auth_ids:
                         # Get capacity breakdown by owner
                         capacity_data = await self.get_directory_capacity(session, path)
-                        if capacity_data and 'capacity_by_owner' in capacity_data:
+                        if capacity_data and "capacity_by_owner" in capacity_data:
                             # Extract owner IDs from capacity data
                             owners_with_files = set()
-                            for entry in capacity_data.get('capacity_by_owner', []):
-                                owner_id = entry.get('id')
+                            for entry in capacity_data.get("capacity_by_owner", []):
+                                owner_id = entry.get("id")
                                 if owner_id:
                                     owners_with_files.add(owner_id)
 
                             # Check if any of our target owners have files here
-                            has_matching_owner = any(auth_id in owners_with_files for auth_id in owner_auth_ids)
+                            has_matching_owner = any(
+                                auth_id in owners_with_files
+                                for auth_id in owner_auth_ids
+                            )
 
                             if not has_matching_owner:
                                 # if verbose:
                                 #     print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
                                 #           file=sys.stderr)
                                 if progress:
-                                    await progress.increment_skipped(total_files, total_directories)
+                                    await progress.increment_skipped(
+                                        total_files, total_directories
+                                    )
                                 return []
 
             except (ValueError, TypeError):
@@ -972,8 +1068,17 @@ class AsyncQumuloClient:
 
         # PHASE 3.2: Use adaptive enumeration (automatically chooses streaming vs batch mode)
         # Pass progress tracker for per-page updates in streaming mode
-        matching_entries, subdirs, match_count, total_processed = await self.enumerate_directory_adaptive(
-            session, path, aggregates, file_filter, owner_stats, collect_results, verbose, progress
+        matching_entries, subdirs, match_count, total_processed = (
+            await self.enumerate_directory_adaptive(
+                session,
+                path,
+                aggregates,
+                file_filter,
+                owner_stats,
+                collect_results,
+                verbose,
+                progress,
+            )
         )
 
         # Filter subdirectories based on omit patterns
@@ -981,7 +1086,11 @@ class AsyncQumuloClient:
             filtered_subdirs = []
             for subdir_path in subdirs:
                 # Extract directory name (last component, handling trailing slashes)
-                subdir_name = subdir_path.rstrip('/').split('/')[-1] if '/' in subdir_path else subdir_path
+                subdir_name = (
+                    subdir_path.rstrip("/").split("/")[-1]
+                    if "/" in subdir_path
+                    else subdir_path
+                )
 
                 # Check if this directory should be omitted
                 should_omit = False
@@ -1012,8 +1121,8 @@ class AsyncQumuloClient:
         # In batch mode, we update once with the total for this directory
         # We determine the mode by checking if total_entries >= 50000 (streaming threshold)
         try:
-            total_files = int(aggregates.get('total_files', 0))
-            total_dirs = int(aggregates.get('total_directories', 0))
+            total_files = int(aggregates.get("total_files", 0))
+            total_dirs = int(aggregates.get("total_directories", 0))
             total_entries = total_files + total_dirs
             used_streaming = total_entries >= 50000 and collect_results
         except (ValueError, TypeError):
@@ -1025,15 +1134,20 @@ class AsyncQumuloClient:
             await progress.update(total_processed, 1, match_count)
 
         # Recursively process subdirectories concurrently
-        if subdirs and (max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth):
+        if subdirs and (
+            max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth
+        ):
             # PHASE 3.2: Adaptive concurrency - process subdirectories in batches
             # Calculate batch size based on number of subdirectories
             num_subdirs = len(subdirs)
             batch_size = self.calculate_adaptive_concurrency(num_subdirs)
 
             if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
-                print(f"\r[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
-                      f"(reduced from {self.max_concurrent})", file=sys.stderr)
+                print(
+                    f"\r[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
+                    f"(reduced from {self.max_concurrent})",
+                    file=sys.stderr,
+                )
 
             # Process subdirectories in batches
             all_results = []
@@ -1047,16 +1161,31 @@ class AsyncQumuloClient:
                 # Early exit: Check if limit reached before processing next batch
                 if progress and progress.should_stop():
                     if verbose:
-                        print(f"\r[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
-                              file=sys.stderr)
+                        print(
+                            f"\r[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
+                            file=sys.stderr,
+                        )
                     break
 
-                batch = subdirs[i:i + batch_size]
+                batch = subdirs[i : i + batch_size]
                 tasks = [
-                    self.walk_tree_async(session, subdir, max_depth, _current_depth + 1, progress,
-                                        file_filter, owner_stats, omit_subdirs, collect_results,
-                                        verbose, max_entries_per_dir, time_filter_info, size_filter_info,
-                                        owner_filter_info, output_callback)
+                    self.walk_tree_async(
+                        session,
+                        subdir,
+                        max_depth,
+                        _current_depth + 1,
+                        progress,
+                        file_filter,
+                        owner_stats,
+                        omit_subdirs,
+                        collect_results,
+                        verbose,
+                        max_entries_per_dir,
+                        time_filter_info,
+                        size_filter_info,
+                        owner_filter_info,
+                        output_callback,
+                    )
                     for subdir in batch
                 ]
 
@@ -1072,7 +1201,11 @@ class AsyncQumuloClient:
                     total_batches = (num_subdirs + batch_size - 1) // batch_size
 
                     # Show progress every 100 batches or every 10 seconds
-                    if batch_num % 100 == 0 or elapsed_since_last >= batch_progress_interval or batch_num == total_batches:
+                    if (
+                        batch_num % 100 == 0
+                        or elapsed_since_last >= batch_progress_interval
+                        or batch_num == total_batches
+                    ):
                         percent = (i + batch_size) / num_subdirs * 100
                         subdirs_processed = min(i + batch_size, num_subdirs)
 
@@ -1082,10 +1215,13 @@ class AsyncQumuloClient:
                         elapsed_total = current_time - progress.start_time
                         time_str = format_time(elapsed_total)
 
-                        print(f"\r[PROGRESS] Scanning subdirs in {display_path}: "
-                              f"{subdirs_processed:,}/{num_subdirs:,} ({percent:.1f}%) | "
-                              f"Run time: {time_str}",
-                              end='', file=sys.stderr)
+                        print(
+                            f"\r[PROGRESS] Scanning subdirs in {display_path}: "
+                            f"{subdirs_processed:,}/{num_subdirs:,} ({percent:.1f}%) | "
+                            f"Run time: {time_str}",
+                            end="",
+                            file=sys.stderr,
+                        )
 
                         last_progress_time = current_time
 
@@ -1099,18 +1235,27 @@ class AsyncQumuloClient:
                 # At deeper levels, use simple extend to avoid memory overhead
                 if _current_depth == 0 and len(all_results) > 1000:
                     if verbose:
-                        print(f"\r[INFO] Collecting results from {len(all_results)} subdirectory batches...",
-                              file=sys.stderr)
+                        print(
+                            f"\r[INFO] Collecting results from {len(all_results)} subdirectory batches...",
+                            file=sys.stderr,
+                        )
 
                     # Use itertools.chain for efficient concatenation
                     import itertools
-                    result_lists = [result for result in all_results if isinstance(result, list)]
+
+                    result_lists = [
+                        result for result in all_results if isinstance(result, list)
+                    ]
                     if result_lists:
-                        matching_entries.extend(itertools.chain.from_iterable(result_lists))
+                        matching_entries.extend(
+                            itertools.chain.from_iterable(result_lists)
+                        )
 
                     if verbose:
-                        print(f"\r[INFO] Collection complete, {len(matching_entries)} total matches          ",
-                              file=sys.stderr)
+                        print(
+                            f"\r[INFO] Collection complete, {len(matching_entries)} total matches          ",
+                            file=sys.stderr,
+                        )
                 else:
                     # For smaller result sets or nested levels, simple extend is fine
                     for result in all_results:
@@ -1119,8 +1264,9 @@ class AsyncQumuloClient:
 
         return matching_entries
 
-    async def resolve_identity(self, session: aiohttp.ClientSession,
-                               identifier: str, id_type: str = "auth_id") -> Dict:
+    async def resolve_identity(
+        self, session: aiohttp.ClientSession, identifier: str, id_type: str = "auth_id"
+    ) -> Dict:
         """
         Resolve an identity using various identifier types.
 
@@ -1154,10 +1300,14 @@ class AsyncQumuloClient:
         elif id_type == "name":
             payload = {"name": str(identifier)}
         else:
-            raise ValueError(f"Unknown id_type: {id_type}. Must be auth_id, sid, uid, gid, or name")
+            raise ValueError(
+                f"Unknown id_type: {id_type}. Must be auth_id, sid, uid, gid, or name"
+            )
 
         try:
-            async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+            async with session.post(
+                url, json=payload, ssl=self.ssl_context
+            ) as response:
                 if response.status == 200:
                     result = await response.json()
                     result["resolved"] = True
@@ -1168,7 +1318,7 @@ class AsyncQumuloClient:
                         "domain": "UNKNOWN",
                         id_type: identifier,
                         "name": f"Unknown ({id_type}: {identifier})",
-                        "resolved": False
+                        "resolved": False,
                     }
                 else:
                     response.raise_for_status()
@@ -1179,12 +1329,15 @@ class AsyncQumuloClient:
                 id_type: identifier,
                 "name": f"Error resolving {id_type}: {identifier}",
                 "error": str(e),
-                "resolved": False
+                "resolved": False,
             }
 
-    async def resolve_multiple_identities(self, session: aiohttp.ClientSession,
-                                         auth_ids: List[str],
-                                         show_progress: bool = False) -> Dict[str, Dict]:
+    async def resolve_multiple_identities(
+        self,
+        session: aiohttp.ClientSession,
+        auth_ids: List[str],
+        show_progress: bool = False,
+    ) -> Dict[str, Dict]:
         """
         Resolve multiple identities in parallel, using identity expansion to find
         the best name for POSIX UIDs that are linked to AD users.
@@ -1204,11 +1357,16 @@ class AsyncQumuloClient:
             return {}
 
         # Track how many are already cached
-        cached_count = sum(1 for auth_id in unique_ids if auth_id in self.persistent_identity_cache)
+        cached_count = sum(
+            1 for auth_id in unique_ids if auth_id in self.persistent_identity_cache
+        )
         to_resolve_count = len(unique_ids) - cached_count
 
         if show_progress:
-            print(f"[INFO] Resolving {len(unique_ids)} unique owner identities ({cached_count} cached, {to_resolve_count} to fetch)...", file=sys.stderr)
+            print(
+                f"[INFO] Resolving {len(unique_ids)} unique owner identities ({cached_count} cached, {to_resolve_count} to fetch)...",
+                file=sys.stderr,
+            )
 
         start_time = time.time()
 
@@ -1224,8 +1382,14 @@ class AsyncQumuloClient:
         if show_progress:
             elapsed = time.time() - start_time
             avg_time = elapsed / len(unique_ids) if len(unique_ids) > 0 else 0
-            print(f"[INFO] Identity resolution completed in {elapsed:.1f}s ({avg_time*1000:.1f}ms per identity)", file=sys.stderr)
-            print(f"[INFO] Cache stats - Hits: {self.cache_hits}, Misses: {self.cache_misses}, Hit rate: {self.cache_hits/(self.cache_hits+self.cache_misses)*100:.1f}%", file=sys.stderr)
+            print(
+                f"[INFO] Identity resolution completed in {elapsed:.1f}s ({avg_time*1000:.1f}ms per identity)",
+                file=sys.stderr,
+            )
+            print(
+                f"[INFO] Cache stats - Hits: {self.cache_hits}, Misses: {self.cache_misses}, Hit rate: {self.cache_hits/(self.cache_hits+self.cache_misses)*100:.1f}%",
+                file=sys.stderr,
+            )
 
         # Build cache mapping auth_id to result
         identity_cache = {}
@@ -1236,15 +1400,16 @@ class AsyncQumuloClient:
                     "auth_id": auth_id,
                     "name": f"Error: {auth_id}",
                     "error": str(result),
-                    "resolved": False
+                    "resolved": False,
                 }
             else:
                 identity_cache[auth_id] = result
 
         return identity_cache
 
-    async def _resolve_identity_with_expansion(self, session: aiohttp.ClientSession,
-                                               auth_id: str) -> Dict:
+    async def _resolve_identity_with_expansion(
+        self, session: aiohttp.ClientSession, auth_id: str
+    ) -> Dict:
         """
         Resolve an identity using expansion to find the best displayable name.
 
@@ -1274,48 +1439,54 @@ class AsyncQumuloClient:
         payload = {"id": {"auth_id": str(auth_id)}}
 
         try:
-            async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+            async with session.post(
+                url, json=payload, ssl=self.ssl_context
+            ) as response:
                 if response.status == 200:
                     expand_result = await response.json()
 
                     # Extract the primary identity (the one we queried for)
-                    primary_identity = expand_result.get('id', {})
+                    primary_identity = expand_result.get("id", {})
 
                     # Check if we got a name from the primary identity
                     best_identity = primary_identity.copy()
-                    best_identity['auth_id'] = auth_id
-                    best_identity['resolved'] = True
+                    best_identity["auth_id"] = auth_id
+                    best_identity["resolved"] = True
 
                     # If the primary identity doesn't have a name, check equivalent identities
-                    if not primary_identity.get('name'):
+                    if not primary_identity.get("name"):
                         # Look through equivalent identities to find one with a name
                         # Prefer AD identities over POSIX identities
-                        equivalent_ids = expand_result.get('equivalent_ids', [])
+                        equivalent_ids = expand_result.get("equivalent_ids", [])
 
                         # Sort equivalent identities by preference: AD > LOCAL > POSIX
                         def identity_preference(identity):
-                            domain = identity.get('domain', '')
-                            if domain == 'ACTIVE_DIRECTORY':
+                            domain = identity.get("domain", "")
+                            if domain == "ACTIVE_DIRECTORY":
                                 return 0
-                            elif domain == 'LOCAL':
+                            elif domain == "LOCAL":
                                 return 1
-                            elif domain in ['POSIX_USER', 'POSIX_GROUP']:
+                            elif domain in ["POSIX_USER", "POSIX_GROUP"]:
                                 return 2
                             else:
                                 return 3
 
-                        sorted_identities = sorted(equivalent_ids, key=identity_preference)
+                        sorted_identities = sorted(
+                            equivalent_ids, key=identity_preference
+                        )
 
                         # Find the first equivalent identity with a name
                         for equiv_identity in sorted_identities:
-                            if equiv_identity.get('name'):
+                            if equiv_identity.get("name"):
                                 # Found a better name - use this identity info
                                 # But keep the original auth_id and domain info
-                                best_identity['name'] = equiv_identity['name']
+                                best_identity["name"] = equiv_identity["name"]
                                 # Keep track of both domains for display
-                                if primary_identity.get('domain'):
-                                    best_identity['domain'] = primary_identity['domain']
-                                best_identity['display_domain'] = equiv_identity.get('domain')
+                                if primary_identity.get("domain"):
+                                    best_identity["domain"] = primary_identity["domain"]
+                                best_identity["display_domain"] = equiv_identity.get(
+                                    "domain"
+                                )
                                 break
 
                     # Store in cache for future use
@@ -1339,10 +1510,13 @@ class AsyncQumuloClient:
             self.persistent_identity_cache[auth_id] = result
             return result
 
-    async def show_directory_stats(self, session: aiohttp.ClientSession,
-                                   path: str,
-                                   max_depth: int = 1,
-                                   current_depth: int = 0) -> None:
+    async def show_directory_stats(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        max_depth: int = 1,
+        current_depth: int = 0,
+    ) -> None:
         """
         Display directory statistics without enumerating entries.
         Uses aggregates API for fast exploration.
@@ -1356,31 +1530,35 @@ class AsyncQumuloClient:
         # Get aggregates
         aggregates = await self.get_directory_aggregates(session, path)
 
-        if 'error' in aggregates:
+        if "error" in aggregates:
             print(f"\nDirectory: {path}")
             print("  (Unable to retrieve statistics)")
             return
 
         # Display statistics
-        total_files = int(aggregates.get('total_files', 0))
-        total_dirs = int(aggregates.get('total_directories', 0))
+        total_files = int(aggregates.get("total_files", 0))
+        total_dirs = int(aggregates.get("total_directories", 0))
         total_entries = total_files + total_dirs
-        total_capacity = int(aggregates.get('total_capacity', 0))
-        oldest_time = aggregates.get('oldest_modification_time', 'Unknown')
-        newest_time = aggregates.get('newest_modification_time', 'Unknown')
+        total_capacity = int(aggregates.get("total_capacity", 0))
+        oldest_time = aggregates.get("oldest_modification_time", "Unknown")
+        newest_time = aggregates.get("newest_modification_time", "Unknown")
 
         # Format times
-        if oldest_time != 'Unknown':
+        if oldest_time != "Unknown":
             try:
-                oldest_dt = datetime.fromisoformat(oldest_time.rstrip('Z').split('.')[0])
-                oldest_time = oldest_dt.strftime('%Y-%m-%d %H:%M:%S')
+                oldest_dt = datetime.fromisoformat(
+                    oldest_time.rstrip("Z").split(".")[0]
+                )
+                oldest_time = oldest_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 pass
 
-        if newest_time != 'Unknown':
+        if newest_time != "Unknown":
             try:
-                newest_dt = datetime.fromisoformat(newest_time.rstrip('Z').split('.')[0])
-                newest_time = newest_dt.strftime('%Y-%m-%d %H:%M:%S')
+                newest_dt = datetime.fromisoformat(
+                    newest_time.rstrip("Z").split(".")[0]
+                )
+                newest_time = newest_dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 pass
 
@@ -1389,7 +1567,9 @@ class AsyncQumuloClient:
         # Print with indentation based on depth
         indent = "  " * current_depth
         print(f"\n{indent}Directory: {path}")
-        print(f"{indent}  Total entries: {total_entries:,} ({total_files:,} files, {total_dirs:,} directories)")
+        print(
+            f"{indent}  Total entries: {total_entries:,} ({total_files:,} files, {total_dirs:,} directories)"
+        )
         print(f"{indent}  Total size: {format_bytes(total_capacity)}")
         print(f"{indent}  Modification time range: {oldest_time} to {newest_time}")
         if total_files > 0:
@@ -1400,17 +1580,25 @@ class AsyncQumuloClient:
             # Enumerate immediate children only (just to get directory names)
             try:
                 entries = await self.enumerate_directory(session, path)
-                subdirs = [e for e in entries if e.get('type') == 'FS_FILE_TYPE_DIRECTORY']
+                subdirs = [
+                    e for e in entries if e.get("type") == "FS_FILE_TYPE_DIRECTORY"
+                ]
 
                 for subdir in subdirs:
-                    subdir_path = subdir['path']
-                    await self.show_directory_stats(session, subdir_path, max_depth, current_depth + 1)
+                    subdir_path = subdir["path"]
+                    await self.show_directory_stats(
+                        session, subdir_path, max_depth, current_depth + 1
+                    )
             except Exception as e:
                 if self.verbose:
-                    print(f"{indent}  [ERROR] Failed to enumerate subdirectories: {e}", file=sys.stderr)
+                    print(
+                        f"{indent}  [ERROR] Failed to enumerate subdirectories: {e}",
+                        file=sys.stderr,
+                    )
 
-    async def expand_identity(self, session: aiohttp.ClientSession,
-                             auth_id: str) -> List[str]:
+    async def expand_identity(
+        self, session: aiohttp.ClientSession, auth_id: str
+    ) -> List[str]:
         """
         Expand an identity to all equivalent auth_ids.
 
@@ -1426,7 +1614,9 @@ class AsyncQumuloClient:
         payload = {"auth_id": auth_id}
 
         try:
-            async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+            async with session.post(
+                url, json=payload, ssl=self.ssl_context
+            ) as response:
                 if response.status == 200:
                     result = await response.json()
 
@@ -1434,23 +1624,23 @@ class AsyncQumuloClient:
                     equivalent_ids = [auth_id]  # Include original
 
                     # Add from equivalent_ids array
-                    for equiv in result.get('equivalent_ids', []):
-                        equiv_auth_id = equiv.get('auth_id')
+                    for equiv in result.get("equivalent_ids", []):
+                        equiv_auth_id = equiv.get("auth_id")
                         if equiv_auth_id and equiv_auth_id not in equivalent_ids:
                             equivalent_ids.append(equiv_auth_id)
 
                     # Add from nfs_id
-                    nfs_auth_id = result.get('nfs_id', {}).get('auth_id')
+                    nfs_auth_id = result.get("nfs_id", {}).get("auth_id")
                     if nfs_auth_id and nfs_auth_id not in equivalent_ids:
                         equivalent_ids.append(nfs_auth_id)
 
                     # Add from smb_id
-                    smb_auth_id = result.get('smb_id', {}).get('auth_id')
+                    smb_auth_id = result.get("smb_id", {}).get("auth_id")
                     if smb_auth_id and smb_auth_id not in equivalent_ids:
                         equivalent_ids.append(smb_auth_id)
 
                     # Add from id
-                    id_auth_id = result.get('id', {}).get('auth_id')
+                    id_auth_id = result.get("id", {}).get("auth_id")
                     if id_auth_id and id_auth_id not in equivalent_ids:
                         equivalent_ids.append(id_auth_id)
 
@@ -1482,20 +1672,20 @@ def parse_trustee(trustee_input: str) -> Dict:
     trustee = trustee_input.strip()
 
     # Windows SID format
-    if trustee.startswith('S-') and len(trustee.split('-')) >= 3:
+    if trustee.startswith("S-") and len(trustee.split("-")) >= 3:
         return {"payload": {"sid": trustee}, "type": "sid"}
 
     # Explicit type prefixes
-    if trustee.startswith('auth_id:'):
+    if trustee.startswith("auth_id:"):
         return {"payload": {"auth_id": trustee[8:]}, "type": "auth_id"}
 
-    if trustee.startswith('uid:'):
+    if trustee.startswith("uid:"):
         try:
             return {"payload": {"uid": int(trustee[4:])}, "type": "uid"}
         except ValueError:
             return {"payload": {"name": trustee}, "type": "name"}
 
-    if trustee.startswith('gid:'):
+    if trustee.startswith("gid:"):
         try:
             return {"payload": {"gid": int(trustee[4:])}, "type": "gid"}
         except ValueError:
@@ -1506,23 +1696,26 @@ def parse_trustee(trustee_input: str) -> Dict:
         return {"payload": {"uid": int(trustee)}, "type": "uid"}
 
     # NetBIOS domain format (DOMAIN\username)
-    if '\\' in trustee:
+    if "\\" in trustee:
         # Need to escape the backslash for JSON
-        domain, username = trustee.split('\\', 1)
+        domain, username = trustee.split("\\", 1)
         return {"payload": {"name": f"{domain}\\\\{username}"}, "type": "name"}
 
     # Email or LDAP DN format
-    if '@' in trustee or trustee.startswith('CN='):
+    if "@" in trustee or trustee.startswith("CN="):
         return {"payload": {"name": trustee}, "type": "name"}
 
     # Domain prefix formats (ad:user, local:user)
-    if ':' in trustee and not trustee.startswith('S-'):
-        prefix, name = trustee.split(':', 1)
+    if ":" in trustee and not trustee.startswith("S-"):
+        prefix, name = trustee.split(":", 1)
         prefix = prefix.lower()
 
-        if prefix in ['ad', 'active_directory']:
-            return {"payload": {"name": name, "domain": "ACTIVE_DIRECTORY"}, "type": "name"}
-        elif prefix == 'local':
+        if prefix in ["ad", "active_directory"]:
+            return {
+                "payload": {"name": name, "domain": "ACTIVE_DIRECTORY"},
+                "type": "name",
+            }
+        elif prefix == "local":
             return {"payload": {"name": name, "domain": "LOCAL"}, "type": "name"}
         else:
             # Unknown prefix, treat as name
@@ -1536,7 +1729,7 @@ def parse_size_to_bytes(size_str: str) -> int:
     """Parse size string (e.g., '100MB', '1.5GiB') to bytes."""
     import re
 
-    match = re.match(r'^([0-9]+\.?[0-9]*)([A-Za-z]*)$', size_str)
+    match = re.match(r"^([0-9]+\.?[0-9]*)([A-Za-z]*)$", size_str)
     if not match:
         raise ValueError(f"Invalid size format: {size_str}")
 
@@ -1544,9 +1737,18 @@ def parse_size_to_bytes(size_str: str) -> int:
     size_unit = match.group(2).lower()
 
     multipliers = {
-        '': 1, 'b': 1,
-        'kb': 1000, 'mb': 1000000, 'gb': 1000000000, 'tb': 1000000000000, 'pb': 1000000000000000,
-        'kib': 1024, 'mib': 1048576, 'gib': 1073741824, 'tib': 1099511627776, 'pib': 1125899906842624
+        "": 1,
+        "b": 1,
+        "kb": 1000,
+        "mb": 1000000,
+        "gb": 1000000000,
+        "tb": 1000000000000,
+        "pb": 1000000000000000,
+        "kib": 1024,
+        "mib": 1048576,
+        "gib": 1073741824,
+        "tib": 1099511627776,
+        "pib": 1125899906842624,
     }
 
     if size_unit not in multipliers:
@@ -1555,7 +1757,9 @@ def parse_size_to_bytes(size_str: str) -> int:
     return int(size_num * multipliers[size_unit])
 
 
-async def resolve_owner_filters(client: AsyncQumuloClient, session: aiohttp.ClientSession, args) -> Optional[Set[str]]:
+async def resolve_owner_filters(
+    client: AsyncQumuloClient, session: aiohttp.ClientSession, args
+) -> Optional[Set[str]]:
     """
     Resolve owner filter arguments to a set of auth_ids to match.
 
@@ -1587,50 +1791,58 @@ async def resolve_owner_filters(client: AsyncQumuloClient, session: aiohttp.Clie
             # UID - resolve by UID
             try:
                 identity = await client.resolve_identity(session, owner, "uid")
-                if identity.get('resolved') and identity.get('auth_id'):
-                    all_auth_ids.add(identity['auth_id'])
+                if identity.get("resolved") and identity.get("auth_id"):
+                    all_auth_ids.add(identity["auth_id"])
             except Exception as e:
                 print(f"[WARN] Failed to resolve UID {owner}: {e}", file=sys.stderr)
         elif owner_type == "ad":
             # Active Directory - resolve by name with AD domain
             payload_info = parse_trustee(f"ad:{owner}")
-            payload = payload_info['payload']
+            payload = payload_info["payload"]
 
             url = f"{client.base_url}/v1/identity/find"
             try:
-                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                async with session.post(
+                    url, json=payload, ssl=client.ssl_context
+                ) as response:
                     if response.status == 200:
                         identity = await response.json()
-                        if identity.get('auth_id'):
-                            all_auth_ids.add(identity['auth_id'])
+                        if identity.get("auth_id"):
+                            all_auth_ids.add(identity["auth_id"])
             except Exception as e:
                 print(f"[WARN] Failed to resolve AD user {owner}: {e}", file=sys.stderr)
         elif owner_type == "local":
             # Local - resolve by name with LOCAL domain
             payload_info = parse_trustee(f"local:{owner}")
-            payload = payload_info['payload']
+            payload = payload_info["payload"]
 
             url = f"{client.base_url}/v1/identity/find"
             try:
-                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                async with session.post(
+                    url, json=payload, ssl=client.ssl_context
+                ) as response:
                     if response.status == 200:
                         identity = await response.json()
-                        if identity.get('auth_id'):
-                            all_auth_ids.add(identity['auth_id'])
+                        if identity.get("auth_id"):
+                            all_auth_ids.add(identity["auth_id"])
             except Exception as e:
-                print(f"[WARN] Failed to resolve local user {owner}: {e}", file=sys.stderr)
+                print(
+                    f"[WARN] Failed to resolve local user {owner}: {e}", file=sys.stderr
+                )
         else:
             # Auto-detect - parse and resolve
             payload_info = parse_trustee(owner)
-            payload = payload_info['payload']
+            payload = payload_info["payload"]
 
             url = f"{client.base_url}/v1/identity/find"
             try:
-                async with session.post(url, json=payload, ssl=client.ssl_context) as response:
+                async with session.post(
+                    url, json=payload, ssl=client.ssl_context
+                ) as response:
                     if response.status == 200:
                         identity = await response.json()
-                        if identity.get('auth_id'):
-                            all_auth_ids.add(identity['auth_id'])
+                        if identity.get("auth_id"):
+                            all_auth_ids.add(identity["auth_id"])
             except Exception as e:
                 print(f"[WARN] Failed to resolve owner {owner}: {e}", file=sys.stderr)
 
@@ -1649,7 +1861,9 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     """Create a file filter function based on command-line arguments."""
 
     # Calculate time thresholds (using current UTC time)
-    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)  # Convert to timezone-naive for comparison
+    now_utc = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    )  # Convert to timezone-naive for comparison
     time_threshold_older = None
     time_threshold_newer = None
 
@@ -1662,27 +1876,59 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     field_time_filters = {}
 
     if args.accessed_older_than or args.accessed_newer_than:
-        field_time_filters['access_time'] = {
-            'older': now_utc - timedelta(days=args.accessed_older_than) if args.accessed_older_than else None,
-            'newer': now_utc - timedelta(days=args.accessed_newer_than) if args.accessed_newer_than else None
+        field_time_filters["access_time"] = {
+            "older": (
+                now_utc - timedelta(days=args.accessed_older_than)
+                if args.accessed_older_than
+                else None
+            ),
+            "newer": (
+                now_utc - timedelta(days=args.accessed_newer_than)
+                if args.accessed_newer_than
+                else None
+            ),
         }
 
     if args.modified_older_than or args.modified_newer_than:
-        field_time_filters['modification_time'] = {
-            'older': now_utc - timedelta(days=args.modified_older_than) if args.modified_older_than else None,
-            'newer': now_utc - timedelta(days=args.modified_newer_than) if args.modified_newer_than else None
+        field_time_filters["modification_time"] = {
+            "older": (
+                now_utc - timedelta(days=args.modified_older_than)
+                if args.modified_older_than
+                else None
+            ),
+            "newer": (
+                now_utc - timedelta(days=args.modified_newer_than)
+                if args.modified_newer_than
+                else None
+            ),
         }
 
     if args.created_older_than or args.created_newer_than:
-        field_time_filters['creation_time'] = {
-            'older': now_utc - timedelta(days=args.created_older_than) if args.created_older_than else None,
-            'newer': now_utc - timedelta(days=args.created_newer_than) if args.created_newer_than else None
+        field_time_filters["creation_time"] = {
+            "older": (
+                now_utc - timedelta(days=args.created_older_than)
+                if args.created_older_than
+                else None
+            ),
+            "newer": (
+                now_utc - timedelta(days=args.created_newer_than)
+                if args.created_newer_than
+                else None
+            ),
         }
 
     if args.changed_older_than or args.changed_newer_than:
-        field_time_filters['change_time'] = {
-            'older': now_utc - timedelta(days=args.changed_older_than) if args.changed_older_than else None,
-            'newer': now_utc - timedelta(days=args.changed_newer_than) if args.changed_newer_than else None
+        field_time_filters["change_time"] = {
+            "older": (
+                now_utc - timedelta(days=args.changed_older_than)
+                if args.changed_older_than
+                else None
+            ),
+            "newer": (
+                now_utc - timedelta(days=args.changed_newer_than)
+                if args.changed_newer_than
+                else None
+            ),
         }
 
     # Parse size filters
@@ -1702,14 +1948,14 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
         """Filter function that returns True if entry matches all criteria."""
 
         # File-only filter
-        if args.file_only and entry.get('type') == 'FS_FILE_TYPE_DIRECTORY':
+        if args.file_only and entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
             return False
 
         # Owner filter
         if owner_auth_ids is not None:
             # Get owner from entry - try owner_details first, then owner
-            owner_details = entry.get('owner_details', {})
-            file_owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+            owner_details = entry.get("owner_details", {})
+            file_owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
 
             if not file_owner_auth_id:
                 # No owner info, skip this file
@@ -1721,7 +1967,7 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
 
         # Size filters
         if size_larger is not None or size_smaller is not None:
-            file_size = entry.get('size')
+            file_size = entry.get("size")
             if file_size is None:
                 return False
 
@@ -1730,7 +1976,7 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
 
                 # Add metadata size if requested
                 if include_metadata:
-                    metablocks = entry.get('metablocks')
+                    metablocks = entry.get("metablocks")
                     if metablocks:
                         try:
                             metadata_bytes = int(metablocks) * 4096
@@ -1754,11 +2000,17 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
             try:
                 # Parse Qumulo timestamp format: "2023-01-15T10:30:45.123456789Z"
                 # Remove 'Z' and parse as timezone-naive for comparison
-                file_time = datetime.fromisoformat(time_value.rstrip('Z').split('.')[0])
+                file_time = datetime.fromisoformat(time_value.rstrip("Z").split(".")[0])
 
-                if time_threshold_older is not None and file_time >= time_threshold_older:
+                if (
+                    time_threshold_older is not None
+                    and file_time >= time_threshold_older
+                ):
                     return False
-                if time_threshold_newer is not None and file_time <= time_threshold_newer:
+                if (
+                    time_threshold_newer is not None
+                    and file_time <= time_threshold_newer
+                ):
                     return False
             except (ValueError, AttributeError):
                 return False
@@ -1771,12 +2023,12 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
 
             try:
                 # Parse Qumulo timestamp format
-                file_time = datetime.fromisoformat(time_value.rstrip('Z').split('.')[0])
+                file_time = datetime.fromisoformat(time_value.rstrip("Z").split(".")[0])
 
                 # Check both older and newer thresholds if specified
-                if thresholds['older'] is not None and file_time >= thresholds['older']:
+                if thresholds["older"] is not None and file_time >= thresholds["older"]:
                     return False
-                if thresholds['newer'] is not None and file_time <= thresholds['newer']:
+                if thresholds["newer"] is not None and file_time <= thresholds["newer"]:
                     return False
             except (ValueError, AttributeError):
                 return False  # If parsing fails, reject the file
@@ -1788,7 +2040,7 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
 
 def format_bytes(bytes_value: int) -> str:
     """Format bytes as human-readable string."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
         if bytes_value < 1024.0:
             return f"{bytes_value:.2f} {unit}"
         bytes_value /= 1024.0
@@ -1832,34 +2084,35 @@ def format_owner_name(identity: Dict) -> str:
     if not identity:
         return "Unknown"
 
-    owner_name = identity.get('name', 'Unknown')
-    domain = identity.get('domain', 'UNKNOWN')
+    owner_name = identity.get("name", "Unknown")
+    domain = identity.get("domain", "UNKNOWN")
 
     # For POSIX_USER domain, show UID if available
-    if domain == 'POSIX_USER' and 'uid' in identity:
-        uid = identity.get('uid')
-        if owner_name and owner_name.startswith('Unknown'):
-            return f'UID {uid}'
+    if domain == "POSIX_USER" and "uid" in identity:
+        uid = identity.get("uid")
+        if owner_name and owner_name.startswith("Unknown"):
+            return f"UID {uid}"
         elif owner_name:
-            return f'{owner_name} (UID {uid})'
+            return f"{owner_name} (UID {uid})"
         else:
-            return f'UID {uid}'
+            return f"UID {uid}"
 
     # For POSIX_GROUP domain, show GID if available
-    elif domain == 'POSIX_GROUP' and 'gid' in identity:
-        gid = identity.get('gid')
-        if owner_name and owner_name.startswith('Unknown'):
-            return f'GID {gid}'
+    elif domain == "POSIX_GROUP" and "gid" in identity:
+        gid = identity.get("gid")
+        if owner_name and owner_name.startswith("Unknown"):
+            return f"GID {gid}"
         elif owner_name:
-            return f'{owner_name} (GID {gid})'
+            return f"{owner_name} (GID {gid})"
         else:
-            return f'GID {gid}'
+            return f"GID {gid}"
 
     return owner_name
 
 
-async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerStats,
-                                args, elapsed_time: float):
+async def generate_owner_report(
+    client: AsyncQumuloClient, owner_stats: OwnerStats, args, elapsed_time: float
+):
     """Generate and display ownership report."""
     print("\n" + "=" * 80, file=sys.stderr)
     print("OWNER REPORT", file=sys.stderr)
@@ -1874,7 +2127,9 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
 
     # Resolve all owners in parallel
     async with client.create_session() as session:
-        identity_cache = await client.resolve_multiple_identities(session, all_owners, show_progress=True)
+        identity_cache = await client.resolve_multiple_identities(
+            session, all_owners, show_progress=True
+        )
 
     # Build report data
     report_rows = []
@@ -1887,62 +2142,71 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
         identity = identity_cache.get(owner_auth_id, {})
 
         # Extract owner name, including UID/GID for POSIX users
-        owner_name = identity.get('name', f'Unknown ({owner_auth_id})')
-        domain = identity.get('domain', 'UNKNOWN')
+        owner_name = identity.get("name", f"Unknown ({owner_auth_id})")
+        domain = identity.get("domain", "UNKNOWN")
 
         # For POSIX_USER domain, show UID if available
-        if domain == 'POSIX_USER' and 'uid' in identity:
-            uid = identity.get('uid')
+        if domain == "POSIX_USER" and "uid" in identity:
+            uid = identity.get("uid")
             # If name is generic "Unknown", replace with UID
-            if owner_name and owner_name.startswith('Unknown'):
-                owner_name = f'UID {uid}'
+            if owner_name and owner_name.startswith("Unknown"):
+                owner_name = f"UID {uid}"
             elif owner_name:
                 # Append UID to name
-                owner_name = f'{owner_name} (UID {uid})'
+                owner_name = f"{owner_name} (UID {uid})"
             else:
                 # No name at all, use UID
-                owner_name = f'UID {uid}'
+                owner_name = f"UID {uid}"
 
         # For POSIX_GROUP domain, show GID if available
-        elif domain == 'POSIX_GROUP' and 'gid' in identity:
-            gid = identity.get('gid')
-            if owner_name and owner_name.startswith('Unknown'):
-                owner_name = f'GID {gid}'
+        elif domain == "POSIX_GROUP" and "gid" in identity:
+            gid = identity.get("gid")
+            if owner_name and owner_name.startswith("Unknown"):
+                owner_name = f"GID {gid}"
             elif owner_name:
-                owner_name = f'{owner_name} (GID {gid})'
+                owner_name = f"{owner_name} (GID {gid})"
             else:
                 # No name at all, use GID
-                owner_name = f'GID {gid}'
+                owner_name = f"GID {gid}"
 
-        report_rows.append({
-            'owner': owner_name,
-            'domain': domain,
-            'auth_id': owner_auth_id,
-            'bytes': stats['bytes'],
-            'files': stats['files'],
-            'dirs': stats['dirs']
-        })
+        report_rows.append(
+            {
+                "owner": owner_name,
+                "domain": domain,
+                "auth_id": owner_auth_id,
+                "bytes": stats["bytes"],
+                "files": stats["files"],
+                "dirs": stats["dirs"],
+            }
+        )
 
-        total_bytes += stats['bytes']
-        total_files += stats['files']
-        total_dirs += stats['dirs']
+        total_bytes += stats["bytes"]
+        total_files += stats["files"]
+        total_dirs += stats["dirs"]
 
     # Sort by bytes descending
-    report_rows.sort(key=lambda x: x['bytes'], reverse=True)
+    report_rows.sort(key=lambda x: x["bytes"], reverse=True)
 
     # Print report
-    print(f"\n{'Owner':<30} {'Domain':<20} {'Files':>10} {'Dirs':>8} {'Total Size':>15}", file=sys.stderr)
+    print(
+        f"\n{'Owner':<30} {'Domain':<20} {'Files':>10} {'Dirs':>8} {'Total Size':>15}",
+        file=sys.stderr,
+    )
     print("-" * 90, file=sys.stderr)
 
     for row in report_rows:
-        owner = row['owner'] or 'Unknown'
-        domain = row['domain'] or 'UNKNOWN'
-        print(f"{owner:<30} {domain:<20} {row['files']:>10,} {row['dirs']:>8,} {format_bytes(row['bytes']):>15}",
-              file=sys.stderr)
+        owner = row["owner"] or "Unknown"
+        domain = row["domain"] or "UNKNOWN"
+        print(
+            f"{owner:<30} {domain:<20} {row['files']:>10,} {row['dirs']:>8,} {format_bytes(row['bytes']):>15}",
+            file=sys.stderr,
+        )
 
     print("-" * 90, file=sys.stderr)
-    print(f"{'TOTAL':<30} {'':<20} {total_files:>10,} {total_dirs:>8,} {format_bytes(total_bytes):>15}",
-          file=sys.stderr)
+    print(
+        f"{'TOTAL':<30} {'':<20} {total_files:>10,} {total_dirs:>8,} {format_bytes(total_bytes):>15}",
+        file=sys.stderr,
+    )
 
     print(f"\nProcessing time: {elapsed_time:.2f}s", file=sys.stderr)
     rate = (total_files + total_dirs) / elapsed_time if elapsed_time > 0 else 0
@@ -1952,8 +2216,10 @@ async def generate_owner_report(client: AsyncQumuloClient, owner_stats: OwnerSta
     total_lookups = client.cache_hits + client.cache_misses
     if total_lookups > 0:
         hit_rate = (client.cache_hits / total_lookups) * 100
-        print(f"\nIdentity cache: {client.cache_hits} hits, {client.cache_misses} misses ({hit_rate:.1f}% hit rate)",
-              file=sys.stderr)
+        print(
+            f"\nIdentity cache: {client.cache_hits} hits, {client.cache_misses} misses ({hit_rate:.1f}% hit rate)",
+            file=sys.stderr,
+        )
 
     print("=" * 80, file=sys.stderr)
 
@@ -1981,8 +2247,10 @@ async def main_async(args):
         creds = get_credentials(credential_store_filename())
 
     if not creds:
-        print("\n[ERROR] No credentials found. Please run 'qq --host <cluster> login' first.",
-              file=sys.stderr)
+        print(
+            "\n[ERROR] No credentials found. Please run 'qq --host <cluster> login' first.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     bearer_token = creds.bearer_token
@@ -1991,9 +2259,15 @@ async def main_async(args):
     identity_cache = load_identity_cache(verbose=args.verbose)
 
     # Create client with identity cache
-    client = AsyncQumuloClient(args.host, args.port, bearer_token,
-                               args.max_concurrent, args.connector_limit,
-                               identity_cache=identity_cache, verbose=args.verbose)
+    client = AsyncQumuloClient(
+        args.host,
+        args.port,
+        bearer_token,
+        args.max_concurrent,
+        args.connector_limit,
+        identity_cache=identity_cache,
+        verbose=args.verbose,
+    )
 
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
@@ -2025,14 +2299,21 @@ async def main_async(args):
             owner_auth_ids = await resolve_owner_filters(client, session, args)
 
         if profiler:
-            profiler.record_sync('owner_identity_resolution', time.time() - resolve_start)
+            profiler.record_sync(
+                "owner_identity_resolution", time.time() - resolve_start
+            )
 
         if owner_auth_ids:
-            print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+            print(
+                f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr
+            )
             if args.verbose:
                 print(f"Owner auth_ids: {', '.join(owner_auth_ids)}", file=sys.stderr)
         else:
-            print("[WARN] No valid owners resolved - no files will match!", file=sys.stderr)
+            print(
+                "[WARN] No valid owners resolved - no files will match!",
+                file=sys.stderr,
+            )
 
     # Create file filter
     file_filter = create_file_filter(args, owner_auth_ids)
@@ -2043,32 +2324,38 @@ async def main_async(args):
     if args.older_than or args.newer_than:
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         time_filter_info = {
-            'time_field': args.time_field,
-            'older_than': now_utc - timedelta(days=args.older_than) if args.older_than else None,
-            'newer_than': now_utc - timedelta(days=args.newer_than) if args.newer_than else None
+            "time_field": args.time_field,
+            "older_than": (
+                now_utc - timedelta(days=args.older_than) if args.older_than else None
+            ),
+            "newer_than": (
+                now_utc - timedelta(days=args.newer_than) if args.newer_than else None
+            ),
         }
 
     # Build size filter info for aggregates-based smart skipping
     size_filter_info = None
     if args.larger_than:
         # Only support --larger-than for smart skipping (min size threshold)
-        size_filter_info = {
-            'min_size': parse_size_to_bytes(args.larger_than)
-        }
+        size_filter_info = {"min_size": parse_size_to_bytes(args.larger_than)}
 
     # PHASE 3.3: Build owner filter info for aggregates-based smart skipping
     owner_filter_info = None
     if owner_auth_ids:
-        owner_filter_info = {
-            'auth_ids': owner_auth_ids
-        }
+        owner_filter_info = {"auth_ids": owner_auth_ids}
 
     # Create progress tracker with optional limit for early exit
-    progress = ProgressTracker(verbose=args.progress, limit=args.limit) if args.progress else None
+    progress = (
+        ProgressTracker(verbose=args.progress, limit=args.limit)
+        if args.progress
+        else None
+    )
 
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
-    owner_stats = OwnerStats(use_capacity=args.use_capacity) if args.owner_report else None
+    owner_stats = (
+        OwnerStats(use_capacity=args.use_capacity) if args.owner_report else None
+    )
 
     # Walk tree and collect matches
     start_time = time.time()
@@ -2086,12 +2373,14 @@ async def main_async(args):
     if not args.owner_report and not args.csv_out and not args.json_out:
         if args.show_owner:
             # Use batched output handler for streaming with owner resolution
-            output_format = 'json' if args.json else 'text'
+            output_format = "json" if args.json else "text"
             batched_handler = BatchedOutputHandler(
                 client, batch_size=100, show_owner=True, output_format=output_format
             )
+
             async def output_callback(entry):
                 await batched_handler.add_entry(entry)
+
         else:
             # Direct streaming output (no owner resolution needed)
             if args.json:
@@ -2099,25 +2388,34 @@ async def main_async(args):
                 async def output_callback(entry):
                     print(json_parser.dumps(entry))
                     sys.stdout.flush()
+
             else:
                 # Plain text to stdout
                 async def output_callback(entry):
-                    print(entry['path'])
+                    print(entry["path"])
                     sys.stdout.flush()
 
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(
-            session, args.path, args.max_depth, progress=progress,
-            file_filter=file_filter, owner_stats=owner_stats,
-            omit_subdirs=args.omit_subdirs, collect_results=collect_results,
-            verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir,
-            time_filter_info=time_filter_info, size_filter_info=size_filter_info,
-            owner_filter_info=owner_filter_info, output_callback=output_callback
+            session,
+            args.path,
+            args.max_depth,
+            progress=progress,
+            file_filter=file_filter,
+            owner_stats=owner_stats,
+            omit_subdirs=args.omit_subdirs,
+            collect_results=collect_results,
+            verbose=args.verbose,
+            max_entries_per_dir=args.max_entries_per_dir,
+            time_filter_info=time_filter_info,
+            size_filter_info=size_filter_info,
+            owner_filter_info=owner_filter_info,
+            output_callback=output_callback,
         )
 
     if profiler:
         tree_walk_time = time.time() - tree_walk_start
-        profiler.record_sync('tree_walking', tree_walk_time)
+        profiler.record_sync("tree_walking", tree_walk_time)
 
     elapsed = time.time() - start_time
 
@@ -2127,7 +2425,10 @@ async def main_async(args):
 
     # Add diagnostic timing
     if args.progress or args.verbose:
-        print(f"[INFO] Tree walk completed, collected {len(matching_files)} matching files", file=sys.stderr)
+        print(
+            f"[INFO] Tree walk completed, collected {len(matching_files)} matching files",
+            file=sys.stderr,
+        )
 
     # Flush any remaining batched output
     if batched_handler:
@@ -2140,15 +2441,17 @@ async def main_async(args):
         # Collect unique owner auth_ids from matching files
         unique_owners = set()
         for entry in matching_files:
-            owner_details = entry.get('owner_details', {})
-            owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+            owner_details = entry.get("owner_details", {})
+            owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
             if owner_auth_id:
                 unique_owners.add(owner_auth_id)
 
         if unique_owners:
             async with client.create_session() as session:
                 identity_cache_for_output = await client.resolve_multiple_identities(
-                    session, list(unique_owners), show_progress=args.verbose or args.progress
+                    session,
+                    list(unique_owners),
+                    show_progress=args.verbose or args.progress,
                 )
 
     # Generate owner report if requested
@@ -2157,7 +2460,7 @@ async def main_async(args):
             report_start = time.time()
         await generate_owner_report(client, owner_stats, args, elapsed)
         if profiler:
-            profiler.record_sync('owner_report_generation', time.time() - report_start)
+            profiler.record_sync("owner_report_generation", time.time() - report_start)
             profiler.print_report(elapsed)
 
         # Save identity cache before exiting
@@ -2167,8 +2470,11 @@ async def main_async(args):
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
         if args.verbose:
-            print(f"\n[INFO] Limiting results to {args.limit} files (found {len(matching_files)})", file=sys.stderr)
-        matching_files = matching_files[:args.limit]
+            print(
+                f"\n[INFO] Limiting results to {args.limit} files (found {len(matching_files)})",
+                file=sys.stderr,
+            )
+        matching_files = matching_files[: args.limit]
 
     # Output results
     if profiler:
@@ -2177,23 +2483,29 @@ async def main_async(args):
     if args.csv_out:
         # CSV output
         import csv
-        with open(args.csv_out, 'w', newline='') as csv_file:
+
+        with open(args.csv_out, "w", newline="") as csv_file:
             if not matching_files:
                 if args.verbose:
-                    print(f"[INFO] No matching files found, CSV file will be empty", file=sys.stderr)
+                    print(
+                        f"[INFO] No matching files found, CSV file will be empty",
+                        file=sys.stderr,
+                    )
                 return
 
             if args.all_attributes:
                 # Add resolved owner name to entries if --show-owner is enabled
                 if args.show_owner:
                     for entry in matching_files:
-                        owner_details = entry.get('owner_details', {})
-                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get(
+                            "owner"
+                        )
                         if owner_auth_id and owner_auth_id in identity_cache_for_output:
                             identity = identity_cache_for_output[owner_auth_id]
-                            entry['owner_name'] = format_owner_name(identity)
+                            entry["owner_name"] = format_owner_name(identity)
                         else:
-                            entry['owner_name'] = 'Unknown'
+                            entry["owner_name"] = "Unknown"
 
                 # Write all attributes
                 fieldnames = sorted(matching_files[0].keys())
@@ -2203,7 +2515,7 @@ async def main_async(args):
                     writer.writerow(entry)
             else:
                 # Write selective fields
-                fieldnames = ['path']
+                fieldnames = ["path"]
 
                 # Add time field if time filter was used
                 if args.older_than or args.newer_than:
@@ -2211,32 +2523,39 @@ async def main_async(args):
 
                 # Add size if size filter was used
                 if args.larger_than or args.smaller_than:
-                    fieldnames.append('size')
+                    fieldnames.append("size")
 
                 # Add owner if --show-owner is enabled
                 if args.show_owner:
-                    fieldnames.append('owner')
+                    fieldnames.append("owner")
 
-                writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
+                writer = csv.DictWriter(
+                    csv_file, fieldnames=fieldnames, extrasaction="ignore"
+                )
                 writer.writeheader()
                 for entry in matching_files:
-                    row = {'path': entry['path']}
+                    row = {"path": entry["path"]}
                     if args.older_than or args.newer_than:
                         row[args.time_field] = entry.get(args.time_field)
                     if args.larger_than or args.smaller_than:
-                        row['size'] = entry.get('size')
+                        row["size"] = entry.get("size")
                     if args.show_owner:
-                        owner_details = entry.get('owner_details', {})
-                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get(
+                            "owner"
+                        )
                         if owner_auth_id and owner_auth_id in identity_cache_for_output:
                             identity = identity_cache_for_output[owner_auth_id]
-                            row['owner'] = format_owner_name(identity)
+                            row["owner"] = format_owner_name(identity)
                         else:
-                            row['owner'] = 'Unknown'
+                            row["owner"] = "Unknown"
                     writer.writerow(row)
 
         if args.verbose:
-            print(f"\n[INFO] Wrote {len(matching_files)} results to {args.csv_out}", file=sys.stderr)
+            print(
+                f"\n[INFO] Wrote {len(matching_files)} results to {args.csv_out}",
+                file=sys.stderr,
+            )
     elif args.json or args.json_out:
         # JSON output
         # Skip if batched_handler was used (already output via streaming)
@@ -2245,36 +2564,40 @@ async def main_async(args):
         else:
             output_handle = sys.stdout
             if args.json_out:
-                output_handle = open(args.json_out, 'w')
+                output_handle = open(args.json_out, "w")
 
             for entry in matching_files:
                 if args.all_attributes:
                     # Add resolved owner name to entry if --show-owner is enabled
                     if args.show_owner:
-                        owner_details = entry.get('owner_details', {})
-                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get(
+                            "owner"
+                        )
                         if owner_auth_id and owner_auth_id in identity_cache_for_output:
                             identity = identity_cache_for_output[owner_auth_id]
-                            entry['owner_name'] = format_owner_name(identity)
+                            entry["owner_name"] = format_owner_name(identity)
                         else:
-                            entry['owner_name'] = 'Unknown'
-                    output_handle.write(json_parser.dumps(entry) + '\n')
+                            entry["owner_name"] = "Unknown"
+                    output_handle.write(json_parser.dumps(entry) + "\n")
                 else:
                     # Minimal output: path and filtered fields
-                    minimal_entry = {'path': entry['path']}
+                    minimal_entry = {"path": entry["path"]}
                     if args.older_than or args.newer_than:
                         minimal_entry[args.time_field] = entry.get(args.time_field)
                     if args.larger_than or args.smaller_than:
-                        minimal_entry['size'] = entry.get('size')
+                        minimal_entry["size"] = entry.get("size")
                     if args.show_owner:
-                        owner_details = entry.get('owner_details', {})
-                        owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get(
+                            "owner"
+                        )
                         if owner_auth_id and owner_auth_id in identity_cache_for_output:
                             identity = identity_cache_for_output[owner_auth_id]
-                            minimal_entry['owner'] = format_owner_name(identity)
+                            minimal_entry["owner"] = format_owner_name(identity)
                         else:
-                            minimal_entry['owner'] = 'Unknown'
-                    output_handle.write(json_parser.dumps(minimal_entry) + '\n')
+                            minimal_entry["owner"] = "Unknown"
+                    output_handle.write(json_parser.dumps(minimal_entry) + "\n")
 
             if args.json_out:
                 output_handle.close()
@@ -2284,12 +2607,12 @@ async def main_async(args):
         # Only output if we didn't use streaming callback (which already printed results)
         if output_callback is None:
             for entry in matching_files:
-                output_line = entry['path']
+                output_line = entry["path"]
 
                 # Add owner information if --show-owner is enabled
                 if args.show_owner:
-                    owner_details = entry.get('owner_details', {})
-                    owner_auth_id = owner_details.get('auth_id') or entry.get('owner')
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                     if owner_auth_id and owner_auth_id in identity_cache_for_output:
                         identity = identity_cache_for_output[owner_auth_id]
                         owner_name = format_owner_name(identity)
@@ -2302,14 +2625,20 @@ async def main_async(args):
     # Record output timing
     if profiler:
         output_time = time.time() - output_start
-        profiler.record_sync('output_generation', output_time)
+        profiler.record_sync("output_generation", output_time)
 
     # Summary
     if args.verbose:
-        print(f"\n[INFO] Processed {progress.total_objects if progress else 'N/A'} objects in {elapsed:.2f}s",
-              file=sys.stderr)
+        print(
+            f"\n[INFO] Processed {progress.total_objects if progress else 'N/A'} objects in {elapsed:.2f}s",
+            file=sys.stderr,
+        )
         print(f"[INFO] Found {len(matching_files)} matching files", file=sys.stderr)
-        rate = (progress.total_objects if progress else len(matching_files)) / elapsed if elapsed > 0 else 0
+        rate = (
+            (progress.total_objects if progress else len(matching_files)) / elapsed
+            if elapsed > 0
+            else 0
+        )
         print(f"[INFO] Processing rate: {rate:.1f} obj/sec", file=sys.stderr)
 
     # Print profiling report
@@ -2322,7 +2651,7 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Qumulo File Filter - Async Python implementation with aiohttp',
+        description="Qumulo File Filter - Async Python implementation with aiohttp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2337,136 +2666,239 @@ Examples:
 
   # Output to JSON file
   ./qumulo_file_filter_async.py --host cluster.example.com --path /home --older-than 30 --json-out results.json --all-attributes
-        """
+        """,
     )
 
     # Required arguments
-    parser.add_argument('--host', required=True,
-                       help='Qumulo cluster hostname or IP')
-    parser.add_argument('--path', required=True,
-                       help='Path to search')
+    parser.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
+    parser.add_argument("--path", required=True, help="Path to search")
 
     # Time filters
-    parser.add_argument('--older-than', type=int,
-                       help='Find files older than N days')
-    parser.add_argument('--newer-than', type=int,
-                       help='Find files newer than N days')
+    parser.add_argument("--older-than", type=int, help="Find files older than N days")
+    parser.add_argument("--newer-than", type=int, help="Find files newer than N days")
 
     # Time field selection
-    parser.add_argument('--time-field', default='creation_time',
-                       choices=['creation_time', 'modification_time', 'access_time', 'change_time'],
-                       help='Time field to filter on (default: creation_time)')
-    parser.add_argument('--created', action='store_const', const='creation_time', dest='time_field',
-                       help='Filter by creation time')
-    parser.add_argument('--modified', action='store_const', const='modification_time', dest='time_field',
-                       help='Filter by modification time')
-    parser.add_argument('--accessed', action='store_const', const='access_time', dest='time_field',
-                       help='Filter by access time')
-    parser.add_argument('--changed', action='store_const', const='change_time', dest='time_field',
-                       help='Filter by change time')
+    parser.add_argument(
+        "--time-field",
+        default="creation_time",
+        choices=["creation_time", "modification_time", "access_time", "change_time"],
+        help="Time field to filter on (default: creation_time)",
+    )
+    parser.add_argument(
+        "--created",
+        action="store_const",
+        const="creation_time",
+        dest="time_field",
+        help="Filter by creation time",
+    )
+    parser.add_argument(
+        "--modified",
+        action="store_const",
+        const="modification_time",
+        dest="time_field",
+        help="Filter by modification time",
+    )
+    parser.add_argument(
+        "--accessed",
+        action="store_const",
+        const="access_time",
+        dest="time_field",
+        help="Filter by access time",
+    )
+    parser.add_argument(
+        "--changed",
+        action="store_const",
+        const="change_time",
+        dest="time_field",
+        help="Filter by change time",
+    )
 
     # Field-specific time filters (all use AND logic)
-    parser.add_argument('--accessed-older-than', type=int,
-                       help='Find files with access time older than N days')
-    parser.add_argument('--accessed-newer-than', type=int,
-                       help='Find files with access time newer than N days')
-    parser.add_argument('--modified-older-than', type=int,
-                       help='Find files with modification time older than N days')
-    parser.add_argument('--modified-newer-than', type=int,
-                       help='Find files with modification time newer than N days')
-    parser.add_argument('--created-older-than', type=int,
-                       help='Find files with creation time older than N days')
-    parser.add_argument('--created-newer-than', type=int,
-                       help='Find files with creation time newer than N days')
-    parser.add_argument('--changed-older-than', type=int,
-                       help='Find files with change time older than N days')
-    parser.add_argument('--changed-newer-than', type=int,
-                       help='Find files with change time newer than N days')
+    parser.add_argument(
+        "--accessed-older-than",
+        type=int,
+        help="Find files with access time older than N days",
+    )
+    parser.add_argument(
+        "--accessed-newer-than",
+        type=int,
+        help="Find files with access time newer than N days",
+    )
+    parser.add_argument(
+        "--modified-older-than",
+        type=int,
+        help="Find files with modification time older than N days",
+    )
+    parser.add_argument(
+        "--modified-newer-than",
+        type=int,
+        help="Find files with modification time newer than N days",
+    )
+    parser.add_argument(
+        "--created-older-than",
+        type=int,
+        help="Find files with creation time older than N days",
+    )
+    parser.add_argument(
+        "--created-newer-than",
+        type=int,
+        help="Find files with creation time newer than N days",
+    )
+    parser.add_argument(
+        "--changed-older-than",
+        type=int,
+        help="Find files with change time older than N days",
+    )
+    parser.add_argument(
+        "--changed-newer-than",
+        type=int,
+        help="Find files with change time newer than N days",
+    )
 
     # Size filters
-    parser.add_argument('--larger-than',
-                       help='Find files larger than specified size (e.g., 100MB, 1.5GiB)')
-    parser.add_argument('--smaller-than',
-                       help='Find files smaller than specified size')
-    parser.add_argument('--include-metadata', action='store_true',
-                       help='Include metadata blocks in size calculations (metablocks * 4KB)')
+    parser.add_argument(
+        "--larger-than",
+        help="Find files larger than specified size (e.g., 100MB, 1.5GiB)",
+    )
+    parser.add_argument("--smaller-than", help="Find files smaller than specified size")
+    parser.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help="Include metadata blocks in size calculations (metablocks * 4KB)",
+    )
 
     # Owner filters
-    parser.add_argument('--owner', action='append', dest='owners',
-                       help='Filter by file owner (can be specified multiple times for OR logic)')
-    parser.add_argument('--ad', action='store_true',
-                       help='Owner(s) are Active Directory users')
-    parser.add_argument('--local', action='store_true',
-                       help='Owner(s) are local users')
-    parser.add_argument('--uid', action='store_true',
-                       help='Owner(s) are specified as UID numbers')
-    parser.add_argument('--expand-identity', action='store_true',
-                       help='Match all equivalent identities (e.g., AD user + NFS UID)')
-    parser.add_argument('--show-owner', action='store_true',
-                       help='Display owner information for matching files')
-    parser.add_argument('--owner-report', action='store_true',
-                       help='Generate ownership report (file count and total bytes by owner)')
-    parser.add_argument('--use-capacity', action='store_true', default=True,
-                       help='Use actual disk capacity (datablocks + metablocks) instead of logical file size for owner reports (default: True). Handles sparse files correctly.')
-    parser.add_argument('--report-logical-size', dest='use_capacity', action='store_false',
-                       help='Report logical file size instead of actual disk capacity in owner reports')
+    parser.add_argument(
+        "--owner",
+        action="append",
+        dest="owners",
+        help="Filter by file owner (can be specified multiple times for OR logic)",
+    )
+    parser.add_argument(
+        "--ad", action="store_true", help="Owner(s) are Active Directory users"
+    )
+    parser.add_argument("--local", action="store_true", help="Owner(s) are local users")
+    parser.add_argument(
+        "--uid", action="store_true", help="Owner(s) are specified as UID numbers"
+    )
+    parser.add_argument(
+        "--expand-identity",
+        action="store_true",
+        help="Match all equivalent identities (e.g., AD user + NFS UID)",
+    )
+    parser.add_argument(
+        "--show-owner",
+        action="store_true",
+        help="Display owner information for matching files",
+    )
+    parser.add_argument(
+        "--owner-report",
+        action="store_true",
+        help="Generate ownership report (file count and total bytes by owner)",
+    )
+    parser.add_argument(
+        "--use-capacity",
+        action="store_true",
+        default=True,
+        help="Use actual disk capacity (datablocks + metablocks) instead of logical file size for owner reports (default: True). Handles sparse files correctly.",
+    )
+    parser.add_argument(
+        "--report-logical-size",
+        dest="use_capacity",
+        action="store_false",
+        help="Report logical file size instead of actual disk capacity in owner reports",
+    )
 
     # Search options
-    parser.add_argument('--max-depth', type=int,
-                       help='Maximum directory depth to search')
-    parser.add_argument('--file-only', action='store_true',
-                       help='Search files only (exclude directories)')
-    parser.add_argument('--omit-subdirs', action='append',
-                       help='Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)')
-    parser.add_argument('--max-entries-per-dir', type=int,
-                       help='Skip directories with more than N entries (safety valve for large directories)')
-    parser.add_argument('--show-dir-stats', action='store_true',
-                       help='Show directory statistics without enumerating files (exploration mode)')
+    parser.add_argument(
+        "--max-depth", type=int, help="Maximum directory depth to search"
+    )
+    parser.add_argument(
+        "--file-only",
+        action="store_true",
+        help="Search files only (exclude directories)",
+    )
+    parser.add_argument(
+        "--omit-subdirs",
+        action="append",
+        help="Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--max-entries-per-dir",
+        type=int,
+        help="Skip directories with more than N entries (safety valve for large directories)",
+    )
+    parser.add_argument(
+        "--show-dir-stats",
+        action="store_true",
+        help="Show directory statistics without enumerating files (exploration mode)",
+    )
 
     # Output options
-    parser.add_argument('--json', action='store_true',
-                       help='Output results as JSON to stdout')
-    parser.add_argument('--json-out',
-                       help='Write JSON results to file')
-    parser.add_argument('--csv-out',
-                       help='Write results to CSV file (mutually exclusive with --json/--json-out)')
-    parser.add_argument('--all-attributes', action='store_true',
-                       help='Include all file attributes in JSON output')
-    parser.add_argument('--verbose', action='store_true',
-                       help='Show detailed logging')
-    parser.add_argument('--progress', action='store_true',
-                       help='Show real-time progress stats')
-    parser.add_argument('--limit', type=int,
-                       help='Stop after finding N matching results')
-    parser.add_argument('--profile', action='store_true',
-                       help='Enable detailed performance profiling and timing metrics')
+    parser.add_argument(
+        "--json", action="store_true", help="Output results as JSON to stdout"
+    )
+    parser.add_argument("--json-out", help="Write JSON results to file")
+    parser.add_argument(
+        "--csv-out",
+        help="Write results to CSV file (mutually exclusive with --json/--json-out)",
+    )
+    parser.add_argument(
+        "--all-attributes",
+        action="store_true",
+        help="Include all file attributes in JSON output",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Show detailed logging")
+    parser.add_argument(
+        "--progress", action="store_true", help="Show real-time progress stats"
+    )
+    parser.add_argument(
+        "--limit", type=int, help="Stop after finding N matching results"
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable detailed performance profiling and timing metrics",
+    )
 
     # Connection options
-    parser.add_argument('--port', type=int, default=8000,
-                       help='Qumulo API port (default: 8000)')
-    parser.add_argument('--credentials-store',
-                       help='Path to credentials file (default: ~/.qfsd_cred)')
+    parser.add_argument(
+        "--port", type=int, default=8000, help="Qumulo API port (default: 8000)"
+    )
+    parser.add_argument(
+        "--credentials-store", help="Path to credentials file (default: ~/.qfsd_cred)"
+    )
 
     # Performance tuning
-    parser.add_argument('--max-concurrent', type=int, default=100,
-                       help='Maximum concurrent operations (default: 100)')
-    parser.add_argument('--connector-limit', type=int, default=100,
-                       help='Maximum HTTP connections in pool (default: 100)')
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=100,
+        help="Maximum concurrent operations (default: 100)",
+    )
+    parser.add_argument(
+        "--connector-limit",
+        type=int,
+        default=100,
+        help="Maximum HTTP connections in pool (default: 100)",
+    )
 
     args = parser.parse_args()
 
     # Validate arguments
     if args.older_than and args.newer_than and args.newer_than >= args.older_than:
-        print("Error: --newer-than must be less than --older-than for a valid time range",
-              file=sys.stderr)
+        print(
+            "Error: --newer-than must be less than --older-than for a valid time range",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Check for mutually exclusive CSV and JSON output
     if args.csv_out and (args.json or args.json_out):
-        print("Error: --csv-out cannot be used with --json or --json-out",
-              file=sys.stderr)
-        print("Please choose either CSV or JSON output format",
-              file=sys.stderr)
+        print(
+            "Error: --csv-out cannot be used with --json or --json-out", file=sys.stderr
+        )
+        print("Please choose either CSV or JSON output format", file=sys.stderr)
         sys.exit(1)
 
     # Run async main
@@ -2479,9 +2911,10 @@ Examples:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
