@@ -1,4 +1,4 @@
-# grump_walk.py
+# grumpwalk.py
 
 High-performance async file search tool for Qumulo storage systems.
 
@@ -27,32 +27,32 @@ High-performance async file search tool for Qumulo storage systems.
 ## Installation
 
 ```bash
-git clone https://github.com/Joe-Costa/grump-walk.git
-cd grump-walk
-chmod +x grump_walk.py
-pip install aiohttp qumulo_api ujson
+git clone https://github.com/Joe-Costa/grumpwalk.git
+cd grumpwalk
+chmod +x grumpwalk.py
+pip install -r requirements.txt
 ```
 
 ## Quick Examples
 
 ```bash
 # List all files in a directory
-./grump_walk.py --host cluster.example.com --path /home
+./grumpwalk.py --host cluster.example.com --path /home
 
 # Find files older than 30 days
-./grump_walk.py --host cluster.example.com --path /home --older-than 30
+./grumpwalk.py --host cluster.example.com --path /home --older-than 30
 
 # Find large log files with progress
-./grump_walk.py --host cluster.example.com --path /var --name '*.log' --larger-than 100MB --progress
+./grumpwalk.py --host cluster.example.com --path /var --name '*.log' --larger-than 100MB --progress
 
 # Search for Python test files
-./grump_walk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+./grumpwalk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
 
 # Find symlinks and show their targets
-./grump_walk.py --host cluster.example.com --path /home --type symlink --resolve-links
+./grumpwalk.py --host cluster.example.com --path /home --type symlink --resolve-links
 
 # Generate owner capacity report
-./grump_walk.py --host cluster.example.com --path /data --owner-report --csv-out report.csv
+./grumpwalk.py --host cluster.example.com --path /data --owner-report --csv-out report.csv
 ```
 
 ## Command Reference
@@ -161,7 +161,7 @@ pip install aiohttp qumulo_api ujson
 
 ### Complex time range query
 ```bash
-./grump_walk.py --host cluster.example.com --path /data \
+./grumpwalk.py --host cluster.example.com --path /data \
   --accessed-newer-than 30 --accessed-older-than 90 \
   --modified-older-than 180 \
   --larger-than 1GB --progress
@@ -169,7 +169,7 @@ pip install aiohttp qumulo_api ujson
 
 ### Find stale backups, exclude users
 ```bash
-./grump_walk.py --host cluster.example.com --path /backups \
+./grumpwalk.py --host cluster.example.com --path /backups \
   --name '*backup*' --name-and '*2024*' \
   --older-than 365 --larger-than 100MB \
   --omit-subdirs /backups/alice --omit-subdirs /backups/bob \
@@ -178,14 +178,14 @@ pip install aiohttp qumulo_api ujson
 
 ### Capacity report for specific owners
 ```bash
-./grump_walk.py --host cluster.example.com --path /projects \
+./grumpwalk.py --host cluster.example.com --path /projects \
   --owner joe --owner jane --expand-identity \
   --owner-report --csv-out capacity.csv
 ```
 
 ### Find all symlinks and their targets
 ```bash
-./grump_walk.py --host cluster.example.com --path /home \
+./grumpwalk.py --host cluster.example.com --path /home \
   --type symlink --resolve-links --max-depth 2 \
   --csv-out symlinks.csv
 ```
@@ -248,4 +248,4 @@ Joe Costa
 
 ## Contributing
 
-Pull requests welcome at https://github.com/Joe-Costa/grump-walk
+Pull requests welcome at https://github.com/Joe-Costa/grumpwalk
