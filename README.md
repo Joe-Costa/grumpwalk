@@ -98,6 +98,7 @@ pip install -r requirements.txt
 ### Directory Options
 - `--max-depth N` - Maximum directory depth
 - `--omit-subdirs PATTERN` - Skip directories (supports glob and paths, repeatable)
+- `--omit-path PATH` - Skip specific absolute path (must start with `/`, repeatable)
 - `--max-entries-per-dir N` - Skip directories exceeding N entries
 
 ### Symlink Options
@@ -150,12 +151,27 @@ pip install -r requirements.txt
 --name '*report*' --name '*summary*' --name-and '*2024*' --name-and '*.pdf'
 ```
 
-### Path Matching (--omit-subdirs)
+### Path Filtering
+
+**--omit-subdirs** - Pattern-based filtering (supports wildcards):
 ```bash
 --omit-subdirs temp             # Skip any directory named "temp"
---omit-subdirs /home/bob        # Skip specific path
+--omit-subdirs /home/bob        # Skip directories matching this pattern
 --omit-subdirs '/home/*/backup' # Skip backup dirs in all home directories
 ```
+
+**--omit-path** - Exact absolute path filtering (no wildcards):
+```bash
+--omit-path /home/joe/100k      # Skip this exact path only
+--omit-path /data/archive       # Must start with / for filter to work
+--omit-path /tmp/cache          # Can specify multiple paths
+```
+
+**Key differences:**
+- `--omit-subdirs` uses pattern matching (wildcards like `*` and `?`)
+- `--omit-path` requires exact absolute paths starting with `/`
+- Both flags can be used multiple times
+- Both increment the Smart Skip counter for progress tracking
 
 ## Advanced Examples
 
@@ -167,12 +183,12 @@ pip install -r requirements.txt
   --larger-than 1GB --progress
 ```
 
-### Find stale backups, exclude users
+### Find stale backups, exclude specific paths
 ```bash
 ./grumpwalk.py --host cluster.example.com --path /backups \
   --name '*backup*' --name-and '*2024*' \
   --older-than 365 --larger-than 100MB \
-  --omit-subdirs /backups/alice --omit-subdirs /backups/bob \
+  --omit-path /backups/alice --omit-path /backups/bob \
   --csv-out stale-backups.csv
 ```
 
@@ -194,7 +210,7 @@ pip install -r requirements.txt
 
 1. **Use --max-depth** to limit search scope
 2. **Enable --progress** to monitor large searches
-3. **Use --omit-subdirs** to skip known large directories
+3. **Use --omit-subdirs** to skip directories by pattern, or **--omit-path** for exact paths
 4. **Combine filters** - More filters = fewer results to process
 5. **Use --limit** for testing before full runs
 6. **Smart skipping** automatically avoids directories that can't match your filters
