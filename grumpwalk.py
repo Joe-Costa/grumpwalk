@@ -4161,6 +4161,9 @@ async def main_async(args):
         print(f"\n{'=' * 70}", file=sys.stderr)
         print(f"DUPLICATE DETECTION", file=sys.stderr)
         print(f"{'=' * 70}", file=sys.stderr)
+        print(f"WARNING: Results are ADVISORY ONLY.", file=sys.stderr)
+        print(f"Perform additional verification (e.g., full checksums) before deleting files.", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
 
         duplicates = await find_duplicates(
             client,
