@@ -989,6 +989,7 @@ class AsyncQumuloClient:
         file_filter=None,
         owner_stats: Optional[OwnerStats] = None,
         omit_subdirs: Optional[List[str]] = None,
+        omit_paths: Optional[List[str]] = None,
         collect_results: bool = True,
         verbose: bool = False,
         max_entries_per_dir: Optional[int] = None,
@@ -1009,6 +1010,7 @@ class AsyncQumuloClient:
             file_filter: Optional function to filter files
             owner_stats: Optional OwnerStats for collecting ownership data
             omit_subdirs: Optional list of wildcard patterns for directories to skip
+            omit_paths: Optional list of exact absolute paths to skip (no wildcards)
             collect_results: If False, don't accumulate matching entries (saves memory for reports)
             verbose: If True, emit warnings to stderr for large directories
             max_entries_per_dir: If set, skip directories with more entries than this limit
@@ -1296,6 +1298,40 @@ class AsyncQumuloClient:
 
             matching_entries = filtered_entries
 
+        # Filter based on exact absolute paths (--omit-path)
+        if omit_paths:
+            filtered_subdirs = []
+            filtered_entries = []
+            omitted_paths_count = 0
+
+            # Normalize omit_paths by stripping trailing slashes for consistent matching
+            normalized_omit_paths = [p.rstrip("/") for p in omit_paths]
+
+            # Filter subdirectories
+            for subdir_path in subdirs:
+                normalized_subdir = subdir_path.rstrip("/")
+                if normalized_subdir in normalized_omit_paths:
+                    omitted_paths_count += 1
+                else:
+                    filtered_subdirs.append(subdir_path)
+
+            subdirs = filtered_subdirs
+
+            # Report omitted paths to progress tracker
+            if progress and omitted_paths_count > 0:
+                await progress.increment_skipped(0, omitted_paths_count)
+
+            # Also filter matching_entries to remove paths that match
+            for entry in matching_entries:
+                entry_path = entry.get('path', '')
+                normalized_entry_path = entry_path.rstrip("/")
+
+                # Check if this path should be omitted
+                if normalized_entry_path not in normalized_omit_paths:
+                    filtered_entries.append(entry)
+
+            matching_entries = filtered_entries
+
         # Output matches immediately if callback provided
         if output_callback and matching_entries:
             for entry in matching_entries:
@@ -1363,6 +1399,7 @@ class AsyncQumuloClient:
                         file_filter,
                         owner_stats,
                         omit_subdirs,
+                        omit_paths,
                         collect_results,
                         verbose,
                         max_entries_per_dir,
@@ -3346,6 +3383,7 @@ async def main_async(args):
             file_filter=file_filter,
             owner_stats=owner_stats,
             omit_subdirs=args.omit_subdirs,
+            omit_paths=args.omit_path,
             collect_results=collect_results,
             verbose=args.verbose,
             max_entries_per_dir=args.max_entries_per_dir,
@@ -4017,6 +4055,11 @@ Examples:
         "--omit-subdirs",
         action="append",
         help="Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--omit-path",
+        action="append",
+        help="Omit specific absolute paths (exact match, can be specified multiple times)",
     )
     parser.add_argument(
         "--max-entries-per-dir",
