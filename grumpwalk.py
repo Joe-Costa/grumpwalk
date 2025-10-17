@@ -2671,33 +2671,6 @@ def parse_trustee(trustee_input: str) -> Dict:
     return {"payload": {"name": trustee}, "type": "name"}
 
 
-def calculate_confidence_percentage(num_sample_points: int) -> str:
-    """
-    Calculate confidence percentage for duplicate detection based on sample points.
-
-    Args:
-        num_sample_points: Number of sample points used
-
-    Returns:
-        Human-readable confidence string
-    """
-    # Each 64KB sample with SHA-256 has 2^256 possible values
-    # Collision probability for independent samples: 1 / (2^256)^n
-    # For practical purposes, anything beyond 10^-40 is effectively 100%
-
-    # Rough approximation of confidence:
-    # 3 points: 99.999999999999999999999999999999999999999999999999% (10^-50)
-    # 5 points: effectively 100% (10^-80)
-    # 7+ points: effectively 100% (10^-110+)
-
-    if num_sample_points >= 5:
-        return ">99.9999999999999999999999999999%"
-    elif num_sample_points >= 3:
-        return ">99.99999999999999999999999%"
-    else:
-        return ">99.999%"
-
-
 def calculate_sample_points(
     file_size: int,
     sample_points: Optional[int] = None,
@@ -4207,19 +4180,36 @@ async def main_async(args):
             total_groups = len(duplicates)
             total_dupes = sum(len(group) for group in duplicates.values())
 
-            # Calculate confidence based on detection method
+            # Calculate detection method info
             if args.by_size:
                 confidence_msg = "Detection method: Size+metadata only (may have false positives)"
                 confidence_value = "Low (size+metadata only)"
             else:
-                # Get sample point count from first group (representative)
+                # Get sample point count and calculate coverage from first group (representative)
                 first_file = next(iter(duplicates.values()))[0]
                 file_size = int(first_file.get('size', 0))
-                sample_offsets = calculate_sample_points(file_size, args.sample_points)
+                chunk_size = args.sample_size if args.sample_size else 65536
+                sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
                 num_points = len(sample_offsets)
-                confidence = calculate_confidence_percentage(num_points)
-                confidence_msg = f"Detection method: {num_points}-point sampling (confidence: {confidence})"
-                confidence_value = confidence
+
+                # Calculate actual coverage percentage
+                if file_size > 0:
+                    total_sampled = num_points * chunk_size
+                    coverage_pct = min(100.0, (total_sampled / file_size) * 100)
+                    coverage_str = f"{coverage_pct:.1f}%" if coverage_pct < 100 else "100%"
+                else:
+                    coverage_str = "N/A"
+
+                # Human-readable chunk size
+                if chunk_size >= 1048576:
+                    chunk_str = f"{chunk_size / 1048576:.1f}MB".rstrip('0').rstrip('.')
+                elif chunk_size >= 1024:
+                    chunk_str = f"{chunk_size / 1024:.0f}KB"
+                else:
+                    chunk_str = f"{chunk_size}B"
+
+                confidence_msg = f"Detection method: {num_points}-point sampling ({chunk_str} chunks, {coverage_str} coverage)"
+                confidence_value = coverage_str
 
             print(f"\nFound {total_dupes:,} duplicate files in {total_groups:,} groups", file=sys.stderr)
             print(f"{confidence_msg}", file=sys.stderr)
@@ -4229,7 +4219,7 @@ async def main_async(args):
             if args.csv_out:
                 import csv
                 with open(args.csv_out, "w", newline="") as csv_file:
-                    fieldnames = ["duplicate_group", "path", "size", "confidence"]
+                    fieldnames = ["duplicate_group", "path", "size", "coverage"]
                     writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                     writer.writeheader()
 
@@ -4243,7 +4233,7 @@ async def main_async(args):
                                 "duplicate_group": group_id,
                                 "path": f['path'],
                                 "size": file_size,
-                                "confidence": confidence_value
+                                "coverage": confidence_value
                             })
 
                 if args.verbose:
