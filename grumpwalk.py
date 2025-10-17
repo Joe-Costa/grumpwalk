@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import fnmatch
 import json
+import os
 import re
 import ssl
 import sys
@@ -30,16 +31,54 @@ from typing import List, Optional, Dict, Set
 from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 
-# Add the Qumulo CLI directory to path to import auth modules
-CLI_PATH = Path(__file__).parent / "cli" / "cli"
-sys.path.insert(0, str(CLI_PATH))
+# Standalone credential management (no cli/cli/ dependencies)
+CREDENTIALS_FILENAME = '.qfsd_cred'
+CREDENTIALS_VERSION = 1
 
-try:
-    from qumulo.lib.auth import get_credentials, credential_store_filename
-except ImportError as e:
-    print(f"[ERROR] Failed to import Qumulo API modules: {e}", file=sys.stderr)
-    print(f"[ERROR] Make sure the CLI directory exists at: {CLI_PATH}", file=sys.stderr)
-    sys.exit(1)
+
+def credential_store_filename(creds_file_name: str = CREDENTIALS_FILENAME) -> str:
+    """Get the path to the credentials store file."""
+    if os.path.isabs(creds_file_name):
+        return creds_file_name
+
+    home = os.path.expanduser('~')
+    if home == '~':
+        home = os.environ.get('HOME')
+
+    if home is None or home == '~':
+        raise OSError('Could not find home directory for credentials store')
+
+    path = os.path.join(home, creds_file_name)
+    if os.path.isdir(path):
+        raise OSError('Credentials store is a directory: %s' % path)
+    return path
+
+
+def get_credentials(path: str) -> Optional[str]:
+    """
+    Load credentials from file and return bearer token.
+    Returns None if file doesn't exist or is empty.
+    """
+    if not os.path.isfile(path):
+        return None
+
+    try:
+        with open(path) as store:
+            if os.fstat(store.fileno()).st_size == 0:
+                return None
+            contents = json.load(store)
+
+        # Extract bearer_token from the credentials file
+        if 'bearer_token' not in contents:
+            return None
+
+        bearer_token = contents['bearer_token']
+        if not isinstance(bearer_token, str):
+            return None
+
+        return bearer_token
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
 
 try:
     import aiohttp
@@ -63,7 +102,6 @@ except ImportError:
 # Identity cache configuration
 IDENTITY_CACHE_FILE = "file_filter_resolved_identities"
 IDENTITY_CACHE_TTL = 15 * 60  # 15 minutes in seconds
-import os
 
 
 def load_identity_cache(verbose: bool = False) -> Dict:
@@ -399,6 +437,42 @@ class Profiler:
             print(f"  {i+1}. {operation}: {pct:.1f}% of total time", file=sys.stderr)
 
         print("=" * 80, file=sys.stderr)
+
+
+def format_http_error(status: int, url: str, path: Optional[str] = None) -> str:
+    """Format HTTP error with helpful context and suggestions."""
+    error_messages = {
+        401: (
+            "Authentication failed (401 Unauthorized)",
+            "Your credentials may have expired. Please run: qq --host <cluster> login"
+        ),
+        403: (
+            "Access denied (403 Forbidden)",
+            f"You don't have permission to access: {path or url}"
+        ),
+        404: (
+            "Not found (404)",
+            f"Path does not exist: {path or url}"
+        ),
+        429: (
+            "Too many requests (429)",
+            "The cluster is rate-limiting requests. Try reducing --max-concurrent"
+        ),
+        500: (
+            "Internal server error (500)",
+            "The cluster encountered an error. Contact Qumulo support if this persists"
+        ),
+        503: (
+            "Service unavailable (503)",
+            "The cluster is temporarily unavailable. Please try again later"
+        )
+    }
+
+    if status in error_messages:
+        title, suggestion = error_messages[status]
+        return f"\n[ERROR] {title}\n[HINT] {suggestion}"
+    else:
+        return f"\n[ERROR] HTTP {status}: {url}"
 
 
 def extract_pagination_token(api_response: dict) -> Optional[str]:
@@ -3035,18 +3109,16 @@ async def main_async(args):
 
     # Load credentials
     if args.credentials_store:
-        creds = get_credentials(args.credentials_store)
+        bearer_token = get_credentials(args.credentials_store)
     else:
-        creds = get_credentials(credential_store_filename())
+        bearer_token = get_credentials(credential_store_filename())
 
-    if not creds:
+    if not bearer_token:
         print(
             "\n[ERROR] No credentials found. Please run 'qq --host <cluster> login' first.",
             file=sys.stderr,
         )
         sys.exit(1)
-
-    bearer_token = creds.bearer_token
 
     # Load persistent identity cache
     identity_cache = load_identity_cache(verbose=args.verbose)
@@ -3348,56 +3420,136 @@ async def main_async(args):
         if args.acl_csv:
             import csv
 
+            file_acls = acl_report['file_acls']
+
+            # First pass: collect all ACL data and find max number of ACEs
+            acl_rows = []
+            max_aces = 0
+
+            for path, acl_info in file_acls.items():
+                acl_data = acl_info['acl_data']
+                is_directory = acl_info['is_directory']
+
+                # Skip if no ACL data
+                if not acl_data:
+                    continue
+
+                # Generate readable ACL with names if requested
+                if args.acl_resolve_names and identity_cache:
+                    readable_acl = qacl_to_readable_acl_with_names(
+                        acl_data,
+                        is_directory=is_directory,
+                        identity_cache=identity_cache
+                    )
+                else:
+                    readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
+
+                # Extract ACE counts from acl_data
+                acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
+                aces = acl_dict.get('aces', [])
+                ace_count = len(aces)
+                inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
+                explicit_count = ace_count - inherited_count
+
+                # Split trustees
+                trustees = readable_acl.split('|') if readable_acl else []
+                max_aces = max(max_aces, len(trustees))
+
+                acl_rows.append({
+                    'path': path,
+                    'ace_count': ace_count,
+                    'inherited_count': inherited_count,
+                    'explicit_count': explicit_count,
+                    'trustees': trustees
+                })
+
+            # Create CSV with dynamic trustee columns
             with open(args.acl_csv, 'w', newline='') as csv_file:
                 fieldnames = [
                     'path',
                     'ace_count',
                     'inherited_count',
-                    'explicit_count',
-                    'acl_shorthand'
+                    'explicit_count'
                 ]
+                # Add trustee columns dynamically
+                for i in range(1, max_aces + 1):
+                    fieldnames.append(f'trustee_{i}')
 
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 writer.writeheader()
 
-                file_acls = acl_report['file_acls']
+                # Write rows with trustees in separate columns
+                for row_data in acl_rows:
+                    row = {
+                        'path': row_data['path'],
+                        'ace_count': row_data['ace_count'],
+                        'inherited_count': row_data['inherited_count'],
+                        'explicit_count': row_data['explicit_count']
+                    }
+                    # Add each trustee to its own column
+                    for i, trustee in enumerate(row_data['trustees'], start=1):
+                        row[f'trustee_{i}'] = trustee.strip()
 
-                # Generate readable ACLs for CSV
-                for path, acl_info in file_acls.items():
-                    acl_data = acl_info['acl_data']
-                    is_directory = acl_info['is_directory']
-
-                    # Skip if no ACL data
-                    if not acl_data:
-                        continue
-
-                    # Generate readable ACL with names if requested
-                    if args.acl_resolve_names and identity_cache:
-                        readable_acl = qacl_to_readable_acl_with_names(
-                            acl_data,
-                            is_directory=is_directory,
-                            identity_cache=identity_cache
-                        )
-                    else:
-                        readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
-
-                    # Extract ACE counts from acl_data
-                    # Handle nested structure (get_file_acl returns {generated: bool, acl: {...}})
-                    acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
-                    aces = acl_dict.get('aces', [])
-                    ace_count = len(aces)
-                    inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
-                    explicit_count = ace_count - inherited_count
-
-                    writer.writerow({
-                        'path': path,
-                        'ace_count': ace_count,
-                        'inherited_count': inherited_count,
-                        'explicit_count': explicit_count,
-                        'acl_shorthand': readable_acl
-                    })
+                    writer.writerow(row)
 
             print(f"\n[INFO] ACL CSV exported to: {args.acl_csv}", file=sys.stderr)
+
+        # Export to JSON if requested
+        if args.json or args.json_out:
+            output_handle = sys.stdout
+            if args.json_out:
+                output_handle = open(args.json_out, 'w')
+
+            file_acls = acl_report['file_acls']
+
+            # Generate JSON output for ACLs - one entry per file
+            for path, acl_info in file_acls.items():
+                acl_data = acl_info['acl_data']
+                is_directory = acl_info['is_directory']
+
+                # Skip if no ACL data
+                if not acl_data:
+                    continue
+
+                # Generate readable ACL with names if requested
+                if args.acl_resolve_names and identity_cache:
+                    readable_acl = qacl_to_readable_acl_with_names(
+                        acl_data,
+                        is_directory=is_directory,
+                        identity_cache=identity_cache
+                    )
+                else:
+                    readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
+
+                # Extract ACE counts from acl_data
+                acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
+                aces = acl_dict.get('aces', [])
+                ace_count = len(aces)
+                inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
+                explicit_count = ace_count - inherited_count
+
+                # Split the readable ACL by pipe to get individual ACEs
+                ace_entries = readable_acl.split('|') if readable_acl else []
+                trustees = [ace_entry.strip() for ace_entry in ace_entries]
+
+                # Write one JSON entry per file with trustees as array
+                json_entry = {
+                    'path': path,
+                    'ace_count': ace_count,
+                    'inherited_count': inherited_count,
+                    'explicit_count': explicit_count,
+                    'trustees': trustees
+                }
+
+                # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
+                if JSON_PARSER_NAME == "ujson":
+                    output_handle.write(json_parser.dumps(json_entry, ensure_ascii=False, escape_forward_slashes=False) + '\n')
+                else:
+                    output_handle.write(json_parser.dumps(json_entry, ensure_ascii=False) + '\n')
+
+            if args.json_out:
+                output_handle.close()
+                print(f"\n[INFO] ACL JSON exported to: {args.json_out}", file=sys.stderr)
 
         print("\n" + "=" * 70, file=sys.stderr)
 
@@ -3922,11 +4074,31 @@ Examples:
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user", file=sys.stderr)
         sys.exit(130)
+    except aiohttp.ClientResponseError as e:
+        # HTTP error with detailed message
+        error_msg = format_http_error(e.status, str(e.request_info.url), args.path)
+        print(error_msg, file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+    except aiohttp.ClientConnectorError as e:
+        print(f"\n[ERROR] Cannot connect to cluster: {args.host}:{args.port}", file=sys.stderr)
+        print(f"[HINT] Check that the cluster is reachable and the hostname/port are correct", file=sys.stderr)
+        if args.verbose:
+            print(f"[DEBUG] {e}", file=sys.stderr)
+        sys.exit(1)
+    except aiohttp.ClientError as e:
+        print(f"\n[ERROR] Network error: {e}", file=sys.stderr)
+        print(f"[HINT] Check your network connection to the cluster", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         if args.verbose:
             import traceback
-
             traceback.print_exc()
         sys.exit(1)
 
