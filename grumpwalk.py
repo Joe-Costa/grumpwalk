@@ -1225,6 +1225,8 @@ class AsyncQumuloClient:
         # Filter subdirectories based on omit patterns
         if omit_subdirs:
             filtered_subdirs = []
+            filtered_entries = []
+
             for subdir_path in subdirs:
                 # Extract directory name (last component, handling trailing slashes)
                 subdir_name = (
@@ -1250,15 +1252,39 @@ class AsyncQumuloClient:
                         matched_pattern = pattern
                         break
 
-                if should_omit:
-                    # if verbose:
-                    #     print(f"\r[SKIP] Omitting subdirectory: {subdir_path} (matched pattern: {matched_pattern})",
-                    #           file=sys.stderr)
-                    pass
-                else:
+                if not should_omit:
                     filtered_subdirs.append(subdir_path)
 
             subdirs = filtered_subdirs
+
+            # Also filter matching_entries to remove directories that match omit patterns
+            for entry in matching_entries:
+                entry_path = entry.get('path', '')
+                entry_type = entry.get('type', '')
+
+                # Only filter directories
+                if entry_type == 'FS_FILE_TYPE_DIRECTORY':
+                    entry_name = (
+                        entry_path.rstrip("/").split("/")[-1]
+                        if "/" in entry_path
+                        else entry_path
+                    )
+
+                    should_omit = False
+                    for pattern in omit_subdirs:
+                        normalized_pattern = pattern.rstrip("/")
+                        if (fnmatch.fnmatch(entry_path.rstrip("/"), normalized_pattern) or
+                            fnmatch.fnmatch(entry_name, normalized_pattern)):
+                            should_omit = True
+                            break
+
+                    if not should_omit:
+                        filtered_entries.append(entry)
+                else:
+                    # Keep all files
+                    filtered_entries.append(entry)
+
+            matching_entries = filtered_entries
 
         # Output matches immediately if callback provided
         if output_callback and matching_entries:
