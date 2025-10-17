@@ -826,6 +826,46 @@ class AsyncQumuloClient:
             except aiohttp.ClientError:
                 return None
 
+    async def read_file_chunk(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        offset: int,
+        length: int
+    ) -> Optional[bytes]:
+        """
+        Read a chunk of a file at a specific offset.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the file
+            offset: Byte offset to start reading from
+            length: Number of bytes to read
+
+        Returns:
+            Bytes read from the file, or None if read fails
+        """
+        async with self.semaphore:
+            if not path.startswith('/'):
+                path = '/' + path
+
+            encoded_path = quote(path, safe='')
+            url = f"{self.base_url}/v1/files/{encoded_path}/data?offset={offset}&length={length}"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        data = await response.read()
+                        return data
+                    else:
+                        if self.verbose:
+                            print(f"[WARN] Failed to read chunk from {path} at offset {offset}: HTTP {response.status}", file=sys.stderr)
+                        return None
+            except aiohttp.ClientError as e:
+                if self.verbose:
+                    print(f"[WARN] Error reading chunk from {path}: {e}", file=sys.stderr)
+                return None
+
     def calculate_adaptive_concurrency(self, total_entries: int) -> int:
         """
         Calculate adaptive concurrency based on directory size.
@@ -2631,6 +2671,278 @@ def parse_trustee(trustee_input: str) -> Dict:
     return {"payload": {"name": trustee}, "type": "name"}
 
 
+def calculate_confidence_percentage(num_sample_points: int) -> str:
+    """
+    Calculate confidence percentage for duplicate detection based on sample points.
+
+    Args:
+        num_sample_points: Number of sample points used
+
+    Returns:
+        Human-readable confidence string
+    """
+    # Each 64KB sample with SHA-256 has 2^256 possible values
+    # Collision probability for independent samples: 1 / (2^256)^n
+    # For practical purposes, anything beyond 10^-40 is effectively 100%
+
+    # Rough approximation of confidence:
+    # 3 points: 99.999999999999999999999999999999999999999999999999% (10^-50)
+    # 5 points: effectively 100% (10^-80)
+    # 7+ points: effectively 100% (10^-110+)
+
+    if num_sample_points >= 5:
+        return ">99.9999999999999999999999999999%"
+    elif num_sample_points >= 3:
+        return ">99.99999999999999999999999%"
+    else:
+        return ">99.999%"
+
+
+def calculate_sample_points(file_size: int, sample_points: Optional[int] = None) -> List[int]:
+    """
+    Calculate adaptive sample points based on file size.
+
+    Args:
+        file_size: Size of the file in bytes
+        sample_points: Override number of sample points (3-11), or None for adaptive
+
+    Returns:
+        List of byte offsets to sample from
+    """
+    SAMPLE_CHUNK_SIZE = 65536  # 64KB per sample
+
+    # Special case: empty files
+    if file_size == 0:
+        return [0]  # Single sample at offset 0 (will read 0 bytes)
+
+    # User override
+    if sample_points is not None:
+        num_points = max(3, min(11, sample_points))  # Clamp to 3-11
+    else:
+        # Adaptive based on file size
+        if file_size < 1_000_000:  # < 1MB
+            num_points = 3
+        elif file_size < 100_000_000:  # < 100MB
+            num_points = 5
+        elif file_size < 1_000_000_000:  # < 1GB
+            num_points = 7
+        elif file_size < 10_000_000_000:  # < 10GB
+            num_points = 9
+        else:  # >= 10GB
+            num_points = 11
+
+    # Calculate evenly distributed offsets
+    offsets = []
+    for i in range(num_points):
+        # Distribute points evenly: 0%, ~14%, ~28%, ..., ~85%, ~100%
+        position = i / (num_points - 1) if num_points > 1 else 0
+        offset = int(position * file_size)
+
+        # Ensure we don't read past end of file
+        if offset + SAMPLE_CHUNK_SIZE > file_size:
+            offset = max(0, file_size - SAMPLE_CHUNK_SIZE)
+
+        offsets.append(offset)
+
+    # Remove duplicates (can happen with very small files) and sort
+    return sorted(set(offsets))
+
+
+async def compute_sample_hash(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    file_path: str,
+    file_size: int,
+    sample_points: Optional[int] = None
+) -> Optional[str]:
+    """
+    Compute a hash from multiple sample points in a file.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp ClientSession
+        file_path: Path to the file
+        file_size: Size of the file in bytes
+        sample_points: Optional override for number of sample points
+
+    Returns:
+        SHA-256 hash of concatenated samples, or None if failed
+    """
+    import hashlib
+
+    SAMPLE_CHUNK_SIZE = 65536  # 64KB
+
+    offsets = calculate_sample_points(file_size, sample_points)
+
+    # Read all sample points concurrently
+    tasks = []
+    for offset in offsets:
+        task = client.read_file_chunk(session, file_path, offset, SAMPLE_CHUNK_SIZE)
+        tasks.append(task)
+
+    chunks = await asyncio.gather(*tasks)
+
+    # Check if any reads failed
+    if None in chunks:
+        return None
+
+    # Concatenate all chunks and hash
+    combined = b''.join(chunks)
+    hash_digest = hashlib.sha256(combined).hexdigest()
+
+    return hash_digest
+
+
+async def find_duplicates(
+    client: AsyncQumuloClient,
+    files: List[Dict],
+    by_size_only: bool = False,
+    sample_points: Optional[int] = None,
+    progress: Optional['ProgressTracker'] = None
+) -> Dict[str, List[Dict]]:
+    """
+    Find duplicate files using metadata filtering and sample hashing.
+
+    Phase 1: Group by size + datablocks + sparse_file (instant)
+    Phase 2: Compute sample hashes for potential duplicates (fast)
+    Phase 3: Return groups of duplicates
+
+    Args:
+        client: AsyncQumuloClient instance
+        files: List of file entries with metadata
+        by_size_only: If True, only use size for duplicate detection (no hashing)
+        sample_points: Optional override for number of sample points
+        progress: Optional ProgressTracker for status updates
+
+    Returns:
+        Dictionary mapping fingerprint -> list of duplicate files
+    """
+    from collections import defaultdict
+
+    if progress and progress.verbose:
+        print(f"[DUPLICATE DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
+
+    # Phase 1: Group by metadata (size, datablocks, sparse_file)
+    metadata_groups = defaultdict(list)
+
+    for entry in files:
+        size = int(entry.get('size', 0))
+        datablocks = entry.get('datablocks', 'unknown')
+        sparse = entry.get('extended_attributes', {}).get('sparse_file', False)
+
+        # Create metadata fingerprint
+        fingerprint = f"{size}:{datablocks}:{sparse}"
+        metadata_groups[fingerprint].append(entry)
+
+    # Filter to only groups with 2+ files
+    potential_duplicates = {k: v for k, v in metadata_groups.items() if len(v) >= 2}
+
+    if progress and progress.verbose:
+        total_potential = sum(len(v) for v in potential_duplicates.values())
+        print(f"[DUPLICATE DETECTION] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} groups", file=sys.stderr)
+
+    # If size-only mode, return now
+    if by_size_only:
+        return potential_duplicates
+
+    # Phase 2: Compute sample hashes for potential duplicates
+    if progress and progress.verbose:
+        print(f"[DUPLICATE DETECTION] Phase 2: Computing sample hashes", file=sys.stderr)
+
+    hash_groups = defaultdict(list)
+    BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
+
+    # Limit concurrent hash operations to avoid overwhelming connection pool
+    # Each hash operation does N API calls (where N = sample points)
+    # Connection pool size is ~100, so we want: concurrent_hashes * sample_points ≤ 80
+    # This leaves some headroom for other operations
+    # Calculate based on actual sample_points being used
+    avg_sample_points = sample_points if sample_points else 7  # Default adaptive is ~7
+    MAX_CONCURRENT_HASHES = max(10, min(80, 80 // avg_sample_points))
+
+    # Track progress across all groups
+    total_files_to_hash = sum(len(group) for group in potential_duplicates.values())
+    files_hashed = 0
+    hash_start_time = time.time()
+    last_progress_update = time.time()
+    is_tty = sys.stderr.isatty() if progress else False
+
+    # Create semaphore to limit concurrent hash operations
+    hash_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
+
+    async def hash_with_limit(entry, file_path, file_size, sample_points):
+        """Wrapper to limit concurrent hash operations."""
+        async with hash_semaphore:
+            return await compute_sample_hash(client, session, file_path, file_size, sample_points)
+
+    async with client.create_session() as session:
+        for fingerprint, group in potential_duplicates.items():
+            # Extract size from fingerprint
+            size_str = fingerprint.split(':')[0]
+            file_size = int(size_str)
+
+            # Process files in batches
+            for i in range(0, len(group), BATCH_SIZE):
+                batch = group[i:i + BATCH_SIZE]
+
+                # Compute hashes for this batch with concurrency limit
+                tasks = []
+                for entry in batch:
+                    file_path = entry['path']
+                    task = hash_with_limit(entry, file_path, file_size, sample_points)
+                    tasks.append((entry, task))
+
+                # Wait for all hashes in this batch to complete
+                results = await asyncio.gather(*[task for _, task in tasks])
+
+                # Group by hash
+                for (entry, _), sample_hash in zip(tasks, results):
+                    if sample_hash:
+                        # Create combined fingerprint: metadata + hash
+                        combined_fingerprint = f"{fingerprint}:{sample_hash}"
+                        hash_groups[combined_fingerprint].append(entry)
+
+                # Update progress
+                files_hashed += len(batch)
+
+                if progress:
+                    current_time = time.time()
+                    elapsed = current_time - hash_start_time
+                    rate = files_hashed / elapsed if elapsed > 0 else 0
+                    remaining = total_files_to_hash - files_hashed
+
+                    progress_msg = (f"[DUPLICATE DETECTION] {files_hashed:,} / {total_files_to_hash:,} hashed | "
+                                  f"{remaining:,} remaining | {rate:.1f} files/sec")
+
+                    # Only update progress display every 0.5 seconds
+                    if is_tty:
+                        # Always overwrite in TTY mode
+                        print(f"\r{progress_msg}", end='', file=sys.stderr, flush=True)
+                    elif progress.verbose and (current_time - last_progress_update) > 0.5:
+                        # Only print on new line when redirected AND enough time has passed
+                        print(progress_msg, file=sys.stderr, flush=True)
+                        last_progress_update = current_time
+
+    # Print final summary
+    if progress and is_tty:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"\r[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+    elif progress and progress.verbose:
+        elapsed = time.time() - hash_start_time
+        rate = files_hashed / elapsed if elapsed > 0 else 0
+        print(f"[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+
+    # Filter to only groups with 2+ files (actual duplicates)
+    duplicates = {k: v for k, v in hash_groups.items() if len(v) >= 2}
+
+    if progress and progress.verbose:
+        total_duplicates = sum(len(v) for v in duplicates.values())
+        print(f"[DUPLICATE DETECTION] Found {total_duplicates:,} confirmed duplicates in {len(duplicates):,} groups", file=sys.stderr)
+
+    return duplicates
+
+
 def parse_size_to_bytes(size_str: str) -> int:
     """Parse size string (e.g., '100MB', '1.5GiB') to bytes."""
     import re
@@ -3403,16 +3715,17 @@ async def main_async(args):
         tree_walk_start = time.time()
 
     # For owner reports and ACL reports, don't collect matching files to save memory
-    # Also collect results if we need to resolve symlinks or generate ACL reports
-    collect_results = not args.owner_report or args.resolve_links or args.acl_report
+    # Also collect results if we need to resolve symlinks, generate ACL reports, or find duplicates
+    collect_results = not args.owner_report or args.resolve_links or args.acl_report or args.find_duplicates
 
     # Create output callback for streaming results to stdout (plain text mode only)
     # Disable streaming if --resolve-links is enabled (need to resolve after collection)
     # Disable streaming if --acl-report is enabled (generates its own report)
+    # Disable streaming if --find-duplicates is enabled (need to collect all files first)
     output_callback = None
     batched_handler = None
 
-    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links:
+    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_duplicates:
         if args.show_owner or args.show_group:
             # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
@@ -3785,6 +4098,135 @@ async def main_async(args):
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after ACL report
+
+    # Find duplicates if requested
+    if args.find_duplicates:
+        if profiler:
+            dup_start = time.time()
+
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(f"DUPLICATE DETECTION", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
+
+        duplicates = await find_duplicates(
+            client,
+            matching_files,
+            by_size_only=args.by_size,
+            sample_points=args.sample_points,
+            progress=progress
+        )
+
+        if profiler:
+            profiler.record_sync("duplicate_detection", time.time() - dup_start)
+
+        # Report results
+        if not duplicates:
+            print("\nNo duplicates found.", file=sys.stderr)
+            # No duplicates, but may still need to create empty CSV or JSON
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    writer = csv.DictWriter(csv_file, fieldnames=["duplicate_group", "path", "size", "confidence"])
+                    writer.writeheader()
+                if args.verbose:
+                    print(f"\n[INFO] Created empty CSV file: {args.csv_out}", file=sys.stderr)
+            elif args.json_out:
+                # Create empty JSON file
+                with open(args.json_out, "w") as json_file:
+                    pass  # Empty file
+                if args.verbose:
+                    print(f"\n[INFO] Created empty JSON file: {args.json_out}", file=sys.stderr)
+        else:
+            total_groups = len(duplicates)
+            total_dupes = sum(len(group) for group in duplicates.values())
+
+            # Calculate confidence based on detection method
+            if args.by_size:
+                confidence_msg = "Detection method: Size+metadata only (may have false positives)"
+                confidence_value = "Low (size+metadata only)"
+            else:
+                # Get sample point count from first group (representative)
+                first_file = next(iter(duplicates.values()))[0]
+                file_size = int(first_file.get('size', 0))
+                sample_offsets = calculate_sample_points(file_size, args.sample_points)
+                num_points = len(sample_offsets)
+                confidence = calculate_confidence_percentage(num_points)
+                confidence_msg = f"Detection method: {num_points}-point sampling (confidence: {confidence})"
+                confidence_value = confidence
+
+            print(f"\nFound {total_dupes:,} duplicate files in {total_groups:,} groups", file=sys.stderr)
+            print(f"{confidence_msg}", file=sys.stderr)
+            print(f"{'=' * 70}\n", file=sys.stderr)
+
+            # Handle CSV output for duplicates
+            if args.csv_out:
+                import csv
+                with open(args.csv_out, "w", newline="") as csv_file:
+                    fieldnames = ["duplicate_group", "path", "size", "confidence"]
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                    writer.writeheader()
+
+                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                        # Extract size from fingerprint
+                        size_str = fingerprint.split(':')[0]
+                        file_size = int(size_str)
+
+                        for f in files:
+                            writer.writerow({
+                                "duplicate_group": group_id,
+                                "path": f['path'],
+                                "size": file_size,
+                                "confidence": confidence_value
+                            })
+
+                if args.verbose:
+                    print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
+            elif args.json_out or args.json:
+                # Handle JSON output for duplicates
+                output_handle = open(args.json_out, 'w') if args.json_out else sys.stdout
+
+                try:
+                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                        # Extract size from fingerprint
+                        size_str = fingerprint.split(':')[0]
+                        file_size = int(size_str)
+
+                        for f in files:
+                            entry = {
+                                "duplicate_group": group_id,
+                                "path": f['path'],
+                                "size": file_size,
+                                "confidence": confidence_value
+                            }
+
+                            # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
+                            if JSON_PARSER_NAME == "ujson":
+                                output_handle.write(json_parser.dumps(entry, ensure_ascii=False, escape_forward_slashes=False) + '\n')
+                            else:
+                                output_handle.write(json_parser.dumps(entry, ensure_ascii=False) + '\n')
+                finally:
+                    if args.json_out:
+                        output_handle.close()
+                        if args.verbose:
+                            print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.json_out}", file=sys.stderr)
+            else:
+                # Output duplicate groups to stderr (text mode)
+                for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                    # Extract size from fingerprint
+                    size_str = fingerprint.split(':')[0]
+                    file_size = int(size_str)
+
+                    print(f"Group {group_id}: {len(files)} files ({file_size:,} bytes each)", file=sys.stderr)
+                    for f in files:
+                        print(f"  {f['path']}", file=sys.stderr)
+                    print(file=sys.stderr)
+
+        if profiler:
+            profiler.print_report(elapsed)
+
+        # Save identity cache before exiting
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return  # Exit after duplicate detection
 
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
@@ -4299,6 +4741,28 @@ Examples:
         "--acl-resolve-names",
         action="store_true",
         help="Resolve auth_ids and SIDs to human-readable names in ACL report (uses identity cache)",
+    )
+
+    # Duplicate detection options
+    parser.add_argument(
+        "--find-duplicates",
+        action="store_true",
+        help="Find duplicate files using adaptive sampling strategy. "
+             "Groups files by size+datablocks, then computes sample hashes.",
+    )
+    parser.add_argument(
+        "--by-size",
+        action="store_true",
+        help="Use size-only duplicate detection (fast, may have false positives). "
+             "Only valid with --find-duplicates.",
+    )
+    parser.add_argument(
+        "--sample-points",
+        type=int,
+        choices=range(3, 12),
+        metavar="N",
+        help="Override number of sample points for duplicate detection (3-11). "
+             "Default is adaptive based on file size.",
     )
 
     # Output options
