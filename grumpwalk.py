@@ -1226,6 +1226,7 @@ class AsyncQumuloClient:
         if omit_subdirs:
             filtered_subdirs = []
             filtered_entries = []
+            omitted_dirs_count = 0
 
             for subdir_path in subdirs:
                 # Extract directory name (last component, handling trailing slashes)
@@ -1252,10 +1253,19 @@ class AsyncQumuloClient:
                         matched_pattern = pattern
                         break
 
-                if not should_omit:
+                if should_omit:
+                    omitted_dirs_count += 1
+                else:
                     filtered_subdirs.append(subdir_path)
 
             subdirs = filtered_subdirs
+
+            # Report omitted directories to progress tracker
+            if progress and omitted_dirs_count > 0:
+                # We count each omitted directory as 1 subdirectory skipped
+                # We don't have file counts for omitted dirs without fetching their aggregates,
+                # so we report 0 files (the subdirs count is what matters here)
+                await progress.increment_skipped(0, omitted_dirs_count)
 
             # Also filter matching_entries to remove directories that match omit patterns
             for entry in matching_entries:
