@@ -109,7 +109,9 @@ pip install -r requirements.txt
 - `--acl-report` - Generate ACL inventory report
 - `--acl-csv FILE` - Export per-file ACL data to CSV (requires `--acl-report`)
 - `--acl-resolve-names` - Resolve IDs to names in ACL output
-- ACLs are returned in NFSv4 shorthand for brevity and compactness (`rwaxdDtTnNcCoy`).  
+- `--show-owner` - Include owner column in ACL reports (requires `--acl-report`)
+- `--show-group` - Include group column in ACL reports (requires `--acl-report`)
+- ACLs are returned in NFSv4 shorthand for brevity and compactness (`rwaxdDtTnNcCoy`).
 - These rights map directly to the 14 NTFS rights in an ACE
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
 
@@ -220,7 +222,7 @@ pip install -r requirements.txt
 ```bash
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --acl-report --acl-csv permissions.csv \
-  --acl-resolve-names --progress
+  --acl-resolve-names --show-owner --show-group --progress
 ```
 
 ## Performance Tips
@@ -267,16 +269,17 @@ ACL reports export per-file permissions in CSV or JSON format:
 
 **CSV format** (one row per file):
 ```csv
-path,ace_count,inherited_count,explicit_count,trustee_1,trustee_2
-/shared/file.txt,2,0,2,Allow::admin:rwx,Allow:g:users:rx
+path,owner,group,ace_count,inherited_count,explicit_count,trustee_1,trustee_2
+/shared/file.txt,AD\joe,AD\Domain Users,2,0,2,Allow::admin:rwx,Allow:g:users:rx
 ```
 
 **JSON format** (one object per file):
 ```json
-{"path":"/shared/file.txt","ace_count":2,"inherited_count":0,"explicit_count":2,"trustees":["Allow::admin:rwx","Allow:g:users:rx"]}
+{"path":"/shared/file.txt","owner":"AD\\joe","group":"AD\\Domain Users","ace_count":2,"inherited_count":0,"explicit_count":2,"trustees":["Allow::admin:rwx","Allow:g:users:rx"]}
 ```
 
 Use `--acl-resolve-names` to convert auth IDs to readable names (e.g., `joe` instead of `auth_id:1234`).
+Use `--show-owner` and `--show-group` to include owner and group columns in the output.
 
 ## Architecture
 

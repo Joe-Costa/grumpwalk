@@ -288,18 +288,20 @@ class ProgressTracker:
 
 
 class BatchedOutputHandler:
-    """Handle batched output with identity resolution for --show-owner streaming."""
+    """Handle batched output with identity resolution for --show-owner and --show-group streaming."""
 
     def __init__(
         self,
         client: "AsyncQumuloClient",
         batch_size: int = 100,
         show_owner: bool = False,
+        show_group: bool = False,
         output_format: str = "text",
     ):
         self.client = client
         self.batch_size = batch_size
         self.show_owner = show_owner
+        self.show_group = show_group
         self.output_format = output_format  # 'text' or 'json'
         self.batch = []
         self.lock = asyncio.Lock()
@@ -319,21 +321,29 @@ class BatchedOutputHandler:
 
         identity_cache = {}
 
+        # Collect unique auth_ids (owners and/or groups) from batch
+        unique_auth_ids = set()
+
         if self.show_owner:
-            # Collect unique owner auth_ids from batch
-            unique_owners = set()
             for entry in self.batch:
                 owner_details = entry.get("owner_details", {})
                 owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
                 if owner_auth_id:
-                    unique_owners.add(owner_auth_id)
+                    unique_auth_ids.add(owner_auth_id)
 
-            # Resolve all owners in parallel
-            if unique_owners:
-                async with self.client.create_session() as session:
-                    identity_cache = await self.client.resolve_multiple_identities(
-                        session, list(unique_owners)
-                    )
+        if self.show_group:
+            for entry in self.batch:
+                group_details = entry.get("group_details", {})
+                group_auth_id = group_details.get("auth_id") or entry.get("group")
+                if group_auth_id:
+                    unique_auth_ids.add(group_auth_id)
+
+        # Resolve all identities in parallel
+        if unique_auth_ids:
+            async with self.client.create_session() as session:
+                identity_cache = await self.client.resolve_multiple_identities(
+                    session, list(unique_auth_ids)
+                )
 
         # Output batch
         for entry in self.batch:
@@ -342,6 +352,7 @@ class BatchedOutputHandler:
             else:
                 # Plain text
                 output_line = entry["path"]
+
                 if self.show_owner:
                     owner_details = entry.get("owner_details", {})
                     owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
@@ -351,6 +362,17 @@ class BatchedOutputHandler:
                         output_line = f"{output_line}\t{owner_name}"
                     else:
                         output_line = f"{output_line}\tUnknown"
+
+                if self.show_group:
+                    group_details = entry.get("group_details", {})
+                    group_auth_id = group_details.get("auth_id") or entry.get("group")
+                    if group_auth_id and group_auth_id in identity_cache:
+                        identity = identity_cache[group_auth_id]
+                        group_name = format_owner_name(identity)
+                        output_line = f"{output_line}\t{group_name}"
+                    else:
+                        output_line = f"{output_line}\tUnknown"
+
                 print(output_line)
             sys.stdout.flush()
 
@@ -2359,7 +2381,9 @@ async def generate_acl_report(
     session: aiohttp.ClientSession,
     files: List[Dict],
     show_progress: bool = False,
-    resolve_names: bool = False
+    resolve_names: bool = False,
+    show_owner: bool = False,
+    show_group: bool = False
 ) -> Dict:
     """
     Generate ACL report for a list of files.
@@ -2370,12 +2394,14 @@ async def generate_acl_report(
         files: List of file dicts (with 'path' and 'type' keys)
         show_progress: Whether to show progress updates
         resolve_names: Whether to resolve auth_ids to human-readable names
+        show_owner: Whether to resolve and display owner information
+        show_group: Whether to resolve and display group information
 
     Returns:
         Dictionary containing:
         - file_acls: Dict mapping file path to ACL info
         - stats: Summary statistics
-        - identity_cache: Dict mapping auth_id to resolved identity (if resolve_names=True)
+        - identity_cache: Dict mapping auth_id to resolved identity (if resolve_names=True or show_owner/show_group=True)
     """
     import sys
     import time
@@ -2397,34 +2423,50 @@ async def generate_acl_report(
         for file_info in batch:
             path = file_info['path']
             is_directory = file_info.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+            owner = file_info.get('owner')
+            owner_details = file_info.get('owner_details', {})
+            group = file_info.get('group')
+            group_details = file_info.get('group_details', {})
             task = client.get_file_acl(session, path)
             tasks.append(task)
-            path_info.append((path, is_directory))
+            path_info.append((path, is_directory, owner, owner_details, group, group_details))
 
         # Wait for all tasks concurrently using gather
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Process results
-        for (path, is_directory), result in zip(path_info, results):
+        for (path, is_directory, owner, owner_details, group, group_details), result in zip(path_info, results):
             if isinstance(result, Exception):
                 # Task raised an exception
                 if client.verbose:
                     print(f"[WARN] Error processing ACL for {path}: {result}", file=sys.stderr)
                 file_acls[path] = {
                     'acl_data': None,
-                    'is_directory': is_directory
+                    'is_directory': is_directory,
+                    'owner': owner,
+                    'owner_details': owner_details,
+                    'group': group,
+                    'group_details': group_details
                 }
             elif result:
                 # Successfully got ACL data
                 file_acls[path] = {
                     'acl_data': result,
-                    'is_directory': is_directory
+                    'is_directory': is_directory,
+                    'owner': owner,
+                    'owner_details': owner_details,
+                    'group': group,
+                    'group_details': group_details
                 }
             else:
                 # ACL retrieval returned None
                 file_acls[path] = {
                     'acl_data': None,
-                    'is_directory': is_directory
+                    'is_directory': is_directory,
+                    'owner': owner,
+                    'owner_details': owner_details,
+                    'group': group,
+                    'group_details': group_details
                 }
 
             processed += 1
@@ -2467,16 +2509,37 @@ async def generate_acl_report(
         'processing_time': time.time() - start_time
     }
 
-    # Resolve names if requested
+    # Resolve names if requested (for ACLs, owners, or groups)
     identity_cache = {}
-    if resolve_names:
-        # Collect all unique auth_ids from all ACLs
+    if resolve_names or show_owner or show_group:
+        # Collect all unique auth_ids
         all_auth_ids = set()
-        for file_info in file_acls.values():
-            acl_data = file_info.get('acl_data')
-            if acl_data:
-                auth_ids = extract_auth_ids_from_acl(acl_data)
-                all_auth_ids.update(auth_ids)
+
+        # Collect from ACLs if resolve_names is enabled
+        if resolve_names:
+            for file_info in file_acls.values():
+                acl_data = file_info.get('acl_data')
+                if acl_data:
+                    auth_ids = extract_auth_ids_from_acl(acl_data)
+                    all_auth_ids.update(auth_ids)
+
+        # Collect owner auth_ids if show_owner is enabled
+        if show_owner:
+            for file_info in file_acls.values():
+                # Try to get auth_id from owner_details first, fallback to owner field
+                owner_details = file_info.get('owner_details', {})
+                owner_auth_id = owner_details.get('auth_id') or file_info.get('owner')
+                if owner_auth_id:
+                    all_auth_ids.add(owner_auth_id)
+
+        # Collect group auth_ids if show_group is enabled
+        if show_group:
+            for file_info in file_acls.values():
+                # Try to get auth_id from group_details first, fallback to group field
+                group_details = file_info.get('group_details', {})
+                group_auth_id = group_details.get('auth_id') or file_info.get('group')
+                if group_auth_id:
+                    all_auth_ids.add(group_auth_id)
 
         if all_auth_ids and show_progress:
             print(f"[ACL REPORT] Resolving {len(all_auth_ids)} unique identities...", file=sys.stderr)
@@ -3350,11 +3413,15 @@ async def main_async(args):
     batched_handler = None
 
     if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links:
-        if args.show_owner:
-            # Use batched output handler for streaming with owner resolution
+        if args.show_owner or args.show_group:
+            # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
             batched_handler = BatchedOutputHandler(
-                client, batch_size=100, show_owner=True, output_format=output_format
+                client,
+                batch_size=100,
+                show_owner=args.show_owner,
+                show_group=args.show_group,
+                output_format=output_format,
             )
 
             async def output_callback(entry):
@@ -3414,23 +3481,32 @@ async def main_async(args):
     if batched_handler:
         await batched_handler.flush()
 
-    # Resolve owner identities if --show-owner is enabled (for non-streaming modes only)
+    # Resolve owner and group identities if --show-owner or --show-group is enabled (for non-streaming modes only)
     # Skip if batched_handler was used (streaming mode)
     identity_cache_for_output = {}
-    if args.show_owner and matching_files and not batched_handler:
-        # Collect unique owner auth_ids from matching files
-        unique_owners = set()
-        for entry in matching_files:
-            owner_details = entry.get("owner_details", {})
-            owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-            if owner_auth_id:
-                unique_owners.add(owner_auth_id)
+    if (args.show_owner or args.show_group) and matching_files and not batched_handler:
+        # Collect unique auth_ids (owners and/or groups) from matching files
+        unique_auth_ids = set()
 
-        if unique_owners:
+        if args.show_owner:
+            for entry in matching_files:
+                owner_details = entry.get("owner_details", {})
+                owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                if owner_auth_id:
+                    unique_auth_ids.add(owner_auth_id)
+
+        if args.show_group:
+            for entry in matching_files:
+                group_details = entry.get("group_details", {})
+                group_auth_id = group_details.get("auth_id") or entry.get("group")
+                if group_auth_id:
+                    unique_auth_ids.add(group_auth_id)
+
+        if unique_auth_ids:
             async with client.create_session() as session:
                 identity_cache_for_output = await client.resolve_multiple_identities(
                     session,
-                    list(unique_owners),
+                    list(unique_auth_ids),
                     show_progress=args.verbose or args.progress,
                 )
 
@@ -3481,7 +3557,9 @@ async def main_async(args):
                 session,
                 matching_files,
                 show_progress=args.progress,
-                resolve_names=args.acl_resolve_names
+                resolve_names=args.acl_resolve_names,
+                show_owner=args.show_owner,
+                show_group=args.show_group
             )
 
         # Get identity cache
@@ -3511,6 +3589,8 @@ async def main_async(args):
             for path, acl_info in file_acls.items():
                 acl_data = acl_info['acl_data']
                 is_directory = acl_info['is_directory']
+                owner_details = acl_info.get('owner_details', {})
+                group_details = acl_info.get('group_details', {})
 
                 # Skip if no ACL data
                 if not acl_data:
@@ -3537,22 +3617,57 @@ async def main_async(args):
                 trustees = readable_acl.split('|') if readable_acl else []
                 max_aces = max(max_aces, len(trustees))
 
+                # Resolve owner and group names if requested
+                owner_name = None
+                group_name = None
+
+                if args.show_owner:
+                    # Use the numeric owner field as the auth_id
+                    owner_auth_id = acl_info.get('owner')
+                    if owner_auth_id and owner_auth_id in identity_cache:
+                        owner_name = format_owner_name(identity_cache[owner_auth_id])
+                    elif owner_auth_id:
+                        owner_name = f"auth_id:{owner_auth_id}"
+                    else:
+                        owner_name = "Unknown"
+
+                if args.show_group:
+                    # Use the numeric group field as the auth_id
+                    group_auth_id = acl_info.get('group')
+                    if group_auth_id and group_auth_id in identity_cache:
+                        group_name = format_owner_name(identity_cache[group_auth_id])
+                    elif group_auth_id:
+                        group_name = f"auth_id:{group_auth_id}"
+                    else:
+                        group_name = "Unknown"
+
                 acl_rows.append({
                     'path': path,
                     'ace_count': ace_count,
                     'inherited_count': inherited_count,
                     'explicit_count': explicit_count,
-                    'trustees': trustees
+                    'trustees': trustees,
+                    'owner': owner_name,
+                    'group': group_name
                 })
 
             # Create CSV with dynamic trustee columns
             with open(args.acl_csv, 'w', newline='') as csv_file:
-                fieldnames = [
-                    'path',
+                fieldnames = ['path']
+
+                # Add owner and group columns if requested
+                if args.show_owner:
+                    fieldnames.append('owner')
+                if args.show_group:
+                    fieldnames.append('group')
+
+                # Add ACL count columns
+                fieldnames.extend([
                     'ace_count',
                     'inherited_count',
                     'explicit_count'
-                ]
+                ])
+
                 # Add trustee columns dynamically
                 for i in range(1, max_aces + 1):
                     fieldnames.append(f'trustee_{i}')
@@ -3562,12 +3677,19 @@ async def main_async(args):
 
                 # Write rows with trustees in separate columns
                 for row_data in acl_rows:
-                    row = {
-                        'path': row_data['path'],
-                        'ace_count': row_data['ace_count'],
-                        'inherited_count': row_data['inherited_count'],
-                        'explicit_count': row_data['explicit_count']
-                    }
+                    row = {'path': row_data['path']}
+
+                    # Add owner and group if requested
+                    if args.show_owner:
+                        row['owner'] = row_data['owner']
+                    if args.show_group:
+                        row['group'] = row_data['group']
+
+                    # Add ACL counts
+                    row['ace_count'] = row_data['ace_count']
+                    row['inherited_count'] = row_data['inherited_count']
+                    row['explicit_count'] = row_data['explicit_count']
+
                     # Add each trustee to its own column
                     for i, trustee in enumerate(row_data['trustees'], start=1):
                         row[f'trustee_{i}'] = trustee.strip()
@@ -3588,6 +3710,8 @@ async def main_async(args):
             for path, acl_info in file_acls.items():
                 acl_data = acl_info['acl_data']
                 is_directory = acl_info['is_directory']
+                owner_details = acl_info.get('owner_details', {})
+                group_details = acl_info.get('group_details', {})
 
                 # Skip if no ACL data
                 if not acl_data:
@@ -3615,13 +3739,36 @@ async def main_async(args):
                 trustees = [ace_entry.strip() for ace_entry in ace_entries]
 
                 # Write one JSON entry per file with trustees as array
-                json_entry = {
-                    'path': path,
+                json_entry = {'path': path}
+
+                # Add owner and group if requested
+                if args.show_owner:
+                    # Use the numeric owner field as the auth_id
+                    owner_auth_id = acl_info.get('owner')
+                    if owner_auth_id and owner_auth_id in identity_cache:
+                        json_entry['owner'] = format_owner_name(identity_cache[owner_auth_id])
+                    elif owner_auth_id:
+                        json_entry['owner'] = f"auth_id:{owner_auth_id}"
+                    else:
+                        json_entry['owner'] = "Unknown"
+
+                if args.show_group:
+                    # Use the numeric group field as the auth_id
+                    group_auth_id = acl_info.get('group')
+                    if group_auth_id and group_auth_id in identity_cache:
+                        json_entry['group'] = format_owner_name(identity_cache[group_auth_id])
+                    elif group_auth_id:
+                        json_entry['group'] = f"auth_id:{group_auth_id}"
+                    else:
+                        json_entry['group'] = "Unknown"
+
+                # Add ACL info
+                json_entry.update({
                     'ace_count': ace_count,
                     'inherited_count': inherited_count,
                     'explicit_count': explicit_count,
                     'trustees': trustees
-                }
+                })
 
                 # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
                 if JSON_PARSER_NAME == "ujson":
@@ -3679,6 +3826,19 @@ async def main_async(args):
                         else:
                             entry["owner_name"] = "Unknown"
 
+                # Add resolved group name to entries if --show-group is enabled
+                if args.show_group:
+                    for entry in matching_files:
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get(
+                            "group"
+                        )
+                        if group_auth_id and group_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[group_auth_id]
+                            entry["group_name"] = format_owner_name(identity)
+                        else:
+                            entry["group_name"] = "Unknown"
+
                 # Write all attributes
                 fieldnames = sorted(matching_files[0].keys())
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -3700,6 +3860,10 @@ async def main_async(args):
                 # Add owner if --show-owner is enabled
                 if args.show_owner:
                     fieldnames.append("owner")
+
+                # Add group if --show-group is enabled
+                if args.show_group:
+                    fieldnames.append("group")
 
                 # Add symlink_target if --resolve-links is enabled
                 if args.resolve_links:
@@ -3725,6 +3889,16 @@ async def main_async(args):
                             row["owner"] = format_owner_name(identity)
                         else:
                             row["owner"] = "Unknown"
+                    if args.show_group:
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get(
+                            "group"
+                        )
+                        if group_auth_id and group_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[group_auth_id]
+                            row["group"] = format_owner_name(identity)
+                        else:
+                            row["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         row["symlink_target"] = entry["symlink_target"]
                     writer.writerow(row)
@@ -3757,6 +3931,19 @@ async def main_async(args):
                             entry["owner_name"] = format_owner_name(identity)
                         else:
                             entry["owner_name"] = "Unknown"
+
+                    # Add resolved group name to entry if --show-group is enabled
+                    if args.show_group:
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get(
+                            "group"
+                        )
+                        if group_auth_id and group_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[group_auth_id]
+                            entry["group_name"] = format_owner_name(identity)
+                        else:
+                            entry["group_name"] = "Unknown"
+
                     output_handle.write(json_parser.dumps(entry) + "\n")
                 else:
                     # Minimal output: path and filtered fields
@@ -3775,6 +3962,16 @@ async def main_async(args):
                             minimal_entry["owner"] = format_owner_name(identity)
                         else:
                             minimal_entry["owner"] = "Unknown"
+                    if args.show_group:
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get(
+                            "group"
+                        )
+                        if group_auth_id and group_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[group_auth_id]
+                            minimal_entry["group"] = format_owner_name(identity)
+                        else:
+                            minimal_entry["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         minimal_entry["symlink_target"] = entry["symlink_target"]
                     output_handle.write(json_parser.dumps(minimal_entry) + "\n")
@@ -3801,6 +3998,17 @@ async def main_async(args):
                         identity = identity_cache_for_output[owner_auth_id]
                         owner_name = format_owner_name(identity)
                         output_line = f"{output_line}\t{owner_name}"
+                    else:
+                        output_line = f"{output_line}\tUnknown"
+
+                # Add group information if --show-group is enabled
+                if args.show_group:
+                    group_details = entry.get("group_details", {})
+                    group_auth_id = group_details.get("auth_id") or entry.get("group")
+                    if group_auth_id and group_auth_id in identity_cache_for_output:
+                        identity = identity_cache_for_output[group_auth_id]
+                        group_name = format_owner_name(identity)
+                        output_line = f"{output_line}\t{group_name}"
                     else:
                         output_line = f"{output_line}\tUnknown"
 
@@ -3989,6 +4197,11 @@ Examples:
         "--show-owner",
         action="store_true",
         help="Display owner information for matching files",
+    )
+    parser.add_argument(
+        "--show-group",
+        action="store_true",
+        help="Display group information for matching files",
     )
     parser.add_argument(
         "--owner-report",
