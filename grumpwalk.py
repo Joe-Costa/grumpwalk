@@ -2698,7 +2698,11 @@ def calculate_confidence_percentage(num_sample_points: int) -> str:
         return ">99.999%"
 
 
-def calculate_sample_points(file_size: int, sample_points: Optional[int] = None) -> List[int]:
+def calculate_sample_points(
+    file_size: int,
+    sample_points: Optional[int] = None,
+    sample_chunk_size: int = 65536
+) -> List[int]:
     """
     Calculate adaptive sample points based on file size using stratified + random sampling.
 
@@ -2713,13 +2717,14 @@ def calculate_sample_points(file_size: int, sample_points: Optional[int] = None)
     Args:
         file_size: Size of the file in bytes
         sample_points: Override number of sample points (3-11), or None for adaptive
+        sample_chunk_size: Size of each sample chunk in bytes (default: 65536 / 64KB)
 
     Returns:
         List of byte offsets to sample from (non-overlapping, sorted)
     """
     import random
 
-    SAMPLE_CHUNK_SIZE = 65536  # 64KB per sample
+    SAMPLE_CHUNK_SIZE = sample_chunk_size
 
     # Special case: empty files
     if file_size == 0:
@@ -2795,7 +2800,8 @@ async def compute_sample_hash(
     session: aiohttp.ClientSession,
     file_path: str,
     file_size: int,
-    sample_points: Optional[int] = None
+    sample_points: Optional[int] = None,
+    sample_chunk_size: int = 65536
 ) -> Optional[str]:
     """
     Compute a position-aware hash from multiple sample points in a file.
@@ -2812,6 +2818,7 @@ async def compute_sample_hash(
         file_path: Path to the file
         file_size: Size of the file in bytes
         sample_points: Optional override for number of sample points
+        sample_chunk_size: Size of each sample chunk in bytes (default: 65536 / 64KB)
 
     Returns:
         SHA-256 hash of position-aware fingerprint, or None if failed
@@ -2819,9 +2826,9 @@ async def compute_sample_hash(
     import hashlib
     import struct
 
-    SAMPLE_CHUNK_SIZE = 65536  # 64KB
+    SAMPLE_CHUNK_SIZE = sample_chunk_size
 
-    offsets = calculate_sample_points(file_size, sample_points)
+    offsets = calculate_sample_points(file_size, sample_points, sample_chunk_size)
 
     # Read all sample points concurrently
     tasks = []
@@ -2852,6 +2859,7 @@ async def find_duplicates(
     files: List[Dict],
     by_size_only: bool = False,
     sample_points: Optional[int] = None,
+    sample_chunk_size: int = 65536,
     progress: Optional['ProgressTracker'] = None
 ) -> Dict[str, List[Dict]]:
     """
@@ -2866,6 +2874,7 @@ async def find_duplicates(
         files: List of file entries with metadata
         by_size_only: If True, only use size for duplicate detection (no hashing)
         sample_points: Optional override for number of sample points
+        sample_chunk_size: Size of each sample chunk in bytes (default: 65536 / 64KB)
         progress: Optional ProgressTracker for status updates
 
     Returns:
@@ -2924,10 +2933,10 @@ async def find_duplicates(
     # Create semaphore to limit concurrent hash operations
     hash_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
 
-    async def hash_with_limit(entry, file_path, file_size, sample_points):
+    async def hash_with_limit(entry, file_path, file_size, sample_points_arg):
         """Wrapper to limit concurrent hash operations."""
         async with hash_semaphore:
-            return await compute_sample_hash(client, session, file_path, file_size, sample_points)
+            return await compute_sample_hash(client, session, file_path, file_size, sample_points_arg, sample_chunk_size)
 
     async with client.create_session() as session:
         for fingerprint, group in potential_duplicates.items():
@@ -4170,6 +4179,7 @@ async def main_async(args):
             matching_files,
             by_size_only=args.by_size,
             sample_points=args.sample_points,
+            sample_chunk_size=args.sample_size if args.sample_size else 65536,
             progress=progress
         )
 
@@ -4820,6 +4830,15 @@ Examples:
         metavar="N",
         help="Override number of sample points for duplicate detection (3-11). "
              "Default is adaptive based on file size.",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=parse_size_to_bytes,
+        metavar="SIZE",
+        help="Sample chunk size for duplicate detection (e.g., 64KB, 256KB, 1MB). "
+             "Default is 64KB. Larger sizes improve detection of small differences "
+             "but increase network transfer. Accepts values like: 64KB, 128KB, 256KB, "
+             "512KB, 1MB, 1.5MB, etc.",
     )
 
     # Output options
