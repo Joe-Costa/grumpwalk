@@ -664,6 +664,43 @@ class AsyncQumuloClient:
                 # Fall back gracefully if capacity API unavailable
                 return {}
 
+    async def get_file_acl(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> Optional[dict]:
+        """
+        Get the Access Control List (ACL) for a file or directory.
+
+        Args:
+            session: aiohttp ClientSession
+            path: File or directory path
+
+        Returns:
+            Dictionary containing ACL data with 'aces', 'control', 'posix_special_permissions',
+            or None if the ACL cannot be retrieved.
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/info/acl"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        if self.verbose:
+                            print(
+                                f"[WARN] Failed to get ACL for {path}: HTTP {response.status}",
+                                file=sys.stderr,
+                            )
+                        return None
+            except aiohttp.ClientError as e:
+                if self.verbose:
+                    print(f"[WARN] Error getting ACL for {path}: {e}", file=sys.stderr)
+                return None
+
     async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
         """
         Read the target of a symlink.
@@ -1683,6 +1720,627 @@ class AsyncQumuloClient:
             return [auth_id]
 
 
+# ============================================================================
+# ACL Conversion Functions (QACL to NFSv4-style shorthand)
+# ============================================================================
+
+
+def qacl_flags_to_nfsv4(flags: List[str]) -> str:
+    """
+    Convert Qumulo ACE flags to NFSv4-style flag string.
+
+    Args:
+        flags: List of Qumulo flags (e.g., ['OBJECT_INHERIT', 'CONTAINER_INHERIT', 'INHERITED'])
+
+    Returns:
+        NFSv4 flags string (e.g., 'fdI')
+    """
+    mapping = {
+        'OBJECT_INHERIT': 'f',
+        'CONTAINER_INHERIT': 'd',
+        'NO_PROPAGATE_INHERIT': 'n',
+        'INHERIT_ONLY': 'i',
+        'INHERITED': 'I'
+    }
+
+    nfsv4_flags = []
+    for flag in flags:
+        if flag in mapping:
+            nfsv4_flags.append(mapping[flag])
+
+    return ''.join(nfsv4_flags)
+
+
+def qacl_rights_to_nfsv4(rights: List[str], is_directory: bool = False) -> str:
+    """
+    Convert Qumulo QACL rights to NFSv4 permission string.
+
+    Args:
+        rights: List of Qumulo rights (e.g., ['READ', 'WRITE_ATTR', 'EXECUTE'])
+        is_directory: Whether the file is a directory (affects DELETE_CHILD)
+
+    Returns:
+        NFSv4 permission string (e.g., 'rxtncy')
+    """
+    mapping = {
+        'READ': 'r',
+        'MODIFY': 'w',
+        'EXTEND': 'a',
+        'EXECUTE': 'x',
+        'DELETE': 'd',
+        'DELETE_CHILD': 'D',  # Only valid for directories
+        'READ_ATTR': 't',
+        'WRITE_ATTR': 'T',
+        'READ_EA': 'n',
+        'WRITE_EA': 'N',
+        'READ_ACL': 'c',
+        'WRITE_ACL': 'C',
+        'CHANGE_OWNER': 'o',
+        'SYNCHRONIZE': 'y'
+    }
+
+    perms = []
+    for right in rights:
+        if right in mapping:
+            # Skip DELETE_CHILD if not a directory
+            if right == 'DELETE_CHILD' and not is_directory:
+                continue
+            perms.append(mapping[right])
+
+    # Return in canonical order: rwaxdDtTnNcCoy
+    canonical_order = 'rwaxdDtTnNcCoy'
+    return ''.join(p for p in canonical_order if p in perms)
+
+
+def qacl_trustee_to_nfsv4(trustee: Dict, trustee_details: Optional[Dict] = None) -> str:
+    """
+    Convert Qumulo trustee to NFSv4-style principal format.
+
+    Args:
+        trustee: Qumulo trustee dict or auth_id string
+        trustee_details: Optional trustee_details dict with id_type and id_value
+
+    Returns:
+        NFSv4 principal string (e.g., 'EVERYONE@', 'uid:1001', 'alice@corp.com')
+    """
+    # Handle legacy format (dict with domain, uid, gid, etc.)
+    if isinstance(trustee, dict):
+        domain = trustee.get('domain')
+        uid = trustee.get('uid')
+        gid = trustee.get('gid')
+        name = trustee.get('name')
+
+        if domain == 'WORLD':
+            return 'EVERYONE@'
+        elif domain == 'POSIX_USER':
+            return f'uid:{uid}' if uid is not None else 'OWNER@'
+        elif domain == 'POSIX_GROUP':
+            return f'gid:{gid}' if gid is not None else 'GROUP@'
+        elif domain == 'LOCAL_USER':
+            return f'user:{name}' if name else f'uid:{uid}'
+        elif domain == 'LOCAL_GROUP':
+            return f'group:{name}' if name else f'gid:{gid}'
+        elif domain in ('AD_USER', 'AD_GROUP'):
+            return name if name else f'sid:{trustee.get("sid")}'
+        else:
+            return f'unknown:{trustee.get("auth_id")}'
+
+    # Handle current API format (trustee is auth_id string, details in trustee_details)
+    if trustee_details:
+        id_type = trustee_details.get('id_type')
+        id_value = trustee_details.get('id_value')
+
+        if id_type == 'NFS_UID':
+            return f'uid:{id_value}'
+        elif id_type == 'NFS_GID':
+            return f'gid:{id_value}'
+        elif id_type == 'SMB_SID':
+            # Check for well-known SIDs
+            if id_value == 'S-1-1-0':
+                return 'EVERYONE@'
+            return f'sid:{id_value}'
+        elif id_type == 'LOCAL_USER':
+            return f'user:{id_value}'
+        elif id_type == 'LOCAL_GROUP':
+            return f'group:{id_value}'
+
+    # Fallback: use auth_id
+    return f'auth_id:{trustee}'
+
+
+def extract_auth_ids_from_acl(qacl_data: Dict) -> set:
+    """
+    Extract all unique auth_ids from an ACL for identity resolution.
+
+    Args:
+        qacl_data: Full QACL dict
+
+    Returns:
+        Set of auth_id strings found in the ACL
+    """
+    auth_ids = set()
+
+    if not qacl_data:
+        return auth_ids
+
+    # Handle nested structure
+    if 'acl' in qacl_data and 'aces' not in qacl_data:
+        qacl_data = qacl_data['acl']
+
+    for ace in qacl_data.get('aces', []):
+        trustee = ace.get('trustee')
+
+        # Current API format: trustee is auth_id string
+        if isinstance(trustee, str):
+            auth_ids.add(trustee)
+        # Legacy format: trustee is dict with auth_id
+        elif isinstance(trustee, dict) and 'auth_id' in trustee:
+            auth_ids.add(trustee['auth_id'])
+
+    return auth_ids
+
+
+def qacl_trustee_to_readable_name(trustee: Dict, trustee_details: Optional[Dict], identity_cache: Dict) -> str:
+    """
+    Convert Qumulo trustee to human-readable name using identity cache.
+    Falls back to technical format if name not available.
+
+    Args:
+        trustee: Trustee value (auth_id string or dict)
+        trustee_details: Trustee details dict
+        identity_cache: Dictionary mapping auth_id to resolved identity info
+
+    Returns:
+        Human-readable trustee name or fallback technical format
+    """
+    # Get auth_id
+    auth_id = None
+    if isinstance(trustee, str):
+        auth_id = trustee
+    elif isinstance(trustee, dict):
+        auth_id = trustee.get('auth_id')
+
+    # Try to resolve from cache
+    if auth_id and auth_id in identity_cache:
+        identity = identity_cache[auth_id]
+        name = identity.get('name', '')
+        domain = identity.get('domain', '')
+
+        # Format based on domain
+        if domain == 'WORLD':
+            return 'EVERYONE@'
+        elif domain == 'POSIX_USER':
+            uid = identity.get('uid')
+            if name and not name.startswith('Unknown'):
+                return f'{name} (UID {uid})' if uid else name
+            return f'UID {uid}' if uid else 'OWNER@'
+        elif domain == 'POSIX_GROUP':
+            gid = identity.get('gid')
+            if name and not name.startswith('Unknown'):
+                return f'{name} (GID {gid})' if gid else name
+            return f'GID {gid}' if gid else 'GROUP@'
+        elif domain in ('ACTIVE_DIRECTORY', 'AD_USER', 'AD_GROUP'):
+            return name if name else f'SID {identity.get("sid", auth_id)}'
+        elif domain in ('LOCAL', 'LOCAL_USER', 'LOCAL_GROUP'):
+            return name if name else f'Local {auth_id}'
+        elif name:
+            return name
+
+    # Fallback to technical format
+    return qacl_trustee_to_nfsv4(trustee, trustee_details)
+
+
+def qacl_ace_to_readable(ace: Dict, is_directory: bool = False) -> str:
+    """
+    Convert a single Qumulo ACE to human-readable NFSv4-style format.
+
+    Args:
+        ace: Qumulo ACE dict with type, flags, trustee, rights
+        is_directory: Whether this ACE is for a directory
+
+    Returns:
+        Readable ACE string in format: Allow/Deny:flags:principal:permissions
+        Example: "Allow:fdI:uid:1001:rwxt"
+    """
+    # Convert type to human-readable form
+    ace_type = 'Allow' if ace.get('type') == 'ALLOWED' else 'Deny'
+
+    # Convert flags
+    flags_str = qacl_flags_to_nfsv4(ace.get('flags', []))
+
+    # Get trustee and trustee_details
+    trustee = ace.get('trustee', {})
+    trustee_details = ace.get('trustee_details')
+
+    # Convert trustee to principal
+    principal = qacl_trustee_to_nfsv4(trustee, trustee_details)
+
+    # Add 'g' flag if trustee is a group (unless it's GROUP@)
+    if trustee_details:
+        id_type = trustee_details.get('id_type')
+        if id_type in ('NFS_GID', 'LOCAL_GROUP', 'AD_GROUP'):
+            if principal not in ('GROUP@',):
+                flags_str = 'g' + flags_str
+    elif isinstance(trustee, dict):
+        domain = trustee.get('domain')
+        if domain in ('POSIX_GROUP', 'LOCAL_GROUP', 'AD_GROUP'):
+            if principal not in ('GROUP@',):
+                flags_str = 'g' + flags_str
+
+    # Convert rights
+    permissions = qacl_rights_to_nfsv4(ace.get('rights', []), is_directory)
+
+    return f'{ace_type}:{flags_str}:{principal}:{permissions}'
+
+
+def qacl_to_readable_acl(qacl_data: Dict, is_directory: bool = False,
+                         separator: str = '|') -> str:
+    """
+    Convert full Qumulo QACL to readable ACL string.
+
+    Args:
+        qacl_data: Full QACL dict - may have 'aces' directly or nested under 'acl'
+        is_directory: Whether this is a directory ACL
+        separator: Character to separate multiple ACEs (default: '|' for CSV)
+
+    Returns:
+        Separated ACL string suitable for CSV
+        Example: "Allow:fdI:uid:1001:rwxt|Allow:fdI:GROUP@:rxt|Allow::OWNER@:rwatTnNcy"
+    """
+    if not qacl_data:
+        return ''
+
+    # Handle nested structure (get_file_acl returns {generated: bool, acl: {...}})
+    if 'acl' in qacl_data and 'aces' not in qacl_data:
+        qacl_data = qacl_data['acl']
+
+    if 'aces' not in qacl_data:
+        return ''
+
+    readable_aces = []
+    for ace in qacl_data.get('aces', []):
+        readable_ace = qacl_ace_to_readable(ace, is_directory)
+        readable_aces.append(readable_ace)
+
+    return separator.join(readable_aces)
+
+
+def qacl_to_readable_acl_with_names(qacl_data: Dict, is_directory: bool = False,
+                                    separator: str = '|', identity_cache: Dict = None) -> str:
+    """
+    Convert full Qumulo QACL to readable ACL string with resolved names.
+
+    Args:
+        qacl_data: Full QACL dict - may have 'aces' directly or nested under 'acl'
+        is_directory: Whether this is a directory ACL
+        separator: Character to separate multiple ACEs (default: '|' for CSV)
+        identity_cache: Dictionary mapping auth_id to resolved identity info
+
+    Returns:
+        Separated ACL string with human-readable names
+        Example: "Allow:fdI:jsmith (UID 1001):rwxt|Allow:fdI:Domain Users:rxt"
+    """
+    if not qacl_data:
+        return ''
+
+    # Handle nested structure
+    if 'acl' in qacl_data and 'aces' not in qacl_data:
+        qacl_data = qacl_data['acl']
+
+    if 'aces' not in qacl_data:
+        return ''
+
+    if not identity_cache:
+        identity_cache = {}
+
+    readable_aces = []
+    for ace in qacl_data.get('aces', []):
+        # Convert type
+        ace_type = 'Allow' if ace.get('type') == 'ALLOWED' else 'Deny'
+
+        # Convert flags
+        flags_str = qacl_flags_to_nfsv4(ace.get('flags', []))
+
+        # Get trustee and details
+        trustee = ace.get('trustee', {})
+        trustee_details = ace.get('trustee_details')
+
+        # Resolve trustee name
+        principal = qacl_trustee_to_readable_name(trustee, trustee_details, identity_cache)
+
+        # Add 'g' flag for groups
+        if trustee_details:
+            id_type = trustee_details.get('id_type')
+            if id_type in ('NFS_GID', 'LOCAL_GROUP', 'AD_GROUP'):
+                if principal not in ('GROUP@',) and not principal.endswith(')'):  # Don't add 'g' if already formatted with GID
+                    flags_str = 'g' + flags_str
+        elif isinstance(trustee, dict):
+            domain = trustee.get('domain')
+            if domain in ('POSIX_GROUP', 'LOCAL_GROUP', 'AD_GROUP'):
+                if principal not in ('GROUP@',):
+                    flags_str = 'g' + flags_str
+
+        # Convert rights
+        permissions = qacl_rights_to_nfsv4(ace.get('rights', []), is_directory)
+
+        readable_aces.append(f'{ace_type}:{flags_str}:{principal}:{permissions}')
+
+    return separator.join(readable_aces)
+
+
+def create_acl_fingerprint(qacl_data: Dict) -> str:
+    """
+    Create a unique fingerprint/hash for an ACL based on its content.
+    Used for grouping files with identical ACLs.
+
+    Args:
+        qacl_data: Full QACL dict
+
+    Returns:
+        SHA-256 hash (first 16 chars) of the ACL structure
+    """
+    import hashlib
+    import json
+
+    if not qacl_data:
+        return 'empty'
+
+    # Handle nested structure
+    if 'acl' in qacl_data and 'aces' not in qacl_data:
+        qacl_data = qacl_data['acl']
+
+    # Extract and normalize ACL components for hashing
+    acl_to_hash = {
+        'aces': [],
+        'control': sorted(qacl_data.get('control', [])),
+        'posix_special_permissions': sorted(qacl_data.get('posix_special_permissions', []))
+    }
+
+    # Normalize each ACE for consistent hashing
+    for ace in qacl_data.get('aces', []):
+        trustee = ace.get('trustee')
+        trustee_details = ace.get('trustee_details', {})
+
+        # Create normalized trustee representation
+        if isinstance(trustee, dict):
+            trustee_key = f"{trustee.get('domain')}:{trustee.get('uid')}:{trustee.get('gid')}:{trustee.get('sid')}"
+        else:
+            # Use trustee_details for current API format
+            trustee_key = f"{trustee_details.get('id_type')}:{trustee_details.get('id_value')}"
+
+        normalized_ace = {
+            'type': ace.get('type'),
+            'flags': sorted(ace.get('flags', [])),
+            'trustee': trustee_key,
+            'rights': sorted(ace.get('rights', []))
+        }
+        acl_to_hash['aces'].append(normalized_ace)
+
+    # Create deterministic JSON and hash it
+    acl_json = json.dumps(acl_to_hash, sort_keys=True)
+    hash_digest = hashlib.sha256(acl_json.encode()).hexdigest()
+
+    # Return first 16 characters for readability
+    return hash_digest[:16]
+
+
+def analyze_acl_structure(qacl_data: Dict) -> Dict:
+    """
+    Analyze ACL structure and extract useful metadata.
+
+    Args:
+        qacl_data: Full QACL dict
+
+    Returns:
+        Dict with analysis results:
+        {
+            'ace_count': int,
+            'inherited_count': int,
+            'explicit_count': int,
+            'has_deny': bool,
+            'has_everyone': bool,
+            'trustees': list of principal strings,
+            'fingerprint': str
+        }
+    """
+    if not qacl_data:
+        return {
+            'ace_count': 0,
+            'inherited_count': 0,
+            'explicit_count': 0,
+            'has_deny': False,
+            'has_everyone': False,
+            'trustees': [],
+            'fingerprint': 'empty'
+        }
+
+    # Handle nested structure
+    if 'acl' in qacl_data and 'aces' not in qacl_data:
+        qacl_data = qacl_data['acl']
+
+    aces = qacl_data.get('aces', [])
+
+    ace_count = len(aces)
+    inherited_count = 0
+    explicit_count = 0
+    has_deny = False
+    has_everyone = False
+    trustees = set()
+
+    for ace in aces:
+        # Check for DENY entries
+        if ace.get('type') == 'DENIED':
+            has_deny = True
+
+        # Check for inherited ACEs
+        if 'INHERITED' in ace.get('flags', []):
+            inherited_count += 1
+        else:
+            explicit_count += 1
+
+        # Extract trustee
+        trustee = ace.get('trustee')
+        trustee_details = ace.get('trustee_details')
+        principal = qacl_trustee_to_nfsv4(trustee, trustee_details)
+        trustees.add(principal)
+
+        # Check for EVERYONE
+        if principal == 'EVERYONE@':
+            has_everyone = True
+
+    return {
+        'ace_count': ace_count,
+        'inherited_count': inherited_count,
+        'explicit_count': explicit_count,
+        'has_deny': has_deny,
+        'has_everyone': has_everyone,
+        'trustees': sorted(list(trustees)),
+        'fingerprint': create_acl_fingerprint(qacl_data)
+    }
+
+
+async def generate_acl_report(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    files: List[Dict],
+    show_progress: bool = False,
+    resolve_names: bool = False
+) -> Dict:
+    """
+    Generate ACL report for a list of files.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        files: List of file dicts (with 'path' and 'type' keys)
+        show_progress: Whether to show progress updates
+        resolve_names: Whether to resolve auth_ids to human-readable names
+
+    Returns:
+        Dictionary containing:
+        - file_acls: Dict mapping file path to ACL info
+        - stats: Summary statistics
+        - identity_cache: Dict mapping auth_id to resolved identity (if resolve_names=True)
+    """
+    import sys
+    import time
+
+    file_acls = {}
+    total_files = len(files)
+    processed = 0
+    start_time = time.time()
+
+    # Batch size for ACL retrieval - increased for better throughput
+    batch_size = 100
+
+    for i in range(0, total_files, batch_size):
+        batch = files[i:i + batch_size]
+
+        # Fetch ACLs concurrently within batch
+        tasks = []
+        path_info = []
+        for file_info in batch:
+            path = file_info['path']
+            is_directory = file_info.get('type') == 'FS_FILE_TYPE_DIRECTORY'
+            task = client.get_file_acl(session, path)
+            tasks.append(task)
+            path_info.append((path, is_directory))
+
+        # Wait for all tasks concurrently using gather
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for (path, is_directory), result in zip(path_info, results):
+            if isinstance(result, Exception):
+                # Task raised an exception
+                if client.verbose:
+                    print(f"[WARN] Error processing ACL for {path}: {result}", file=sys.stderr)
+                file_acls[path] = {
+                    'acl_data': None,
+                    'is_directory': is_directory
+                }
+            elif result:
+                # Successfully got ACL data
+                file_acls[path] = {
+                    'acl_data': result,
+                    'is_directory': is_directory
+                }
+            else:
+                # ACL retrieval returned None
+                file_acls[path] = {
+                    'acl_data': None,
+                    'is_directory': is_directory
+                }
+
+            processed += 1
+
+        # Progress update
+        if show_progress and processed > 0:
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = total_files - processed
+
+            # TTY-aware progress (use \r for overwrite on terminal)
+            if sys.stderr.isatty():
+                print(
+                    f"\r[ACL REPORT] {processed:,} / {total_files:,} processed | "
+                    f"{remaining:,} remaining | {rate:.1f} files/sec",
+                    end='',
+                    file=sys.stderr,
+                    flush=True
+                )
+            else:
+                # For non-TTY, print periodic updates
+                if processed % 1000 == 0 or processed == total_files:
+                    print(
+                        f"[ACL REPORT] {processed:,} / {total_files:,} processed | "
+                        f"{remaining:,} remaining | {rate:.1f} files/sec",
+                        file=sys.stderr
+                    )
+
+    if show_progress:
+        if sys.stderr.isatty():
+            print(file=sys.stderr)  # New line after progress
+        print(f"[ACL REPORT] Completed processing {total_files:,} files", file=sys.stderr)
+
+    # Calculate statistics
+    files_with_acls = sum(1 for info in file_acls.values() if info['acl_data'] is not None)
+
+    stats = {
+        'total_files': total_files,
+        'files_with_acls': files_with_acls,
+        'processing_time': time.time() - start_time
+    }
+
+    # Resolve names if requested
+    identity_cache = {}
+    if resolve_names:
+        # Collect all unique auth_ids from all ACLs
+        all_auth_ids = set()
+        for file_info in file_acls.values():
+            acl_data = file_info.get('acl_data')
+            if acl_data:
+                auth_ids = extract_auth_ids_from_acl(acl_data)
+                all_auth_ids.update(auth_ids)
+
+        if all_auth_ids and show_progress:
+            print(f"[ACL REPORT] Resolving {len(all_auth_ids)} unique identities...", file=sys.stderr)
+
+        # Resolve identities using existing infrastructure
+        if all_auth_ids:
+            identity_cache = await client.resolve_multiple_identities(
+                session,
+                list(all_auth_ids),
+                show_progress=show_progress
+            )
+
+    return {
+        'file_acls': file_acls,
+        'stats': stats,
+        'identity_cache': identity_cache
+    }
+
+
 def parse_trustee(trustee_input: str) -> Dict:
     """
     Parse various trustee formats into an API payload.
@@ -2504,7 +3162,12 @@ async def main_async(args):
             else:
                 dirs_str = f"{int(total_dirs):,}"
 
-            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files)",
+            # Add note if traversal filters are active
+            filter_note = ""
+            if args.max_depth or args.omit_subdirs:
+                filter_note = " (before filters)"
+
+            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files){filter_note}",
                   file=sys.stderr)
         except Exception as e:
             # If aggregates fail, just continue without displaying them
@@ -2523,16 +3186,17 @@ async def main_async(args):
     if profiler:
         tree_walk_start = time.time()
 
-    # For owner reports, don't collect matching files to save memory
-    # Also collect results if we need to resolve symlinks
-    collect_results = not args.owner_report or args.resolve_links
+    # For owner reports and ACL reports, don't collect matching files to save memory
+    # Also collect results if we need to resolve symlinks or generate ACL reports
+    collect_results = not args.owner_report or args.resolve_links or args.acl_report
 
     # Create output callback for streaming results to stdout (plain text mode only)
     # Disable streaming if --resolve-links is enabled (need to resolve after collection)
+    # Disable streaming if --acl-report is enabled (generates its own report)
     output_callback = None
     batched_handler = None
 
-    if not args.owner_report and not args.csv_out and not args.json_out and not args.resolve_links:
+    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links:
         if args.show_owner:
             # Use batched output handler for streaming with owner resolution
             output_format = "json" if args.json else "text"
@@ -2649,6 +3313,97 @@ async def main_async(args):
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after report, don't output file list
+
+    # Generate ACL report if requested
+    if args.acl_report and matching_files:
+        print("\n" + "=" * 70, file=sys.stderr)
+        print("ACL REPORT", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+
+        # Generate ACL report
+        async with client.create_session() as session:
+            acl_report = await generate_acl_report(
+                client,
+                session,
+                matching_files,
+                show_progress=args.progress,
+                resolve_names=args.acl_resolve_names
+            )
+
+        # Get identity cache
+        identity_cache = acl_report.get('identity_cache', {})
+
+        # Display summary statistics
+        stats = acl_report['stats']
+        print("\n" + "=" * 70, file=sys.stderr)
+        print("ACL REPORT SUMMARY", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(f"Total files analyzed:        {stats['total_files']:,}", file=sys.stderr)
+        print(f"Files with ACLs:             {stats['files_with_acls']:,}", file=sys.stderr)
+        print(f"Processing time:             {stats['processing_time']:.2f}s", file=sys.stderr)
+        if args.acl_resolve_names:
+            print(f"Identities resolved:         {len(identity_cache):,}", file=sys.stderr)
+
+        # Export to CSV if requested
+        if args.acl_csv:
+            import csv
+
+            with open(args.acl_csv, 'w', newline='') as csv_file:
+                fieldnames = [
+                    'path',
+                    'ace_count',
+                    'inherited_count',
+                    'explicit_count',
+                    'acl_shorthand'
+                ]
+
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+
+                file_acls = acl_report['file_acls']
+
+                # Generate readable ACLs for CSV
+                for path, acl_info in file_acls.items():
+                    acl_data = acl_info['acl_data']
+                    is_directory = acl_info['is_directory']
+
+                    # Skip if no ACL data
+                    if not acl_data:
+                        continue
+
+                    # Generate readable ACL with names if requested
+                    if args.acl_resolve_names and identity_cache:
+                        readable_acl = qacl_to_readable_acl_with_names(
+                            acl_data,
+                            is_directory=is_directory,
+                            identity_cache=identity_cache
+                        )
+                    else:
+                        readable_acl = qacl_to_readable_acl(acl_data, is_directory=is_directory)
+
+                    # Extract ACE counts from acl_data
+                    # Handle nested structure (get_file_acl returns {generated: bool, acl: {...}})
+                    acl_dict = acl_data.get('acl', acl_data) if 'acl' in acl_data else acl_data
+                    aces = acl_dict.get('aces', [])
+                    ace_count = len(aces)
+                    inherited_count = sum(1 for ace in aces if ace.get('flags', []) and 'INHERITED' in ace['flags'])
+                    explicit_count = ace_count - inherited_count
+
+                    writer.writerow({
+                        'path': path,
+                        'ace_count': ace_count,
+                        'inherited_count': inherited_count,
+                        'explicit_count': explicit_count,
+                        'acl_shorthand': readable_acl
+                    })
+
+            print(f"\n[INFO] ACL CSV exported to: {args.acl_csv}", file=sys.stderr)
+
+        print("\n" + "=" * 70, file=sys.stderr)
+
+        # Save identity cache before exiting
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return  # Exit after ACL report
 
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
@@ -3076,6 +3831,22 @@ Examples:
         "--show-dir-stats",
         action="store_true",
         help="Show directory statistics without enumerating files (exploration mode)",
+    )
+
+    # ACL reporting options
+    parser.add_argument(
+        "--acl-report",
+        action="store_true",
+        help="Generate ACL inventory report showing unique ACLs and affected files",
+    )
+    parser.add_argument(
+        "--acl-csv",
+        help="Export per-file ACL data to CSV file (requires --acl-report)",
+    )
+    parser.add_argument(
+        "--acl-resolve-names",
+        action="store_true",
+        help="Resolve auth_ids and SIDs to human-readable names in ACL report (uses identity cache)",
     )
 
     # Output options
