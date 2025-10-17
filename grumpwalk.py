@@ -2700,15 +2700,25 @@ def calculate_confidence_percentage(num_sample_points: int) -> str:
 
 def calculate_sample_points(file_size: int, sample_points: Optional[int] = None) -> List[int]:
     """
-    Calculate adaptive sample points based on file size.
+    Calculate adaptive sample points based on file size using stratified + random sampling.
+
+    Uses a tiered approach:
+    - Fixed points: start (0) and end
+    - Stratified points: evenly distributed across file
+    - Random points: deterministic pseudorandom offsets for better edge-case coverage
+
+    This hybrid approach maximizes coverage and catches localized edits that purely
+    evenly-spaced samples might miss.
 
     Args:
         file_size: Size of the file in bytes
         sample_points: Override number of sample points (3-11), or None for adaptive
 
     Returns:
-        List of byte offsets to sample from
+        List of byte offsets to sample from (non-overlapping, sorted)
     """
+    import random
+
     SAMPLE_CHUNK_SIZE = 65536  # 64KB per sample
 
     # Special case: empty files
@@ -2731,20 +2741,52 @@ def calculate_sample_points(file_size: int, sample_points: Optional[int] = None)
         else:  # >= 10GB
             num_points = 11
 
-    # Calculate evenly distributed offsets
     offsets = []
-    for i in range(num_points):
-        # Distribute points evenly: 0%, ~14%, ~28%, ..., ~85%, ~100%
-        position = i / (num_points - 1) if num_points > 1 else 0
-        offset = int(position * file_size)
 
-        # Ensure we don't read past end of file
-        if offset + SAMPLE_CHUNK_SIZE > file_size:
-            offset = max(0, file_size - SAMPLE_CHUNK_SIZE)
+    def add_offset(pos):
+        """Add offset if it doesn't overlap with existing offsets."""
+        pos = max(0, min(max(0, file_size - SAMPLE_CHUNK_SIZE), pos))
+        # Check for overlaps
+        for existing in offsets:
+            if not (pos + SAMPLE_CHUNK_SIZE <= existing or existing + SAMPLE_CHUNK_SIZE <= pos):
+                return False
+        offsets.append(pos)
+        return True
 
-        offsets.append(offset)
+    # Fixed points: start and end
+    add_offset(0)
+    if file_size >= SAMPLE_CHUNK_SIZE:
+        add_offset(file_size - SAMPLE_CHUNK_SIZE)
 
-    # Remove duplicates (can happen with very small files) and sort
+    # Calculate how many stratified vs random points we need
+    # Use 60% stratified, 40% random distribution
+    remaining = num_points - len(offsets)
+    num_stratified = max(1, int(remaining * 0.6))
+    num_random = remaining - num_stratified
+
+    # Stratified points: evenly distributed
+    for i in range(1, num_stratified + 1):
+        position = i / (num_stratified + 1)
+        offset = int(position * file_size - SAMPLE_CHUNK_SIZE / 2)
+        add_offset(offset)
+
+    # Random points: deterministic based on file size
+    # Use file_size as seed for reproducibility
+    seed = file_size % (2**32)
+    rng = random.Random(seed)
+
+    tries = 0
+    max_tries = 1000
+    while len(offsets) < num_points and tries < max_tries:
+        if file_size <= SAMPLE_CHUNK_SIZE:
+            pos = 0
+        else:
+            pos = rng.randrange(0, file_size - SAMPLE_CHUNK_SIZE + 1)
+        if add_offset(pos):
+            continue
+        tries += 1
+
+    # Remove duplicates and sort
     return sorted(set(offsets))
 
 
@@ -2756,7 +2798,13 @@ async def compute_sample_hash(
     sample_points: Optional[int] = None
 ) -> Optional[str]:
     """
-    Compute a hash from multiple sample points in a file.
+    Compute a position-aware hash from multiple sample points in a file.
+
+    Uses position-aware fingerprinting: includes offset and length metadata
+    in the hash to prevent false positives when files have identical chunks
+    at different positions.
+
+    Format: hash(offset1 + length1 + data1 + offset2 + length2 + data2 + ...)
 
     Args:
         client: AsyncQumuloClient instance
@@ -2766,9 +2814,10 @@ async def compute_sample_hash(
         sample_points: Optional override for number of sample points
 
     Returns:
-        SHA-256 hash of concatenated samples, or None if failed
+        SHA-256 hash of position-aware fingerprint, or None if failed
     """
     import hashlib
+    import struct
 
     SAMPLE_CHUNK_SIZE = 65536  # 64KB
 
@@ -2786,11 +2835,16 @@ async def compute_sample_hash(
     if None in chunks:
         return None
 
-    # Concatenate all chunks and hash
-    combined = b''.join(chunks)
-    hash_digest = hashlib.sha256(combined).hexdigest()
+    # Build position-aware fingerprint
+    # Format: offset (8 bytes) + length (8 bytes) + data
+    hasher = hashlib.sha256()
+    for offset, chunk in zip(offsets, chunks):
+        # Pack offset and length as little-endian 64-bit unsigned integers
+        hasher.update(struct.pack('<Q', offset))
+        hasher.update(struct.pack('<Q', len(chunk)))
+        hasher.update(chunk)
 
-    return hash_digest
+    return hasher.hexdigest()
 
 
 async def find_duplicates(
