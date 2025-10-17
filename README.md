@@ -156,7 +156,8 @@ pip install -r requirements.txt
 **--omit-subdirs** - Pattern-based filtering (supports wildcards):
 ```bash
 --omit-subdirs temp             # Skip any directory named "temp"
---omit-subdirs /home/bob        # Skip directories matching this pattern
+--omit-subdirs /home/bob        # Skip directories matching this pattern at a point
+# past the value provided via --path.  See --omit-path for absolute path matching
 --omit-subdirs '/home/*/backup' # Skip backup dirs in all home directories
 ```
 
