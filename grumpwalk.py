@@ -1237,7 +1237,15 @@ class AsyncQumuloClient:
                 should_omit = False
                 matched_pattern = None
                 for pattern in omit_subdirs:
-                    if fnmatch.fnmatch(subdir_name, pattern):
+                    # Normalize pattern by stripping trailing slashes for matching
+                    normalized_pattern = pattern.rstrip("/")
+
+                    # Try matching against:
+                    # 1. Full path (e.g., "/home/bob" matches "/home/bob")
+                    # 2. Directory name only (e.g., "bob" matches "bob")
+                    # 3. Pattern with wildcards (e.g., "bob*" matches "bob123")
+                    if (fnmatch.fnmatch(subdir_path.rstrip("/"), normalized_pattern) or
+                        fnmatch.fnmatch(subdir_name, normalized_pattern)):
                         should_omit = True
                         matched_pattern = pattern
                         break
