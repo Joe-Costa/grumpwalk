@@ -2833,6 +2833,7 @@ async def find_duplicates(
     by_size_only: bool = False,
     sample_points: Optional[int] = None,
     sample_chunk_size: int = 65536,
+    estimate_only: bool = False,
     progress: Optional['ProgressTracker'] = None
 ) -> Dict[str, List[Dict]]:
     """
@@ -2876,6 +2877,65 @@ async def find_duplicates(
     if progress and progress.verbose:
         total_potential = sum(len(v) for v in potential_duplicates.values())
         print(f"[DUPLICATE DETECTION] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} groups", file=sys.stderr)
+
+    # If estimate-only mode, calculate and display data transfer estimate, then exit
+    if estimate_only:
+        total_files = sum(len(v) for v in potential_duplicates.values())
+        total_file_size = 0
+        total_data_to_read = 0
+
+        # Calculate estimates for each size group
+        for fingerprint, group in potential_duplicates.items():
+            size_str = fingerprint.split(':')[0]
+            file_size = int(size_str)
+            total_file_size += file_size * len(group)
+
+            # Calculate sample points for this file size
+            sample_offsets = calculate_sample_points(file_size, sample_points, sample_chunk_size)
+            num_points = len(sample_offsets)
+
+            # Data to read per file
+            data_per_file = min(num_points * sample_chunk_size, file_size)
+            total_data_to_read += data_per_file * len(group)
+
+        # Calculate coverage percentage
+        if total_file_size > 0:
+            coverage_pct = (total_data_to_read / total_file_size) * 100
+        else:
+            coverage_pct = 0
+
+        # Format human-readable sizes
+        def format_bytes(b):
+            if b >= 1_000_000_000_000:
+                return f"{b / 1_000_000_000_000:.2f} TB"
+            elif b >= 1_000_000_000:
+                return f"{b / 1_000_000_000:.2f} GB"
+            elif b >= 1_000_000:
+                return f"{b / 1_000_000:.2f} MB"
+            elif b >= 1_000:
+                return f"{b / 1_000:.2f} KB"
+            else:
+                return f"{b} bytes"
+
+        # Human-readable chunk size
+        if sample_chunk_size >= 1048576:
+            chunk_str = f"{sample_chunk_size / 1048576:.1f}MB".rstrip('0').rstrip('.')
+        elif sample_chunk_size >= 1024:
+            chunk_str = f"{sample_chunk_size / 1024:.0f}KB"
+        else:
+            chunk_str = f"{sample_chunk_size}B"
+
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(f"DUPLICATE DETECTION - DATA TRANSFER ESTIMATE", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
+        print(f"Files to scan:        {total_files:,}", file=sys.stderr)
+        print(f"Total file size:      {format_bytes(total_file_size)}", file=sys.stderr)
+        print(f"Sample chunk size:    {chunk_str}", file=sys.stderr)
+        print(f"Data to read:         {format_bytes(total_data_to_read)}", file=sys.stderr)
+        print(f"Coverage:             {coverage_pct:.2f}%", file=sys.stderr)
+        print(f"{'=' * 70}\n", file=sys.stderr)
+
+        return {}  # Return empty dict to exit without doing actual hashing
 
     # If size-only mode, return now
     if by_size_only:
@@ -4153,11 +4213,16 @@ async def main_async(args):
             by_size_only=args.by_size,
             sample_points=args.sample_points,
             sample_chunk_size=args.sample_size if args.sample_size else 65536,
+            estimate_only=args.estimate_size,
             progress=progress
         )
 
         if profiler:
             profiler.record_sync("duplicate_detection", time.time() - dup_start)
+
+        # If estimate-only, we're done (report was already printed)
+        if args.estimate_size:
+            return
 
         # Report results
         if not duplicates:
@@ -4829,6 +4894,13 @@ Examples:
              "Default is 64KB. Larger sizes improve detection of small differences "
              "but increase network transfer. Accepts values like: 64KB, 128KB, 256KB, "
              "512KB, 1MB, 1.5MB, etc.",
+    )
+    parser.add_argument(
+        "--estimate-size",
+        action="store_true",
+        help="Estimate data transfer size for duplicate detection and exit. "
+             "Shows how much data will be read based on --sample-size and --sample-points. "
+             "Only valid with --find-duplicates.",
     )
 
     # Output options
