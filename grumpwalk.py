@@ -7,7 +7,7 @@ High-performance async implementation using direct REST API calls instead of qq 
 Applies lessons learned from benchmark_async_aiohttp.py for 6-7x performance improvement.
 
 Usage:
-    ./qumulo_file_filter_async.py --host <cluster> --path <path> [OPTIONS]
+    ./grumpwalk.py --host <cluster> --path <path> [OPTIONS]
 
 Key improvements over bash version:
 - Direct REST API calls via aiohttp (no subprocess overhead)
@@ -4612,31 +4612,31 @@ def main():
         epilog="""
 Examples:
   # Find files older than 30 days
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /home --older-than 30
+  ./grumpwalk.py --host cluster.example.com --path /home --older-than 30
 
   # Find large files with progress tracking
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /data --larger-than 1GB --progress
+  ./grumpwalk.py --host cluster.example.com --path /data --larger-than 1GB --progress
 
   # Search for log files or temporary files (OR logic, glob wildcards)
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /var --name '*.log' --name '*.tmp'
+  ./grumpwalk.py --host cluster.example.com --path /var --name '*.log' --name '*.tmp'
 
   # Search for backup files from 2024 (AND logic)
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /backups --name-and '*backup*' --name-and '*2024*'
+  ./grumpwalk.py --host cluster.example.com --path /backups --name-and '*backup*' --name-and '*2024*'
 
   # Find all Python test files (glob pattern)
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+  ./grumpwalk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
 
   # Find all directories starting with "temp" (regex pattern)
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /data --name '^temp.*' --type directory
+  ./grumpwalk.py --host cluster.example.com --path /data --name '^temp.*' --type directory
 
   # Case-sensitive search for README files
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /docs --name '^README$' --name-case-sensitive
+  ./grumpwalk.py --host cluster.example.com --path /docs --name '^README$' --name-case-sensitive
 
   # High-performance mode with increased concurrency
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /home --older-than 90 --max-concurrent 200 --connector-limit 200
+  ./grumpwalk.py --host cluster.example.com --path /home --older-than 90 --max-concurrent 200 --connector-limit 200
 
   # Output to JSON file
-  ./qumulo_file_filter_async.py --host cluster.example.com --path /home --older-than 30 --json-out results.json --all-attributes
+  ./grumpwalk.py --host cluster.example.com --path /home --older-than 30 --json-out results.json --all-attributes
         """,
     )
 
@@ -4869,38 +4869,31 @@ Examples:
     parser.add_argument(
         "--find-duplicates",
         action="store_true",
-        help="Find duplicate files using adaptive sampling strategy. "
-             "Groups files by size+datablocks, then computes sample hashes.",
+        help="Find duplicate files using metadata + sample hashing",
     )
     parser.add_argument(
         "--by-size",
         action="store_true",
-        help="Use size-only duplicate detection (fast, may have false positives). "
-             "Only valid with --find-duplicates.",
+        help="Match by size+metadata only (fast, may have false positives)",
     )
     parser.add_argument(
         "--sample-points",
         type=int,
         choices=range(3, 12),
         metavar="N",
-        help="Override number of sample points for duplicate detection (3-11). "
-             "Default is adaptive based on file size.",
+        help="Number of sample points (3-11, default: adaptive)",
     )
     parser.add_argument(
         "--sample-size",
         type=parse_size_to_bytes,
         metavar="SIZE",
-        help="Sample chunk size for duplicate detection (e.g., 64KB, 256KB, 1MB). "
-             "Default is 64KB. Larger sizes improve detection of small differences "
-             "but increase network transfer. Accepts values like: 64KB, 128KB, 256KB, "
-             "512KB, 1MB, 1.5MB, etc.",
+        help="Sample chunk size (e.g., 64KB, 256KB, 1MB, default: 64KB). "
+             "Larger sizes = better accuracy, more network transfer",
     )
     parser.add_argument(
         "--estimate-size",
         action="store_true",
-        help="Estimate data transfer size for duplicate detection and exit. "
-             "Shows how much data will be read based on --sample-size and --sample-points. "
-             "Only valid with --find-duplicates.",
+        help="Show data transfer estimate and exit (no hashing)",
     )
 
     # Output options
