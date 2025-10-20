@@ -864,6 +864,97 @@ class AsyncQumuloClient:
             except aiohttp.ClientError as e:
                 return (False, str(e))
 
+    async def get_file_owner_group(
+        self,
+        session: aiohttp.ClientSession,
+        path: str
+    ) -> Optional[dict]:
+        """
+        Get owner and group information for a file or directory using v1 attributes API.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the file/directory
+
+        Returns:
+            Dictionary with 'owner', 'owner_details', 'group', 'group_details' or None if failed
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'owner': data.get('owner'),
+                            'owner_details': data.get('owner_details'),
+                            'group': data.get('group'),
+                            'group_details': data.get('group_details')
+                        }
+                    else:
+                        return None
+            except aiohttp.ClientError:
+                return None
+
+    async def set_file_owner_group(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        owner: Optional[str] = None,
+        group: Optional[str] = None
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Set owner and/or group for a file or directory using v1 attributes PATCH API.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the file/directory
+            owner: Owner auth_id to set (if provided)
+            group: Group auth_id to set (if provided)
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
+
+            # Build PATCH payload with only specified fields
+            payload = {}
+            if owner is not None:
+                payload['owner'] = owner
+            if group is not None:
+                payload['group'] = group
+
+            # Return success if nothing to update
+            if not payload:
+                return (True, None)
+
+            try:
+                async with session.patch(
+                    url, json=payload, ssl=self.ssl_context
+                ) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    else:
+                        error_msg = f"HTTP {response.status}"
+                        try:
+                            error_detail = await response.json()
+                            error_msg += f": {error_detail.get('description', '')}"
+                        except:
+                            pass
+                        return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
     async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
         """
         Read the target of a symlink.
@@ -2617,14 +2708,18 @@ async def apply_acl_to_tree(
     file_filter = None,
     progress: bool = False,
     continue_on_error: bool = False,
-    args = None
+    args = None,
+    owner_group_data: Optional[dict] = None,
+    copy_owner: bool = False,
+    copy_group: bool = False,
+    owner_group_only: bool = False
 ) -> dict:
     """
-    Apply ACL to target path, optionally propagating to filtered children.
+    Apply ACL and/or owner/group to target path, optionally propagating to filtered children.
 
-    Applies ACL to:
-    1. Target path itself (no INHERITED flag modification)
-    2. If propagate=True, all matching children (with INHERITED flag added)
+    Applies to:
+    1. Target path itself (no INHERITED flag modification for ACL)
+    2. If propagate=True, all matching children (with INHERITED flag added to ACL)
 
     Children are filtered using the standard file_filter (Universal Filters).
 
@@ -2638,6 +2733,10 @@ async def apply_acl_to_tree(
         progress: Show progress output
         continue_on_error: Continue on 401 errors after initial success
         args: Command line arguments for filter parameters
+        owner_group_data: Owner/group data from source (optional)
+        copy_owner: Copy owner from source
+        copy_group: Copy group from source
+        owner_group_only: Apply only owner/group, not ACL
 
     Returns:
         Statistics dict:
@@ -2659,24 +2758,51 @@ async def apply_acl_to_tree(
 
     start_time = time.time()
 
-    # Step 1: Apply to target path (unmodified ACL)
+    # Step 1: Apply to target path
     if progress:
-        print(f"[ACL CLONE] Applying ACL to target: {target_path}", file=sys.stderr)
+        if owner_group_only:
+            print(f"[OWNER/GROUP] Applying owner/group to target: {target_path}", file=sys.stderr)
+        elif copy_owner or copy_group:
+            print(f"[ACL+OWNER/GROUP] Applying ACL and owner/group to target: {target_path}", file=sys.stderr)
+        else:
+            print(f"[ACL CLONE] Applying ACL to target: {target_path}", file=sys.stderr)
 
-    success, error_msg = await client.set_file_acl(
-        session, target_path, acl_data, mark_inherited=False
-    )
+    # Apply ACL if not owner_group_only
+    if not owner_group_only:
+        success, error_msg = await client.set_file_acl(
+            session, target_path, acl_data, mark_inherited=False
+        )
 
-    if not success:
-        print(f"\n[ERROR] Failed to apply ACL to target path: {target_path}", file=sys.stderr)
-        print(f"[ERROR] {error_msg}", file=sys.stderr)
-        stats['objects_failed'] = 1
-        stats['errors'].append({
-            'path': target_path,
-            'error_code': 'INITIAL_FAILURE',
-            'message': error_msg
-        })
-        return stats
+        if not success:
+            print(f"\n[ERROR] Failed to apply ACL to target path: {target_path}", file=sys.stderr)
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            stats['objects_failed'] = 1
+            stats['errors'].append({
+                'path': target_path,
+                'error_code': 'INITIAL_FAILURE',
+                'message': error_msg
+            })
+            return stats
+
+    # Apply owner/group if requested
+    if (copy_owner or copy_group) and owner_group_data:
+        owner_to_set = owner_group_data.get('owner') if copy_owner else None
+        group_to_set = owner_group_data.get('group') if copy_group else None
+
+        success, error_msg = await client.set_file_owner_group(
+            session, target_path, owner=owner_to_set, group=group_to_set
+        )
+
+        if not success:
+            print(f"\n[ERROR] Failed to apply owner/group to target path: {target_path}", file=sys.stderr)
+            print(f"[ERROR] {error_msg}", file=sys.stderr)
+            stats['objects_failed'] = 1
+            stats['errors'].append({
+                'path': target_path,
+                'error_code': 'OWNER_GROUP_FAILURE',
+                'message': error_msg
+            })
+            return stats
 
     stats['objects_changed'] = 1
     stats['total_objects_processed'] = 1
@@ -2716,7 +2842,36 @@ async def apply_acl_to_tree(
     # Batch size for parallel ACL application
     batch_size = 100
 
-    # Process files in batches for parallel ACL application
+    # Helper async function to apply both ACL and owner/group to a single file
+    async def apply_to_single_file(path: str):
+        """Apply ACL and/or owner/group to a single file"""
+        acl_success = True
+        og_success = True
+        error_msg = None
+
+        # Apply ACL if not owner_group_only
+        if not owner_group_only:
+            acl_success, acl_error = await client.set_file_acl(
+                session, path, acl_data, mark_inherited=True
+            )
+            if not acl_success:
+                error_msg = acl_error
+
+        # Apply owner/group if requested
+        if (copy_owner or copy_group) and owner_group_data:
+            owner_to_set = owner_group_data.get('owner') if copy_owner else None
+            group_to_set = owner_group_data.get('group') if copy_group else None
+
+            og_success, og_error = await client.set_file_owner_group(
+                session, path, owner=owner_to_set, group=group_to_set
+            )
+            if not og_success:
+                error_msg = og_error if not error_msg else f"{error_msg}; {og_error}"
+
+        # Return combined result
+        return (acl_success and og_success, error_msg)
+
+    # Process files in batches for parallel application
     for i in range(0, total_to_process, batch_size):
         batch = matching_files[i:i + batch_size]
 
@@ -2726,7 +2881,7 @@ async def apply_acl_to_tree(
         for entry in batch:
             path = entry['path']
             paths.append(path)
-            task = client.set_file_acl(session, path, acl_data, mark_inherited=True)
+            task = apply_to_single_file(path)
             tasks.append(task)
 
         # Execute all tasks in this batch concurrently
@@ -4133,6 +4288,24 @@ async def main_async(args):
                 ace_count = len(source_acl.get('acl', {}).get('aces', []))
                 print(f"[INFO] Retrieved ACL with {ace_count} ACEs", file=sys.stderr)
 
+            # Step 1b: Retrieve owner/group if requested
+            owner_group_data = None
+            if args.copy_owner or args.copy_group:
+                if args.verbose:
+                    print(f"[INFO] Retrieving owner/group from: {args.source_acl}", file=sys.stderr)
+
+                owner_group_data = await client.get_file_owner_group(session, args.source_acl)
+
+                if not owner_group_data:
+                    print(f"[ERROR] Could not retrieve owner/group from {args.source_acl}", file=sys.stderr)
+                    sys.exit(1)
+
+                if args.verbose:
+                    if args.copy_owner:
+                        print(f"[INFO] Source owner: {owner_group_data.get('owner')}", file=sys.stderr)
+                    if args.copy_group:
+                        print(f"[INFO] Source group: {owner_group_data.get('group')}", file=sys.stderr)
+
             # Step 2: Check ACL type compatibility and warn if needed
             proceed = await check_acl_type_compatibility(
                 client=client,
@@ -4155,7 +4328,7 @@ async def main_async(args):
 
             file_filter = create_file_filter(args, owner_auth_ids)
 
-            # Step 4: Apply ACL to target tree
+            # Step 4: Apply ACL and/or owner/group to target tree
             stats = await apply_acl_to_tree(
                 client=client,
                 session=session,
@@ -4165,14 +4338,34 @@ async def main_async(args):
                 file_filter=file_filter,
                 progress=args.progress,
                 continue_on_error=args.continue_on_error,
-                args=args
+                args=args,
+                owner_group_data=owner_group_data,
+                copy_owner=args.copy_owner,
+                copy_group=args.copy_group,
+                owner_group_only=args.owner_group_only
             )
 
             # Step 5: Print summary
-            print("\nACL CLONING SUMMARY", file=sys.stderr)
+            if args.owner_group_only:
+                print("\nOWNER/GROUP COPY SUMMARY", file=sys.stderr)
+            elif args.copy_owner or args.copy_group:
+                print("\nACL + OWNER/GROUP COPY SUMMARY", file=sys.stderr)
+            else:
+                print("\nACL CLONING SUMMARY", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
-            print(f"Source ACL:        {args.source_acl}", file=sys.stderr)
+            print(f"Source:            {args.source_acl}", file=sys.stderr)
             print(f"Target path:       {args.acl_target}", file=sys.stderr)
+
+            # Show what was copied
+            copied_items = []
+            if not args.owner_group_only:
+                copied_items.append("ACL")
+            if args.copy_owner:
+                copied_items.append("Owner")
+            if args.copy_group:
+                copied_items.append("Group")
+            print(f"Copied:            {', '.join(copied_items)}", file=sys.stderr)
+
             print(f"Objects changed:   {stats['objects_changed']:,}", file=sys.stderr)
             print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
             if file_filter:
@@ -5142,6 +5335,21 @@ Examples:
 
   # Output to JSON file
   ./grumpwalk.py --host cluster.example.com --path /home --older-than 30 --json-out results.json --all-attributes
+
+  # Clone ACL from one directory to another
+  ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir
+
+  # Clone ACL and propagate to all children
+  ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls --progress
+
+  # Copy owner and group (with ACL) from source to target
+  ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --copy-owner --copy-group --propagate-acls
+
+  # Copy only owner and group (no ACL changes)
+  ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --copy-owner --copy-group --owner-group-only --propagate-acls
+
+  # Clone ACL to filtered files (e.g., only files older than 30 days)
+  ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls --older-than 30 --type file --progress
         """,
     )
 
@@ -5454,33 +5662,51 @@ Examples:
     )
 
     # ============================================================================
-    # FEATURE: ACL MANAGEMENT
+    # FEATURE: ACL AND OWNER/GROUP MANAGEMENT
     # ============================================================================
-    acl_management = parser.add_argument_group('Feature: ACL Management',
-        'Clone and apply ACLs across file system objects')
+    acl_management = parser.add_argument_group('Feature: ACL and Owner/Group Management',
+        'Copy ACLs, owner, and group between objects')
 
     acl_management.add_argument(
         "--source-acl",
-        help="Path to source object whose ACL to copy",
+        help="Source object path",
         metavar="PATH"
     )
 
     acl_management.add_argument(
         "--acl-target",
-        help="Path to target object/directory to apply ACL (starting point for --propagate-acls)",
+        help="Target object/directory path",
         metavar="PATH"
     )
 
     acl_management.add_argument(
         "--propagate-acls",
         action="store_true",
-        help="Recursively apply ACL to all child objects (adds INHERITED flag to children)"
+        help="Apply to all child objects recursively"
     )
 
     acl_management.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="Continue applying ACLs on 401 permission errors after initial target succeeds"
+        help="Continue on permission errors"
+    )
+
+    acl_management.add_argument(
+        "--copy-owner",
+        action="store_true",
+        help="Copy owner from source"
+    )
+
+    acl_management.add_argument(
+        "--copy-group",
+        action="store_true",
+        help="Copy group from source"
+    )
+
+    acl_management.add_argument(
+        "--owner-group-only",
+        action="store_true",
+        help="Copy only owner/group, skip ACL"
     )
 
     # ============================================================================
@@ -5586,6 +5812,21 @@ Examples:
     if not args.path and not acl_cloning_mode:
         print(
             "Error: Either --path is required OR both --source-acl and --acl-target for ACL cloning",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Validate owner/group flags
+    if (args.copy_owner or args.copy_group) and not args.source_acl:
+        print(
+            "Error: --copy-owner and --copy-group require --source-acl",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.owner_group_only and not (args.copy_owner or args.copy_group):
+        print(
+            "Error: --owner-group-only requires at least one of --copy-owner or --copy-group",
             file=sys.stderr,
         )
         sys.exit(1)
