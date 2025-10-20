@@ -1335,10 +1335,17 @@ async def compute_sample_hash(
         sample_chunk_size: Size of each sample chunk in bytes (default: 65536 / 64KB)
 
     Returns:
-        SHA-256 hash of position-aware fingerprint, or None if failed
+        xxHash or SHA-256 hash of position-aware fingerprint, or None if failed
     """
-    import hashlib
     import struct
+
+    # Try to use xxhash if available (much faster than SHA-256)
+    try:
+        import xxhash
+        hasher = xxhash.xxh128()
+    except ImportError:
+        import hashlib
+        hasher = hashlib.sha256()
 
     SAMPLE_CHUNK_SIZE = sample_chunk_size
 
@@ -1358,7 +1365,6 @@ async def compute_sample_hash(
 
     # Build position-aware fingerprint
     # Format: offset (8 bytes) + length (8 bytes) + data
-    hasher = hashlib.sha256()
     for offset, chunk in zip(offsets, chunks):
         # Pack offset and length as little-endian 64-bit unsigned integers
         hasher.update(struct.pack('<Q', offset))
@@ -1397,7 +1403,15 @@ async def find_similar(
     """
     from collections import defaultdict
 
+    # Check if xxhash is available and inform user
+    try:
+        import xxhash
+        hash_lib = "xxHash (fast)"
+    except ImportError:
+        hash_lib = "SHA-256 (slow - install xxhash for 10x speedup: pip install xxhash)"
+
     if progress and progress.verbose:
+        print(f"[SIMILARITY DETECTION] Using {hash_lib} for file hashing", file=sys.stderr)
         print(f"[SIMILARITY DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
 
     # Phase 1: Group by metadata (size, datablocks, sparse_file)
