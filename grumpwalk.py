@@ -2827,7 +2827,7 @@ async def compute_sample_hash(
     return hasher.hexdigest()
 
 
-async def find_duplicates(
+async def find_similar(
     client: AsyncQumuloClient,
     files: List[Dict],
     by_size_only: bool = False,
@@ -2837,27 +2837,27 @@ async def find_duplicates(
     progress: Optional['ProgressTracker'] = None
 ) -> Dict[str, List[Dict]]:
     """
-    Find duplicate files using metadata filtering and sample hashing.
+    Find similar files using metadata filtering and sample hashing.
 
     Phase 1: Group by size + datablocks + sparse_file (instant)
-    Phase 2: Compute sample hashes for potential duplicates (fast)
-    Phase 3: Return groups of duplicates
+    Phase 2: Compute sample hashes for potential similar files (fast)
+    Phase 3: Return groups of similar files
 
     Args:
         client: AsyncQumuloClient instance
         files: List of file entries with metadata
-        by_size_only: If True, only use size for duplicate detection (no hashing)
+        by_size_only: If True, only use size for similarity detection (no hashing)
         sample_points: Optional override for number of sample points
         sample_chunk_size: Size of each sample chunk in bytes (default: 65536 / 64KB)
         progress: Optional ProgressTracker for status updates
 
     Returns:
-        Dictionary mapping fingerprint -> list of duplicate files
+        Dictionary mapping fingerprint -> list of similar files
     """
     from collections import defaultdict
 
     if progress and progress.verbose:
-        print(f"[DUPLICATE DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
+        print(f"[SIMILARITY DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
 
     # Phase 1: Group by metadata (size, datablocks, sparse_file)
     metadata_groups = defaultdict(list)
@@ -2876,7 +2876,7 @@ async def find_duplicates(
 
     if progress and progress.verbose:
         total_potential = sum(len(v) for v in potential_duplicates.values())
-        print(f"[DUPLICATE DETECTION] Found {total_potential:,} potential duplicates in {len(potential_duplicates):,} groups", file=sys.stderr)
+        print(f"[SIMILARITY DETECTION] Found {total_potential:,} potential similar files in {len(potential_duplicates):,} groups", file=sys.stderr)
 
     # If estimate-only mode, calculate and display data transfer estimate, then exit
     if estimate_only:
@@ -2926,7 +2926,7 @@ async def find_duplicates(
             chunk_str = f"{sample_chunk_size}B"
 
         print(f"\n{'=' * 70}", file=sys.stderr)
-        print(f"DUPLICATE DETECTION - DATA TRANSFER ESTIMATE", file=sys.stderr)
+        print(f"SIMILARITY DETECTION - DATA TRANSFER ESTIMATE", file=sys.stderr)
         print(f"{'=' * 70}", file=sys.stderr)
         print(f"Files to scan:        {total_files:,}", file=sys.stderr)
         print(f"Total file size:      {format_bytes(total_file_size)}", file=sys.stderr)
@@ -2941,9 +2941,9 @@ async def find_duplicates(
     if by_size_only:
         return potential_duplicates
 
-    # Phase 2: Compute sample hashes for potential duplicates
+    # Phase 2: Compute sample hashes for potential similar files
     if progress and progress.verbose:
-        print(f"[DUPLICATE DETECTION] Phase 2: Computing sample hashes", file=sys.stderr)
+        print(f"[SIMILARITY DETECTION] Phase 2: Computing sample hashes", file=sys.stderr)
 
     hash_groups = defaultdict(list)
     BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
@@ -3023,20 +3023,20 @@ async def find_duplicates(
     if progress and is_tty:
         elapsed = time.time() - hash_start_time
         rate = files_hashed / elapsed if elapsed > 0 else 0
-        print(f"\r[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+        print(f"\r[SIMILARITY DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
     elif progress and progress.verbose:
         elapsed = time.time() - hash_start_time
         rate = files_hashed / elapsed if elapsed > 0 else 0
-        print(f"[DUPLICATE DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+        print(f"[SIMILARITY DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
 
-    # Filter to only groups with 2+ files (actual duplicates)
-    duplicates = {k: v for k, v in hash_groups.items() if len(v) >= 2}
+    # Filter to only groups with 2+ files (actual similar files)
+    similar_groups = {k: v for k, v in hash_groups.items() if len(v) >= 2}
 
     if progress and progress.verbose:
-        total_duplicates = sum(len(v) for v in duplicates.values())
-        print(f"[DUPLICATE DETECTION] Found {total_duplicates:,} confirmed duplicates in {len(duplicates):,} groups", file=sys.stderr)
+        total_similar = sum(len(v) for v in similar_groups.values())
+        print(f"[SIMILARITY DETECTION] Found {total_similar:,} confirmed similar files in {len(similar_groups):,} groups", file=sys.stderr)
 
-    return duplicates
+    return similar_groups
 
 
 def parse_size_to_bytes(size_str: str) -> int:
@@ -3646,7 +3646,7 @@ async def generate_owner_report(
 async def main_async(args):
     """Main async function."""
     print("=" * 70, file=sys.stderr)
-    print("Qumulo File Filter - Async Python (aiohttp)", file=sys.stderr)
+    print("GrumpWalk - Qumulo Directory Tree Walk", file=sys.stderr)
     print("=" * 70, file=sys.stderr)
     print(f"Cluster:          {args.host}", file=sys.stderr)
     print(f"Path:             {args.path}", file=sys.stderr)
@@ -3811,17 +3811,17 @@ async def main_async(args):
         tree_walk_start = time.time()
 
     # For owner reports and ACL reports, don't collect matching files to save memory
-    # Also collect results if we need to resolve symlinks, generate ACL reports, or find duplicates
-    collect_results = not args.owner_report or args.resolve_links or args.acl_report or args.find_duplicates
+    # Also collect results if we need to resolve symlinks, generate ACL reports, or find similar files
+    collect_results = not args.owner_report or args.resolve_links or args.acl_report or args.find_similar
 
     # Create output callback for streaming results to stdout (plain text mode only)
     # Disable streaming if --resolve-links is enabled (need to resolve after collection)
     # Disable streaming if --acl-report is enabled (generates its own report)
-    # Disable streaming if --find-duplicates is enabled (need to collect all files first)
+    # Disable streaming if --find-similar is enabled (need to collect all files first)
     output_callback = None
     batched_handler = None
 
-    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_duplicates:
+    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_similar:
         if args.show_owner or args.show_group:
             # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
@@ -4195,19 +4195,19 @@ async def main_async(args):
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after ACL report
 
-    # Find duplicates if requested
-    if args.find_duplicates:
+    # Find similar files if requested
+    if args.find_similar:
         if profiler:
             dup_start = time.time()
 
         print(f"\n{'=' * 70}", file=sys.stderr)
-        print(f"DUPLICATE DETECTION", file=sys.stderr)
+        print(f"SIMILARITY DETECTION", file=sys.stderr)
         print(f"{'=' * 70}", file=sys.stderr)
         print(f"WARNING: Results are ADVISORY ONLY.", file=sys.stderr)
         print(f"Perform additional verification (e.g., full checksums) before deleting files.", file=sys.stderr)
         print(f"{'=' * 70}", file=sys.stderr)
 
-        duplicates = await find_duplicates(
+        similar_files = await find_similar(
             client,
             matching_files,
             by_size_only=args.by_size,
@@ -4218,20 +4218,20 @@ async def main_async(args):
         )
 
         if profiler:
-            profiler.record_sync("duplicate_detection", time.time() - dup_start)
+            profiler.record_sync("similarity_detection", time.time() - dup_start)
 
         # If estimate-only, we're done (report was already printed)
         if args.estimate_size:
             return
 
         # Report results
-        if not duplicates:
-            print("\nNo duplicates found.", file=sys.stderr)
-            # No duplicates, but may still need to create empty CSV or JSON
+        if not similar_files:
+            print("\nNo similar files found.", file=sys.stderr)
+            # No similar files found, but may still need to create empty CSV or JSON
             if args.csv_out:
                 import csv
                 with open(args.csv_out, "w", newline="") as csv_file:
-                    writer = csv.DictWriter(csv_file, fieldnames=["duplicate_group", "path", "size", "confidence"])
+                    writer = csv.DictWriter(csv_file, fieldnames=["similar_group", "path", "size", "coverage"])
                     writer.writeheader()
                 if args.verbose:
                     print(f"\n[INFO] Created empty CSV file: {args.csv_out}", file=sys.stderr)
@@ -4242,8 +4242,8 @@ async def main_async(args):
                 if args.verbose:
                     print(f"\n[INFO] Created empty JSON file: {args.json_out}", file=sys.stderr)
         else:
-            total_groups = len(duplicates)
-            total_dupes = sum(len(group) for group in duplicates.values())
+            total_groups = len(similar_files)
+            total_similar = sum(len(group) for group in similar_files.values())
 
             # Calculate detection method info
             if args.by_size:
@@ -4251,7 +4251,7 @@ async def main_async(args):
                 confidence_value = "Low (size+metadata only)"
             else:
                 # Get sample point count and calculate coverage from first group (representative)
-                first_file = next(iter(duplicates.values()))[0]
+                first_file = next(iter(similar_files.values()))[0]
                 file_size = int(first_file.get('size', 0))
                 chunk_size = args.sample_size if args.sample_size else 65536
                 sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
@@ -4276,49 +4276,49 @@ async def main_async(args):
                 confidence_msg = f"Detection method: {num_points}-point sampling ({chunk_str} chunks, {coverage_str} coverage)"
                 confidence_value = coverage_str
 
-            print(f"\nFound {total_dupes:,} duplicate files in {total_groups:,} groups", file=sys.stderr)
+            print(f"\nFound {total_similar:,} similar files in {total_groups:,} groups", file=sys.stderr)
             print(f"{confidence_msg}", file=sys.stderr)
             print(f"{'=' * 70}\n", file=sys.stderr)
 
-            # Handle CSV output for duplicates
+            # Handle CSV output for similar files
             if args.csv_out:
                 import csv
                 with open(args.csv_out, "w", newline="") as csv_file:
-                    fieldnames = ["duplicate_group", "path", "size", "coverage"]
+                    fieldnames = ["similar_group", "path", "size", "coverage"]
                     writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                     writer.writeheader()
 
-                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                    for group_id, (fingerprint, files) in enumerate(similar_files.items(), 1):
                         # Extract size from fingerprint
                         size_str = fingerprint.split(':')[0]
                         file_size = int(size_str)
 
                         for f in files:
                             writer.writerow({
-                                "duplicate_group": group_id,
+                                "similar_group": group_id,
                                 "path": f['path'],
                                 "size": file_size,
                                 "coverage": confidence_value
                             })
 
                 if args.verbose:
-                    print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
+                    print(f"\n[INFO] Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
             elif args.json_out or args.json:
-                # Handle JSON output for duplicates
+                # Handle JSON output for similar files
                 output_handle = open(args.json_out, 'w') if args.json_out else sys.stdout
 
                 try:
-                    for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                    for group_id, (fingerprint, files) in enumerate(similar_files.items(), 1):
                         # Extract size from fingerprint
                         size_str = fingerprint.split(':')[0]
                         file_size = int(size_str)
 
                         for f in files:
                             entry = {
-                                "duplicate_group": group_id,
+                                "similar_group": group_id,
                                 "path": f['path'],
                                 "size": file_size,
-                                "confidence": confidence_value
+                                "coverage": confidence_value
                             }
 
                             # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
@@ -4330,10 +4330,10 @@ async def main_async(args):
                     if args.json_out:
                         output_handle.close()
                         if args.verbose:
-                            print(f"\n[INFO] Wrote {total_dupes:,} duplicate files ({total_groups:,} groups) to {args.json_out}", file=sys.stderr)
+                            print(f"\n[INFO] Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.json_out}", file=sys.stderr)
             else:
-                # Output duplicate groups to stderr (text mode)
-                for group_id, (fingerprint, files) in enumerate(duplicates.items(), 1):
+                # Output similar file groups to stderr (text mode)
+                for group_id, (fingerprint, files) in enumerate(similar_files.items(), 1):
                     # Extract size from fingerprint
                     size_str = fingerprint.split(':')[0]
                     file_size = int(size_str)
@@ -4348,7 +4348,7 @@ async def main_async(args):
 
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
-        return  # Exit after duplicate detection
+        return  # Exit after similarity detection
 
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
@@ -4640,16 +4640,24 @@ Examples:
         """,
     )
 
-    # Required arguments
-    parser.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
-    parser.add_argument("--path", required=True, help="Path to search")
+    # ============================================================================
+    # Required Arguments
+    # ============================================================================
+    required = parser.add_argument_group('Required Arguments')
+    required.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
+    required.add_argument("--path", required=True, help="Path to search")
+
+    # ============================================================================
+    # General Filters (work with any feature)
+    # ============================================================================
+    filters = parser.add_argument_group('General Filters')
 
     # Time filters
-    parser.add_argument("--older-than", type=int, help="Find files older than N days")
-    parser.add_argument("--newer-than", type=int, help="Find files newer than N days")
+    filters.add_argument("--older-than", type=int, help="Find files older than N days")
+    filters.add_argument("--newer-than", type=int, help="Find files newer than N days")
 
     # Time field selection
-    parser.add_argument(
+    filters.add_argument(
         "--time-field",
         default="creation_time",
         choices=["creation_time", "modification_time", "access_time", "change_time"],
@@ -4865,11 +4873,11 @@ Examples:
         help="Resolve auth_ids and SIDs to human-readable names in ACL report (uses identity cache)",
     )
 
-    # Duplicate detection options
+    # Similarity detection options
     parser.add_argument(
-        "--find-duplicates",
+        "--find-similar",
         action="store_true",
-        help="Find duplicate files using metadata + sample hashing",
+        help="Find similar files using metadata + sample hashing",
     )
     parser.add_argument(
         "--by-size",
