@@ -2707,50 +2707,98 @@ async def apply_acl_to_tree(
     if progress:
         print(f"[ACL CLONE] Found {total_to_process:,} child objects to process", file=sys.stderr)
 
-    # Apply ACL to each child
-    for entry in matching_files:
-        path = entry['path']
-        processed += 1
-        stats['total_objects_processed'] += 1
+    # Batch size for parallel ACL application
+    batch_size = 100
 
-        # Apply ACL with INHERITED flag
-        success, error_msg = await client.set_file_acl(
-            session, path, acl_data, mark_inherited=True
-        )
+    # Process files in batches for parallel ACL application
+    for i in range(0, total_to_process, batch_size):
+        batch = matching_files[i:i + batch_size]
 
-        if success:
-            stats['objects_changed'] += 1
-        else:
-            stats['objects_failed'] += 1
-            stats['errors'].append({
-                'path': path,
-                'error_code': 'APPLY_FAILURE',
-                'message': error_msg
-            })
+        # Create tasks for parallel execution
+        tasks = []
+        paths = []
+        for entry in batch:
+            path = entry['path']
+            paths.append(path)
+            task = client.set_file_acl(session, path, acl_data, mark_inherited=True)
+            tasks.append(task)
 
-            # Handle errors based on settings
-            is_401 = '401' in error_msg or 'Unauthorized' in error_msg
+        # Execute all tasks in this batch concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if is_401 and continue_on_error:
-                # Log and continue
-                if progress:
-                    print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
-            else:
-                # Pause and prompt
-                print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
-                print(f"[ERROR] {error_msg}", file=sys.stderr)
+        # Process results from this batch
+        for path, result in zip(paths, results):
+            processed += 1
+            stats['total_objects_processed'] += 1
 
-                while True:
-                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
-                    if response in ['c', 'continue']:
-                        break
-                    elif response in ['a', 'abort']:
-                        print("[INFO] Operation aborted by user.", file=sys.stderr)
-                        return stats
-                    print("Invalid response. Please enter 'c' or 'a'.")
+            if isinstance(result, Exception):
+                # Task raised an exception
+                stats['objects_failed'] += 1
+                error_msg = str(result)
+                stats['errors'].append({
+                    'path': path,
+                    'error_code': 'EXCEPTION',
+                    'message': error_msg
+                })
 
-        # Progress reporting
-        if progress and (processed % 100 == 0 or processed == total_to_process):
+                # Handle errors based on settings
+                is_401 = '401' in error_msg or 'Unauthorized' in error_msg.lower()
+
+                if is_401 and continue_on_error:
+                    # Log and continue
+                    if progress:
+                        print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
+                else:
+                    # Pause and prompt
+                    print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
+                    print(f"[ERROR] {error_msg}", file=sys.stderr)
+
+                    while True:
+                        response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                        if response in ['c', 'continue']:
+                            break
+                        elif response in ['a', 'abort']:
+                            print("[INFO] Operation aborted by user.", file=sys.stderr)
+                            return stats
+                        print("Invalid response. Please enter 'c' or 'a'.")
+
+            elif isinstance(result, tuple):
+                # Normal return: (success: bool, error_msg: Optional[str])
+                success, error_msg = result
+
+                if success:
+                    stats['objects_changed'] += 1
+                else:
+                    stats['objects_failed'] += 1
+                    stats['errors'].append({
+                        'path': path,
+                        'error_code': 'APPLY_FAILURE',
+                        'message': error_msg
+                    })
+
+                    # Handle errors based on settings
+                    is_401 = '401' in error_msg or 'Unauthorized' in error_msg.lower()
+
+                    if is_401 and continue_on_error:
+                        # Log and continue
+                        if progress:
+                            print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
+                    else:
+                        # Pause and prompt
+                        print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
+                        print(f"[ERROR] {error_msg}", file=sys.stderr)
+
+                        while True:
+                            response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                            if response in ['c', 'continue']:
+                                break
+                            elif response in ['a', 'abort']:
+                                print("[INFO] Operation aborted by user.", file=sys.stderr)
+                                return stats
+                            print("Invalid response. Please enter 'c' or 'a'.")
+
+        # Progress reporting after each batch
+        if progress:
             elapsed = time.time() - start_time
             rate = processed / elapsed if elapsed > 0 else 0
             remaining = total_to_process - processed
