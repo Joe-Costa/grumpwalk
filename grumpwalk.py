@@ -1591,9 +1591,7 @@ async def find_similar(
         total_similar = sum(len(v) for v in similar_groups.values())
         print(f"[SIMILARITY DETECTION] Found {total_similar:,} confirmed similar files in {len(similar_groups):,} groups", file=sys.stderr)
 
-        return True
-
-    return file_filter
+    return similar_groups
 
 
 async def generate_owner_report(
@@ -2479,25 +2477,33 @@ async def main_async(args):
             total_groups = len(similar_files)
             total_similar = sum(len(group) for group in similar_files.values())
 
-            # Calculate detection method info
+            # Helper function to calculate coverage for a specific file size
+            def calculate_coverage(file_size):
+                if args.by_size:
+                    return "Low (size+metadata only)"
+                chunk_size = args.sample_size if args.sample_size else 65536
+                sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
+                num_points = len(sample_offsets)
+                if file_size > 0:
+                    total_sampled = num_points * chunk_size
+                    coverage_pct = min(100.0, (total_sampled / file_size) * 100)
+                    return f"{coverage_pct:.1f}%" if coverage_pct < 100 else "100%"
+                else:
+                    return "N/A"
+
+            # Calculate detection method info for summary message
             if args.by_size:
                 confidence_msg = "Detection method: Size+metadata only (may have false positives)"
-                confidence_value = "Low (size+metadata only)"
             else:
-                # Get sample point count and calculate coverage from first group (representative)
+                # Get sample point count from first group (representative)
                 first_file = next(iter(similar_files.values()))[0]
                 file_size = int(first_file.get('size', 0))
                 chunk_size = args.sample_size if args.sample_size else 65536
                 sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
                 num_points = len(sample_offsets)
 
-                # Calculate actual coverage percentage
-                if file_size > 0:
-                    total_sampled = num_points * chunk_size
-                    coverage_pct = min(100.0, (total_sampled / file_size) * 100)
-                    coverage_str = f"{coverage_pct:.1f}%" if coverage_pct < 100 else "100%"
-                else:
-                    coverage_str = "N/A"
+                # Calculate representative coverage percentage
+                coverage_str = calculate_coverage(file_size)
 
                 # Human-readable chunk size
                 if chunk_size >= 1048576:
@@ -2508,7 +2514,6 @@ async def main_async(args):
                     chunk_str = f"{chunk_size}B"
 
                 confidence_msg = f"Detection method: {num_points}-point sampling ({chunk_str} chunks, {coverage_str} coverage)"
-                confidence_value = coverage_str
 
             print(f"\nFound {total_similar:,} similar files in {total_groups:,} groups", file=sys.stderr)
             print(f"{confidence_msg}", file=sys.stderr)
@@ -2532,7 +2537,7 @@ async def main_async(args):
                                 "similar_group": group_id,
                                 "path": f['path'],
                                 "size": file_size,
-                                "coverage": confidence_value
+                                "coverage": calculate_coverage(file_size)
                             })
 
                 if args.verbose:
@@ -2552,7 +2557,7 @@ async def main_async(args):
                                 "similar_group": group_id,
                                 "path": f['path'],
                                 "size": file_size,
-                                "coverage": confidence_value
+                                "coverage": calculate_coverage(file_size)
                             }
 
                             # Use ensure_ascii=False and escape_forward_slashes=False for cleaner output
