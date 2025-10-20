@@ -614,7 +614,10 @@ class AsyncQumuloClient:
             total_entries = 0
 
         # Decide enumeration strategy
-        use_streaming = total_entries >= 50000 and collect_results
+        # Use streaming for large directories when either:
+        # 1. We're collecting results (to save memory)
+        # 2. We have an output callback (for immediate output)
+        use_streaming = total_entries >= 50000 and (collect_results or output_callback is not None)
 
         if verbose and use_streaming:
             print(
@@ -1110,7 +1113,7 @@ class AsyncQumuloClient:
             total_files = int(aggregates.get("total_files", 0))
             total_dirs = int(aggregates.get("total_directories", 0))
             total_entries = total_files + total_dirs
-            used_streaming = total_entries >= 50000 and collect_results
+            used_streaming = total_entries >= 50000 and (collect_results or output_callback is not None)
         except (ValueError, TypeError):
             used_streaming = False
 

@@ -1996,9 +1996,10 @@ async def main_async(args):
     if profiler:
         tree_walk_start = time.time()
 
-    # For owner reports and ACL reports, don't collect matching files to save memory
-    # Also collect results if we need to resolve symlinks, generate ACL reports, or find similar files
-    collect_results = not args.owner_report or args.resolve_links or args.acl_report or args.find_similar
+    # Only collect results if we need post-processing or file output
+    # Don't collect when streaming to stdout (saves memory)
+    # Don't collect for owner reports (they track stats separately)
+    collect_results = args.resolve_links or args.acl_report or args.find_similar or args.csv_out or args.json_out
 
     # Create output callback for streaming results to stdout (plain text mode only)
     # Disable streaming if --resolve-links is enabled (need to resolve after collection)
@@ -2027,9 +2028,32 @@ async def main_async(args):
             # Direct streaming output (no owner resolution needed)
             if args.json:
                 # JSON to stdout
-                async def output_callback(entry):
-                    print(json_parser.dumps(entry))
-                    sys.stdout.flush()
+                if args.all_attributes:
+                    # Output full entry with all attributes
+                    async def output_callback(entry):
+                        # Use escape_forward_slashes=False for ujson to avoid \/
+                        try:
+                            print(json_parser.dumps(entry, escape_forward_slashes=False))
+                        except TypeError:
+                            # Standard json doesn't have escape_forward_slashes parameter
+                            print(json_parser.dumps(entry))
+                        sys.stdout.flush()
+                else:
+                    # Output minimal entry (just path + filter fields)
+                    async def output_callback(entry):
+                        minimal_entry = {"path": entry["path"]}
+                        # Add filter-relevant fields
+                        if args.older_than or args.newer_than:
+                            minimal_entry[args.time_field] = entry.get(args.time_field)
+                        if args.larger_than or args.smaller_than:
+                            minimal_entry["size"] = entry.get("size")
+                        # Use escape_forward_slashes=False for ujson to avoid \/
+                        try:
+                            print(json_parser.dumps(minimal_entry, escape_forward_slashes=False))
+                        except TypeError:
+                            # Standard json doesn't have escape_forward_slashes parameter
+                            print(json_parser.dumps(minimal_entry))
+                        sys.stdout.flush()
 
             else:
                 # Plain text to stdout

@@ -196,7 +196,12 @@ class BatchedOutputHandler:
                 break
 
             if self.output_format == "json":
-                print(json_parser.dumps(entry))
+                # Use escape_forward_slashes=False for ujson to avoid \/
+                try:
+                    print(json_parser.dumps(entry, escape_forward_slashes=False))
+                except TypeError:
+                    # Standard json doesn't have escape_forward_slashes parameter
+                    print(json_parser.dumps(entry))
             else:
                 # Plain text
                 output_line = entry["path"]
