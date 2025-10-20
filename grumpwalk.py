@@ -783,17 +783,24 @@ async def apply_acl_to_tree(
     if progress:
         print(f"[ACL CLONE] Scanning tree for child objects...", file=sys.stderr)
 
+    # Create a ProgressTracker to count examined vs matched objects
+    walk_progress = ProgressTracker(verbose=False, limit=args.limit if args else None)
+
     matching_files = await client.walk_tree_async(
         session=session,
         path=target_path,
         max_depth=args.max_depth if args else None,
-        progress=None,  # We'll handle progress ourselves
+        progress=walk_progress,  # Track objects for skipped count
         file_filter=file_filter,
         collect_results=True
     )
 
     # Remove target path from list (already applied)
     matching_files = [f for f in matching_files if f['path'] != target_path]
+
+    # Calculate skipped objects: examined - matched
+    # We need to subtract the target path itself (1) since it was processed separately
+    stats['objects_skipped'] = walk_progress.total_objects - walk_progress.matches
 
     # Apply limit if specified
     if args and args.limit and len(matching_files) > args.limit:
