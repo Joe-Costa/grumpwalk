@@ -1127,6 +1127,10 @@ class AsyncQumuloClient:
             num_subdirs = len(subdirs)
             batch_size = self.calculate_adaptive_concurrency(num_subdirs)
 
+            # If limit is set, use smaller batch size for more responsive early exit
+            if progress and progress.limit:
+                batch_size = min(batch_size, 10)
+
             if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
                 print(
                     f"\r[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "

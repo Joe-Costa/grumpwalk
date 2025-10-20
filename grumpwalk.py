@@ -2012,9 +2012,11 @@ async def main_async(args):
         if args.show_owner or args.show_group:
             # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
+            # Use smaller batch size when limit is specified for faster streaming
+            batch_size = min(20, args.limit) if args.limit else 100
             batched_handler = BatchedOutputHandler(
                 client,
-                batch_size=100,
+                batch_size=batch_size,
                 show_owner=args.show_owner,
                 show_group=args.show_group,
                 output_format=output_format,
