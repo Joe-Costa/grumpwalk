@@ -140,6 +140,7 @@ class BatchedOutputHandler:
         show_group: bool = False,
         output_format: str = "text",
         progress: Optional["ProgressTracker"] = None,
+        all_attributes: bool = False,
     ):
         self.client = client
         self.batch_size = batch_size
@@ -149,6 +150,7 @@ class BatchedOutputHandler:
         self.batch = []
         self.lock = asyncio.Lock()
         self.progress = progress
+        self.all_attributes = all_attributes
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -196,12 +198,37 @@ class BatchedOutputHandler:
                 break
 
             if self.output_format == "json":
+                if self.all_attributes:
+                    # Output full entry with all attributes
+                    output_entry = entry
+                else:
+                    # Create minimal entry with path + owner/group
+                    output_entry = {"path": entry["path"]}
+
+                    if self.show_owner:
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                        if owner_auth_id and owner_auth_id in identity_cache:
+                            identity = identity_cache[owner_auth_id]
+                            output_entry["owner"] = format_owner_name(identity)
+                        else:
+                            output_entry["owner"] = "Unknown"
+
+                    if self.show_group:
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get("group")
+                        if group_auth_id and group_auth_id in identity_cache:
+                            identity = identity_cache[group_auth_id]
+                            output_entry["group"] = format_owner_name(identity)
+                        else:
+                            output_entry["group"] = "Unknown"
+
                 # Use escape_forward_slashes=False for ujson to avoid \/
                 try:
-                    print(json_parser.dumps(entry, escape_forward_slashes=False))
+                    print(json_parser.dumps(output_entry, escape_forward_slashes=False))
                 except TypeError:
                     # Standard json doesn't have escape_forward_slashes parameter
-                    print(json_parser.dumps(entry))
+                    print(json_parser.dumps(output_entry))
             else:
                 # Plain text
                 output_line = entry["path"]

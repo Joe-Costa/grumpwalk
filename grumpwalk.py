@@ -2019,6 +2019,7 @@ async def main_async(args):
                 show_group=args.show_group,
                 output_format=output_format,
                 progress=progress,
+                all_attributes=args.all_attributes,
             )
 
             async def output_callback(entry):
@@ -2038,6 +2039,8 @@ async def main_async(args):
                             # Standard json doesn't have escape_forward_slashes parameter
                             print(json_parser.dumps(entry))
                         sys.stdout.flush()
+                        if progress:
+                            await progress.increment_output()
                 else:
                     # Output minimal entry (just path + filter fields)
                     async def output_callback(entry):
@@ -2054,12 +2057,16 @@ async def main_async(args):
                             # Standard json doesn't have escape_forward_slashes parameter
                             print(json_parser.dumps(minimal_entry))
                         sys.stdout.flush()
+                        if progress:
+                            await progress.increment_output()
 
             else:
                 # Plain text to stdout
                 async def output_callback(entry):
                     print(entry["path"])
                     sys.stdout.flush()
+                    if progress:
+                        await progress.increment_output()
 
     async with client.create_session() as session:
         matching_files = await client.walk_tree_async(

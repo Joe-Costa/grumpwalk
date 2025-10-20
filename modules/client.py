@@ -684,8 +684,6 @@ class AsyncQumuloClient:
                         if progress and not progress.can_output():
                             return  # Stop processing this page
                         await output_callback(entry)
-                        if progress:
-                            await progress.increment_output()
 
                 # Update progress after each page in streaming mode
                 if progress:
@@ -741,8 +739,6 @@ class AsyncQumuloClient:
                     if progress and not progress.can_output():
                         break  # Stop processing entries
                     await output_callback(entry)
-                    if progress:
-                        await progress.increment_output()
 
         return (matching_entries, subdirs, match_count, total_processed)
 
