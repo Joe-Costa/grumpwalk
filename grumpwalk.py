@@ -4607,7 +4607,7 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qumulo File Filter - Async Python implementation with aiohttp",
+        description="Qumulo File Filter and Directory Tree Walker Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -4641,312 +4641,402 @@ Examples:
     )
 
     # ============================================================================
-    # Required Arguments
+    # REQUIRED ARGUMENTS
     # ============================================================================
     required = parser.add_argument_group('Required Arguments')
     required.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
     required.add_argument("--path", required=True, help="Path to search")
 
     # ============================================================================
-    # General Filters (work with any feature)
+    # UNIVERSAL FILTERS - TIME
+    # Filters that work with any feature (regular search, reports, etc.)
     # ============================================================================
-    filters = parser.add_argument_group('General Filters')
+    time_filters = parser.add_argument_group('Universal Filters - Time',
+        'Time-based filters that work with all features')
 
-    # Time filters
-    filters.add_argument("--older-than", type=int, help="Find files older than N days")
-    filters.add_argument("--newer-than", type=int, help="Find files newer than N days")
+    time_filters.add_argument("--older-than", type=int, help="Find files older than N days")
+    time_filters.add_argument("--newer-than", type=int, help="Find files newer than N days")
 
-    # Time field selection
-    filters.add_argument(
+    time_filters.add_argument(
         "--time-field",
         default="creation_time",
         choices=["creation_time", "modification_time", "access_time", "change_time"],
         help="Time field to filter on (default: creation_time)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--created",
         action="store_const",
         const="creation_time",
         dest="time_field",
-        help="Filter by creation time",
+        help="Shortcut for --time-field creation_time",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--modified",
         action="store_const",
         const="modification_time",
         dest="time_field",
-        help="Filter by modification time",
+        help="Shortcut for --time-field modification_time",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--accessed",
         action="store_const",
         const="access_time",
         dest="time_field",
-        help="Filter by access time",
+        help="Shortcut for --time-field access_time",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--changed",
         action="store_const",
         const="change_time",
         dest="time_field",
-        help="Filter by change time",
+        help="Shortcut for --time-field change_time",
     )
-
-    # Field-specific time filters (all use AND logic)
-    parser.add_argument(
+    time_filters.add_argument(
         "--accessed-older-than",
         type=int,
-        help="Find files with access time older than N days",
+        help="Find files with access time older than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--accessed-newer-than",
         type=int,
-        help="Find files with access time newer than N days",
+        help="Find files with access time newer than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--modified-older-than",
         type=int,
-        help="Find files with modification time older than N days",
+        help="Find files with modification time older than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--modified-newer-than",
         type=int,
-        help="Find files with modification time newer than N days",
+        help="Find files with modification time newer than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--created-older-than",
         type=int,
-        help="Find files with creation time older than N days",
+        help="Find files with creation time older than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--created-newer-than",
         type=int,
-        help="Find files with creation time newer than N days",
+        help="Find files with creation time newer than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--changed-older-than",
         type=int,
-        help="Find files with change time older than N days",
+        help="Find files with change time older than N days (AND logic)",
     )
-    parser.add_argument(
+    time_filters.add_argument(
         "--changed-newer-than",
         type=int,
-        help="Find files with change time newer than N days",
+        help="Find files with change time newer than N days (AND logic)",
     )
 
-    # Size filters
-    parser.add_argument(
+    # ============================================================================
+    # UNIVERSAL FILTERS - SIZE
+    # ============================================================================
+    size_filters = parser.add_argument_group('Universal Filters - Size',
+        'Size-based filters that work with all features')
+
+    size_filters.add_argument(
         "--larger-than",
         help="Find files larger than specified size (e.g., 100MB, 1.5GiB)",
     )
-    parser.add_argument("--smaller-than", help="Find files smaller than specified size")
-    parser.add_argument(
+    size_filters.add_argument(
+        "--smaller-than",
+        help="Find files smaller than specified size (e.g., 50MB, 500KiB)",
+    )
+    size_filters.add_argument(
         "--include-metadata",
         action="store_true",
         help="Include metadata blocks in size calculations (metablocks * 4KB)",
     )
 
-    # Owner filters
-    parser.add_argument(
-        "--owner",
-        action="append",
-        dest="owners",
-        help="Filter by file owner (can be specified multiple times for OR logic)",
-    )
-    parser.add_argument(
-        "--ad", action="store_true", help="Owner(s) are Active Directory users"
-    )
-    parser.add_argument("--local", action="store_true", help="Owner(s) are local users")
-    parser.add_argument(
-        "--uid", action="store_true", help="Owner(s) are specified as UID numbers"
-    )
-    parser.add_argument(
-        "--expand-identity",
-        action="store_true",
-        help="Match all equivalent identities (e.g., AD user + NFS UID)",
-    )
-    parser.add_argument(
-        "--show-owner",
-        action="store_true",
-        help="Display owner information for matching files",
-    )
-    parser.add_argument(
-        "--show-group",
-        action="store_true",
-        help="Display group information for matching files",
-    )
-    parser.add_argument(
-        "--owner-report",
-        action="store_true",
-        help="Generate ownership report (file count and total bytes by owner)",
-    )
+    # ============================================================================
+    # UNIVERSAL FILTERS - NAME AND TYPE
+    # ============================================================================
+    name_filters = parser.add_argument_group('Universal Filters - Name and Type',
+        'Name pattern and type filters that work with all features')
 
-    # Name search filters
-    parser.add_argument(
+    name_filters.add_argument(
         "--name",
         action="append",
         dest="name_patterns",
-        help="Filter by name pattern (supports glob wildcards and regex, can be specified multiple times for OR logic). "
-             "Glob examples: --name '*.log' --name 'test_*'. "
-             "Regex examples: --name '.*\\.log$' --name '^test_.*'",
+        help="Filter by name pattern (supports glob wildcards and regex, repeatable for OR logic). "
+             "Glob: --name '*.log' | Regex: --name '.*\\.log$'",
     )
-    parser.add_argument(
+    name_filters.add_argument(
         "--name-and",
         action="append",
         dest="name_patterns_and",
-        help="Filter by name pattern using AND logic (all patterns must match, supports glob and regex). "
-             "Examples: --name-and '*backup*' --name-and '*2024*'",
+        help="Filter by name pattern using AND logic (all patterns must match, repeatable). "
+             "Example: --name-and '*backup*' --name-and '*2024*'",
     )
-    parser.add_argument(
+    name_filters.add_argument(
         "--name-case-sensitive",
         action="store_true",
         help="Make name pattern matching case-sensitive (default: case-insensitive)",
     )
-    parser.add_argument(
+    name_filters.add_argument(
         "--type",
         choices=["file", "f", "directory", "dir", "d", "symlink", "link", "l"],
         help="Filter by object type: file/f, directory/dir/d, or symlink/link/l",
     )
-    parser.add_argument(
-        "--resolve-links",
+
+    # ============================================================================
+    # UNIVERSAL FILTERS - OWNER
+    # ============================================================================
+    owner_filters = parser.add_argument_group('Universal Filters - Owner',
+        'Owner-based filters that work with all features')
+
+    owner_filters.add_argument(
+        "--owner",
+        action="append",
+        dest="owners",
+        help="Filter by file owner (repeatable for OR logic)",
+    )
+    owner_filters.add_argument(
+        "--ad",
         action="store_true",
-        help="Resolve and display symlink targets (shows 'link → target' in output). "
-             "Does not follow symlinks during traversal.",
+        help="Owner(s) are Active Directory users",
+    )
+    owner_filters.add_argument(
+        "--local",
+        action="store_true",
+        help="Owner(s) are local users",
+    )
+    owner_filters.add_argument(
+        "--uid",
+        action="store_true",
+        help="Owner(s) are specified as UID numbers",
+    )
+    owner_filters.add_argument(
+        "--expand-identity",
+        action="store_true",
+        help="Match all equivalent identities (e.g., AD user + NFS UID)",
     )
 
-    parser.add_argument(
-        "--use-capacity",
-        action="store_true",
-        default=True,
-        help="Use actual disk capacity (datablocks + metablocks) instead of logical file size for owner reports (default: True). Handles sparse files correctly.",
-    )
-    parser.add_argument(
-        "--report-logical-size",
-        dest="use_capacity",
-        action="store_false",
-        help="Report logical file size instead of actual disk capacity in owner reports",
-    )
+    # ============================================================================
+    # UNIVERSAL FILTERS - DIRECTORY SCOPE
+    # ============================================================================
+    dir_filters = parser.add_argument_group('Universal Filters - Directory Scope',
+        'Directory traversal filters that work with all features')
 
-    # Search options
-    parser.add_argument(
-        "--max-depth", type=int, help="Maximum directory depth to search"
+    dir_filters.add_argument(
+        "--max-depth",
+        type=int,
+        help="Maximum directory depth to search",
     )
-    parser.add_argument(
+    dir_filters.add_argument(
         "--file-only",
         action="store_true",
-        help="Search files only (exclude directories)",
+        help="Search files only, exclude directories (deprecated, use --type file)",
     )
-    parser.add_argument(
+    dir_filters.add_argument(
         "--omit-subdirs",
         action="append",
-        help="Omit subdirectories matching pattern (supports wildcards, can be specified multiple times)",
+        help="Omit subdirectories matching pattern (supports wildcards, repeatable)",
     )
-    parser.add_argument(
+    dir_filters.add_argument(
         "--omit-path",
         action="append",
-        help="Omit specific absolute paths (exact match, can be specified multiple times)",
+        help="Omit specific absolute paths (exact match, repeatable)",
     )
-    parser.add_argument(
+    dir_filters.add_argument(
         "--max-entries-per-dir",
         type=int,
-        help="Skip directories with more than N entries (safety valve for large directories)",
-    )
-    parser.add_argument(
-        "--show-dir-stats",
-        action="store_true",
-        help="Show directory statistics without enumerating files (exploration mode)",
+        help="Skip directories with more than N entries",
     )
 
-    # ACL reporting options
-    parser.add_argument(
-        "--acl-report",
-        action="store_true",
-        help="Generate ACL inventory report showing unique ACLs and affected files",
-    )
-    parser.add_argument(
-        "--acl-csv",
-        help="Export per-file ACL data to CSV file (requires --acl-report)",
-    )
-    parser.add_argument(
-        "--acl-resolve-names",
-        action="store_true",
-        help="Resolve auth_ids and SIDs to human-readable names in ACL report (uses identity cache)",
-    )
+    # ============================================================================
+    # OUTPUT OPTIONS
+    # ============================================================================
+    output = parser.add_argument_group('Output Options',
+        'Control output format and verbosity')
 
-    # Similarity detection options
-    parser.add_argument(
-        "--find-similar",
+    output.add_argument(
+        "--json",
         action="store_true",
-        help="Find similar files using metadata + sample hashing",
+        help="Output results as JSON to stdout",
     )
-    parser.add_argument(
-        "--by-size",
-        action="store_true",
-        help="Match by size+metadata only (fast, may have false positives)",
+    output.add_argument(
+        "--json-out",
+        help="Write JSON results to file",
     )
-    parser.add_argument(
-        "--sample-points",
-        type=int,
-        choices=range(3, 12),
-        metavar="N",
-        help="Number of sample points (3-11, default: adaptive)",
-    )
-    parser.add_argument(
-        "--sample-size",
-        type=parse_size_to_bytes,
-        metavar="SIZE",
-        help="Sample chunk size (e.g., 64KB, 256KB, 1MB, default: 64KB). "
-             "Larger sizes = better accuracy, more network transfer",
-    )
-    parser.add_argument(
-        "--estimate-size",
-        action="store_true",
-        help="Show data transfer estimate and exit (no hashing)",
-    )
-
-    # Output options
-    parser.add_argument(
-        "--json", action="store_true", help="Output results as JSON to stdout"
-    )
-    parser.add_argument("--json-out", help="Write JSON results to file")
-    parser.add_argument(
+    output.add_argument(
         "--csv-out",
-        help="Write results to CSV file (mutually exclusive with --json/--json-out)",
+        help="Write results to CSV file",
     )
-    parser.add_argument(
+    output.add_argument(
         "--all-attributes",
         action="store_true",
         help="Include all file attributes in JSON output",
     )
-    parser.add_argument("--verbose", action="store_true", help="Show detailed logging")
-    parser.add_argument(
-        "--progress", action="store_true", help="Show real-time progress stats"
+    output.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed logging",
     )
-    parser.add_argument(
-        "--limit", type=int, help="Stop after finding N matching results"
+    output.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show real-time progress statistics",
     )
-    parser.add_argument(
+    output.add_argument(
+        "--limit",
+        type=int,
+        help="Stop after finding N matching results",
+    )
+    output.add_argument(
         "--profile",
         action="store_true",
-        help="Enable detailed performance profiling and timing metrics",
+        help="Enable performance profiling and timing metrics",
     )
 
-    # Connection options
-    parser.add_argument(
-        "--port", type=int, default=8000, help="Qumulo API port (default: 8000)"
+    # ============================================================================
+    # FEATURE: OWNER REPORTS
+    # ============================================================================
+    owner_report = parser.add_argument_group('Feature: Owner Reports',
+        'Generate storage capacity reports by owner')
+
+    owner_report.add_argument(
+        "--owner-report",
+        action="store_true",
+        help="Generate ownership report (file count and capacity by owner)",
     )
-    parser.add_argument(
-        "--credentials-store", help="Path to credentials file (default: ~/.qfsd_cred)"
+    owner_report.add_argument(
+        "--show-owner",
+        action="store_true",
+        help="Display owner information in output (works with all features)",
+    )
+    owner_report.add_argument(
+        "--show-group",
+        action="store_true",
+        help="Display group information in output (works with all features)",
+    )
+    owner_report.add_argument(
+        "--use-capacity",
+        action="store_true",
+        default=True,
+        help="Use actual disk capacity (datablocks + metablocks) instead of logical size (default: True)",
+    )
+    owner_report.add_argument(
+        "--report-logical-size",
+        dest="use_capacity",
+        action="store_false",
+        help="Report logical file size instead of actual disk capacity",
     )
 
-    # Performance tuning
-    parser.add_argument(
+    # ============================================================================
+    # FEATURE: ACL REPORTS
+    # ============================================================================
+    acl_report = parser.add_argument_group('Feature: ACL Reports',
+        'Generate ACL and permissions inventory reports')
+
+    acl_report.add_argument(
+        "--acl-report",
+        action="store_true",
+        help="Generate ACL inventory report showing unique ACLs and affected files",
+    )
+    acl_report.add_argument(
+        "--acl-csv",
+        help="Export per-file ACL data to CSV file (requires --acl-report)",
+    )
+    acl_report.add_argument(
+        "--acl-resolve-names",
+        action="store_true",
+        help="Resolve auth_ids and SIDs to human-readable names in ACL report",
+    )
+
+    # ============================================================================
+    # FEATURE: SIMILARITY DETECTION
+    # ============================================================================
+    similarity = parser.add_argument_group('Feature: Similarity Detection',
+        'Find similar files using adaptive sampling (results are advisory)')
+
+    similarity.add_argument(
+        "--find-similar",
+        action="store_true",
+        help="Find similar files using metadata + sample hashing",
+    )
+    similarity.add_argument(
+        "--by-size",
+        action="store_true",
+        help="Match by size+metadata only, skip hashing (fast but less accurate)",
+    )
+    similarity.add_argument(
+        "--sample-points",
+        type=int,
+        choices=range(3, 12),
+        metavar="N",
+        help="Number of sample points to hash (3-11, default: adaptive based on size)",
+    )
+    similarity.add_argument(
+        "--sample-size",
+        type=parse_size_to_bytes,
+        metavar="SIZE",
+        help="Sample chunk size (e.g., 64KB, 256KB, 1MB, default: 64KB)",
+    )
+    similarity.add_argument(
+        "--estimate-size",
+        action="store_true",
+        help="Show data transfer estimate and exit without hashing",
+    )
+
+    # ============================================================================
+    # FEATURE: DIRECTORY EXPLORATION
+    # ============================================================================
+    exploration = parser.add_argument_group('Feature: Directory Exploration',
+        'Explore directory structure without enumerating files')
+
+    exploration.add_argument(
+        "--show-dir-stats",
+        action="store_true",
+        help="Show directory statistics only (no file enumeration)",
+    )
+
+    # ============================================================================
+    # FEATURE: SYMLINK RESOLUTION
+    # ============================================================================
+    symlinks = parser.add_argument_group('Feature: Symlink Resolution',
+        'Resolve and display symlink targets')
+
+    symlinks.add_argument(
+        "--resolve-links",
+        action="store_true",
+        help="Resolve and display symlink targets (shows 'link -> target')",
+    )
+
+    # ============================================================================
+    # CONNECTION OPTIONS
+    # ============================================================================
+    connection = parser.add_argument_group('Connection Options',
+        'Configure connection to Qumulo cluster')
+
+    connection.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Qumulo API port (default: 8000)",
+    )
+    connection.add_argument(
+        "--credentials-store",
+        help="Path to credentials file (default: ~/.qfsd_cred)",
+    )
+
+    # ============================================================================
+    # PERFORMANCE TUNING
+    # ============================================================================
+    performance = parser.add_argument_group('Performance Tuning',
+        'Tune concurrency and connection pool settings')
+
+    performance.add_argument(
         "--max-concurrent",
         type=int,
         default=100,
         help="Maximum concurrent operations (default: 100)",
     )
-    parser.add_argument(
+    performance.add_argument(
         "--connector-limit",
         type=int,
         default=100,
