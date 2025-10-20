@@ -16,6 +16,7 @@ High-performance async file search tool for Qumulo storage systems.
 - **Directory scope preview** - Shows total subdirs/files before search
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
+- **Similarity detection** - Find similar files using adaptive sampling
 
 ## Requirements
 
@@ -54,6 +55,9 @@ pip install -r requirements.txt
 
 # Generate owner capacity report
 ./grumpwalk.py --host cluster.example.com --path /data --owner-report --csv-out report.csv
+
+# Find similar files
+./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
 ```
 
 ## Command Reference
@@ -114,6 +118,15 @@ pip install -r requirements.txt
 - ACLs are returned in NFSv4 shorthand for brevity and compactness (`rwaxdDtTnNcCoy`).
 - These rights map directly to the 14 NTFS rights in an ACE
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
+
+### Similarity Detection Options
+- `--find-similar` - Find similar files using metadata + sample hashing
+- `--by-size` - Match by size+metadata only (fast, may have false positives)
+- `--sample-size SIZE` - Sample chunk size (e.g., `64KB`, `256KB`, `1MB`, default: `64KB`)
+- `--sample-points N` - Number of sample points (3-11, default: adaptive based on file size)
+- `--estimate-size` - Show data transfer estimate and exit (no actual hashing)
+
+**Note:** Results are advisory. Always verify before deleting files.
 
 ### Output Options
 - `--json` - JSON output to stdout
@@ -223,6 +236,18 @@ pip install -r requirements.txt
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --acl-report --acl-csv permissions.csv \
   --acl-resolve-names --show-owner --show-group --progress
+```
+
+### Find similar files with custom sampling
+```bash
+# Estimate data transfer before running
+./grumpwalk.py --host cluster.example.com --path /backups \
+  --find-similar --estimate-size --sample-size 256KB --sample-points 11
+
+# Find similar files with higher accuracy (more data transfer)
+./grumpwalk.py --host cluster.example.com --path /backups \
+  --find-similar --sample-size 256KB --sample-points 11 \
+  --csv-out similar.csv --progress
 ```
 
 ## Performance Tips
