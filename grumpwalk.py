@@ -28,7 +28,7 @@ import ssl
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
 
@@ -805,7 +805,7 @@ class AsyncQumuloClient:
         path: str,
         acl_data: dict,
         mark_inherited: bool = False
-    ) -> tuple[bool, Optional[str]]:
+    ) -> Tuple[bool, Optional[str]]:
         """
         Apply ACL to a file or directory using v2 API.
 
