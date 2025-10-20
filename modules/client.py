@@ -1606,10 +1606,3 @@ class AsyncQumuloClient:
         except Exception:
             # If expansion fails, return just the original
             return [auth_id]
-
-
-# ============================================================================
-# ACL Conversion Functions (QACL to NFSv4-style shorthand)
-# ============================================================================
-
-
