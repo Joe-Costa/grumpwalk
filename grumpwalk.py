@@ -19,6 +19,7 @@ Key improvements over bash version:
 
 import argparse
 import asyncio
+import copy
 import fnmatch
 import json
 import os
@@ -765,6 +766,7 @@ class AsyncQumuloClient:
     ) -> Optional[dict]:
         """
         Get the Access Control List (ACL) for a file or directory.
+        Uses v2 API endpoint.
 
         Args:
             session: aiohttp ClientSession
@@ -779,7 +781,7 @@ class AsyncQumuloClient:
                 path = "/" + path
 
             encoded_path = quote(path, safe="")
-            url = f"{self.base_url}/v1/files/{encoded_path}/info/acl"
+            url = f"{self.base_url}/v2/files/{encoded_path}/info/acl"
 
             try:
                 async with session.get(url, ssl=self.ssl_context) as response:
@@ -796,6 +798,71 @@ class AsyncQumuloClient:
                 if self.verbose:
                     print(f"[WARN] Error getting ACL for {path}: {e}", file=sys.stderr)
                 return None
+
+    async def set_file_acl(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        acl_data: dict,
+        mark_inherited: bool = False
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Apply ACL to a file or directory using v2 API.
+
+        Performs 1:1 ACL replacement preserving all fields:
+        - aces (Access Control Entries)
+        - control flags
+        - posix_special_permissions
+
+        Args:
+            session: aiohttp ClientSession
+            path: Target file/directory path
+            acl_data: Full ACL data structure from get_file_acl()
+            mark_inherited: Add INHERITED flag to all ACEs
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v2/files/{encoded_path}/info/acl"
+
+            # Deep copy to avoid mutating source
+            acl_to_apply = copy.deepcopy(acl_data)
+
+            # Extract nested 'acl' portion if present
+            if 'acl' in acl_to_apply and 'aces' not in acl_to_apply:
+                acl_payload = acl_to_apply['acl']
+            else:
+                acl_payload = acl_to_apply
+
+            # Add INHERITED flag to all ACEs if requested
+            if mark_inherited:
+                for ace in acl_payload.get('aces', []):
+                    flags = ace.get('flags', [])
+                    if 'INHERITED' not in flags:
+                        flags.append('INHERITED')
+                    ace['flags'] = flags
+
+            try:
+                async with session.put(
+                    url, json=acl_payload, ssl=self.ssl_context
+                ) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    else:
+                        error_msg = f"HTTP {response.status}"
+                        try:
+                            error_detail = await response.json()
+                            error_msg += f": {error_detail.get('description', '')}"
+                        except:
+                            pass
+                        return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
 
     async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
         """
@@ -2416,6 +2483,296 @@ def analyze_acl_structure(qacl_data: Dict) -> Dict:
     }
 
 
+async def get_file_type(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    path: str
+) -> Optional[str]:
+    """
+    Get the type of a file system object.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        path: Path to check
+
+    Returns:
+        'FS_FILE_TYPE_FILE', 'FS_FILE_TYPE_DIRECTORY', 'FS_FILE_TYPE_SYMLINK',
+        or None if unable to determine
+    """
+    try:
+        # Handle root directory special case
+        if path == '/':
+            return 'FS_FILE_TYPE_DIRECTORY'
+
+        # Get parent directory and basename
+        parent = os.path.dirname(path) or '/'
+        name = os.path.basename(path)
+
+        # List parent directory to get entry metadata
+        entries = await client.enumerate_directory(session, parent, max_entries=1000)
+        entry = next((e for e in entries if e['name'] == name), None)
+
+        return entry.get('type') if entry else None
+    except Exception as e:
+        if client.verbose:
+            print(f"[WARN] Could not determine type for {path}: {e}", file=sys.stderr)
+        return None
+
+
+async def check_acl_type_compatibility(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    source_path: str,
+    target_path: str,
+    propagate: bool
+) -> bool:
+    """
+    Check ACL source/target type compatibility and warn user if needed.
+
+    Warns when applying a file ACL to directories, as file ACLs may not have
+    appropriate directory-specific permissions and inheritance settings.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        source_path: Path to ACL source
+        target_path: Path to ACL target
+        propagate: Whether ACL will be propagated to children
+
+    Returns:
+        True to proceed, False to abort
+    """
+    source_type = await get_file_type(client, session, source_path)
+    target_type = await get_file_type(client, session, target_path)
+
+    # Only warn if source is a file
+    if source_type != 'FS_FILE_TYPE_FILE':
+        return True
+
+    # Warn if target is directory or propagating (might hit directories)
+    should_warn = (
+        target_type == 'FS_FILE_TYPE_DIRECTORY' or
+        propagate
+    )
+
+    if not should_warn:
+        return True
+
+    # Display warning
+    print("\n" + "=" * 70, file=sys.stderr)
+    print("WARNING: Source ACL Type Mismatch", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(f"Source: {source_path} (FILE)", file=sys.stderr)
+
+    if target_type == 'FS_FILE_TYPE_DIRECTORY':
+        print(f"Target: {target_path} (DIRECTORY)", file=sys.stderr)
+    else:
+        print(f"Target: {target_path}", file=sys.stderr)
+
+    print("\nFile ACLs may not be appropriate for directories because:", file=sys.stderr)
+    print("  - Directories have different permission semantics", file=sys.stderr)
+    print("  - Directory-specific rights (traverse, list, add files) may be missing", file=sys.stderr)
+    print("  - Inheritance flags may not be configured correctly", file=sys.stderr)
+
+    if propagate:
+        print("\n[!] --propagate-acls is enabled. This will apply the file ACL to", file=sys.stderr)
+        print("    all child objects including subdirectories.", file=sys.stderr)
+
+    print("\n" + "=" * 70, file=sys.stderr)
+
+    # Prompt user
+    while True:
+        response = input("Proceed? (Yes/No): ").strip().lower()
+        if response in ['yes', 'y']:
+            print("[INFO] Proceeding with ACL application...\n", file=sys.stderr)
+            return True
+        elif response in ['no', 'n']:
+            print("[INFO] Operation cancelled by user.", file=sys.stderr)
+            return False
+        else:
+            print("Please enter 'Yes' or 'No'.", file=sys.stderr)
+
+
+def format_time_estimate(seconds: float) -> str:
+    """Format seconds into human-readable time estimate."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
+
+
+async def apply_acl_to_tree(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    acl_data: dict,
+    target_path: str,
+    propagate: bool = False,
+    file_filter = None,
+    progress: bool = False,
+    continue_on_error: bool = False,
+    args = None
+) -> dict:
+    """
+    Apply ACL to target path, optionally propagating to filtered children.
+
+    Applies ACL to:
+    1. Target path itself (no INHERITED flag modification)
+    2. If propagate=True, all matching children (with INHERITED flag added)
+
+    Children are filtered using the standard file_filter (Universal Filters).
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        acl_data: Source ACL data (full structure with 'acl' nested)
+        target_path: Target path to apply ACL
+        propagate: If True, apply to all matching descendants
+        file_filter: Filter function for matching objects
+        progress: Show progress output
+        continue_on_error: Continue on 401 errors after initial success
+        args: Command line arguments for filter parameters
+
+    Returns:
+        Statistics dict:
+        {
+            'objects_changed': int,
+            'objects_failed': int,
+            'objects_skipped': int,  # Didn't match filters
+            'total_objects_processed': int,
+            'errors': list[dict]  # [{path, error_code, message}]
+        }
+    """
+    stats = {
+        'objects_changed': 0,
+        'objects_failed': 0,
+        'objects_skipped': 0,
+        'total_objects_processed': 0,
+        'errors': []
+    }
+
+    start_time = time.time()
+
+    # Step 1: Apply to target path (unmodified ACL)
+    if progress:
+        print(f"[ACL CLONE] Applying ACL to target: {target_path}", file=sys.stderr)
+
+    success, error_msg = await client.set_file_acl(
+        session, target_path, acl_data, mark_inherited=False
+    )
+
+    if not success:
+        print(f"\n[ERROR] Failed to apply ACL to target path: {target_path}", file=sys.stderr)
+        print(f"[ERROR] {error_msg}", file=sys.stderr)
+        stats['objects_failed'] = 1
+        stats['errors'].append({
+            'path': target_path,
+            'error_code': 'INITIAL_FAILURE',
+            'message': error_msg
+        })
+        return stats
+
+    stats['objects_changed'] = 1
+    stats['total_objects_processed'] = 1
+
+    # Step 2: Propagate to children if requested
+    if not propagate:
+        return stats
+
+    # Walk the tree to get all objects
+    if progress:
+        print(f"[ACL CLONE] Scanning tree for child objects...", file=sys.stderr)
+
+    matching_files = await client.walk_tree_async(
+        session=session,
+        path=target_path,
+        max_depth=args.max_depth if args else None,
+        progress=None,  # We'll handle progress ourselves
+        file_filter=file_filter,
+        collect_results=True
+    )
+
+    # Remove target path from list (already applied)
+    matching_files = [f for f in matching_files if f['path'] != target_path]
+
+    total_to_process = len(matching_files)
+    processed = 0
+
+    if progress:
+        print(f"[ACL CLONE] Found {total_to_process:,} child objects to process", file=sys.stderr)
+
+    # Apply ACL to each child
+    for entry in matching_files:
+        path = entry['path']
+        processed += 1
+        stats['total_objects_processed'] += 1
+
+        # Apply ACL with INHERITED flag
+        success, error_msg = await client.set_file_acl(
+            session, path, acl_data, mark_inherited=True
+        )
+
+        if success:
+            stats['objects_changed'] += 1
+        else:
+            stats['objects_failed'] += 1
+            stats['errors'].append({
+                'path': path,
+                'error_code': 'APPLY_FAILURE',
+                'message': error_msg
+            })
+
+            # Handle errors based on settings
+            is_401 = '401' in error_msg or 'Unauthorized' in error_msg
+
+            if is_401 and continue_on_error:
+                # Log and continue
+                if progress:
+                    print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
+            else:
+                # Pause and prompt
+                print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
+                print(f"[ERROR] {error_msg}", file=sys.stderr)
+
+                while True:
+                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                    if response in ['c', 'continue']:
+                        break
+                    elif response in ['a', 'abort']:
+                        print("[INFO] Operation aborted by user.", file=sys.stderr)
+                        return stats
+                    print("Invalid response. Please enter 'c' or 'a'.")
+
+        # Progress reporting
+        if progress and (processed % 100 == 0 or processed == total_to_process):
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = total_to_process - processed
+            eta_seconds = remaining / rate if rate > 0 else 0
+            eta_str = format_time_estimate(eta_seconds)
+
+            print(
+                f"\r[ACL CLONE] Changed: {stats['objects_changed']:,} | "
+                f"Failed: {stats['objects_failed']:,} | "
+                f"Remaining: {remaining:,} | "
+                f"Est: {eta_str}",
+                end='',
+                file=sys.stderr
+            )
+            sys.stderr.flush()
+
+    if progress:
+        print()  # New line after progress
+
+    return stats
+
+
 async def generate_acl_report(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -3686,6 +4043,86 @@ async def main_async(args):
         verbose=args.verbose,
     )
 
+    # ACL Cloning Mode
+    if args.source_acl or args.acl_target:
+        # Validate: both flags must be provided together
+        if not (args.source_acl and args.acl_target):
+            print("[ERROR] Both --source-acl and --acl-target must be specified together", file=sys.stderr)
+            sys.exit(1)
+
+        async with client.create_session() as session:
+            # Step 1: Retrieve source ACL
+            if args.verbose:
+                print(f"[INFO] Retrieving ACL from: {args.source_acl}", file=sys.stderr)
+
+            source_acl = await client.get_file_acl(session, args.source_acl)
+
+            if not source_acl:
+                print(f"[ERROR] Could not retrieve ACL from {args.source_acl}", file=sys.stderr)
+                sys.exit(1)
+
+            if args.verbose:
+                ace_count = len(source_acl.get('acl', {}).get('aces', []))
+                print(f"[INFO] Retrieved ACL with {ace_count} ACEs", file=sys.stderr)
+
+            # Step 2: Check ACL type compatibility and warn if needed
+            proceed = await check_acl_type_compatibility(
+                client=client,
+                session=session,
+                source_path=args.source_acl,
+                target_path=args.acl_target,
+                propagate=args.propagate_acls
+            )
+
+            if not proceed:
+                sys.exit(0)
+
+            # Step 3: Build file filter from Universal Filters (reuse existing logic)
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+
+            # Step 4: Apply ACL to target tree
+            stats = await apply_acl_to_tree(
+                client=client,
+                session=session,
+                acl_data=source_acl,
+                target_path=args.acl_target,
+                propagate=args.propagate_acls,
+                file_filter=file_filter,
+                progress=args.progress,
+                continue_on_error=args.continue_on_error,
+                args=args
+            )
+
+            # Step 5: Print summary
+            print("\nACL CLONING SUMMARY", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Source ACL:        {args.source_acl}", file=sys.stderr)
+            print(f"Target path:       {args.acl_target}", file=sys.stderr)
+            print(f"Objects changed:   {stats['objects_changed']:,}", file=sys.stderr)
+            print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
+            if file_filter:
+                print(f"Objects skipped:   {stats['objects_skipped']:,} (filter mismatch)", file=sys.stderr)
+
+            if stats['errors']:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats['errors'][:10]:  # Show first 10
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats['errors']) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            # Exit with error code if any failures
+            if stats['objects_failed'] > 0:
+                sys.exit(1)
+
+        return  # Exit after ACL operation
+
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
         print("\n[INFO] Directory statistics mode (exploration)", file=sys.stderr)
@@ -4946,6 +5383,36 @@ Examples:
         "--acl-resolve-names",
         action="store_true",
         help="Resolve auth_ids and SIDs to human-readable names in ACL report",
+    )
+
+    # ============================================================================
+    # FEATURE: ACL MANAGEMENT
+    # ============================================================================
+    acl_management = parser.add_argument_group('Feature: ACL Management',
+        'Clone and apply ACLs across file system objects')
+
+    acl_management.add_argument(
+        "--source-acl",
+        help="Path to source object whose ACL to copy",
+        metavar="PATH"
+    )
+
+    acl_management.add_argument(
+        "--acl-target",
+        help="Path to target object/directory to apply ACL (starting point for --propagate-acls)",
+        metavar="PATH"
+    )
+
+    acl_management.add_argument(
+        "--propagate-acls",
+        action="store_true",
+        help="Recursively apply ACL to all child objects (adds INHERITED flag to children)"
+    )
+
+    acl_management.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue applying ACLs on 401 permission errors after initial target succeeds"
     )
 
     # ============================================================================
