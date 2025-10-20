@@ -4002,11 +4002,25 @@ async def generate_owner_report(
 
 async def main_async(args):
     """Main async function."""
+    # Determine if we're in ACL cloning mode
+    acl_cloning_mode = args.source_acl and args.acl_target
+
     print("=" * 70, file=sys.stderr)
-    print("GrumpWalk - Qumulo Directory Tree Walk", file=sys.stderr)
+    if acl_cloning_mode:
+        print("GrumpWalk - ACL Cloning Mode", file=sys.stderr)
+    else:
+        print("GrumpWalk - Qumulo Directory Tree Walk", file=sys.stderr)
     print("=" * 70, file=sys.stderr)
     print(f"Cluster:          {args.host}", file=sys.stderr)
-    print(f"Path:             {args.path}", file=sys.stderr)
+
+    if acl_cloning_mode:
+        print(f"Source ACL:       {args.source_acl}", file=sys.stderr)
+        print(f"Target path:      {args.acl_target}", file=sys.stderr)
+        if args.propagate_acls:
+            print(f"Propagate:        Enabled", file=sys.stderr)
+    else:
+        print(f"Path:             {args.path}", file=sys.stderr)
+
     print(f"JSON parser:      {JSON_PARSER_NAME}", file=sys.stderr)
     print(f"Max concurrent:   {args.max_concurrent}", file=sys.stderr)
     print(f"Connection pool:  {args.connector_limit}", file=sys.stderr)
@@ -5082,7 +5096,7 @@ Examples:
     # ============================================================================
     required = parser.add_argument_group('Required Arguments')
     required.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
-    required.add_argument("--path", required=True, help="Path to search")
+    required.add_argument("--path", help="Path to search (not required for ACL cloning with --source-acl/--acl-target)")
 
     # ============================================================================
     # UNIVERSAL FILTERS - TIME
@@ -5513,6 +5527,15 @@ Examples:
     args = parser.parse_args()
 
     # Validate arguments
+    # Check that either --path OR (--source-acl + --acl-target) are provided
+    acl_cloning_mode = args.source_acl and args.acl_target
+    if not args.path and not acl_cloning_mode:
+        print(
+            "Error: Either --path is required OR both --source-acl and --acl-target for ACL cloning",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if args.older_than and args.newer_than and args.newer_than >= args.older_than:
         print(
             "Error: --newer-than must be less than --older-than for a valid time range",
@@ -5536,7 +5559,8 @@ Examples:
         sys.exit(130)
     except aiohttp.ClientResponseError as e:
         # HTTP error with detailed message
-        error_msg = format_http_error(e.status, str(e.request_info.url), args.path)
+        path_for_error = args.path if args.path else (args.acl_target if hasattr(args, 'acl_target') else 'N/A')
+        error_msg = format_http_error(e.status, str(e.request_info.url), path_for_error)
         print(error_msg, file=sys.stderr)
         if args.verbose:
             import traceback
