@@ -40,6 +40,7 @@ class ProgressTracker:
         self.lock = asyncio.Lock()
         self.limit = limit
         self.limit_reached = False
+        self.output_count = 0  # Track how many results have been output (for streaming)
 
     async def update(self, objects: int, dirs: int = 0, matches: int = 0):
         """Update progress counters and check if limit reached."""
@@ -92,6 +93,26 @@ class ProgressTracker:
         """Check if processing should stop due to limit."""
         return self.limit_reached
 
+    def can_output(self) -> bool:
+        """Check if we can output more results (for streaming mode)."""
+        if not self.limit:
+            return True
+        return self.output_count < self.limit
+
+    async def increment_output(self):
+        """Increment output counter (for streaming mode)."""
+        async with self.lock:
+            self.output_count += 1
+            # Update limit_reached based on output count for streaming
+            if self.limit and self.output_count >= self.limit and not self.limit_reached:
+                self.limit_reached = True
+                if self.verbose:
+                    print(
+                        f"\r[INFO] Output limit reached: {self.output_count} results (limit: {self.limit})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
     def final_report(self):
         """Print final progress report."""
         if self.verbose:
@@ -118,6 +139,7 @@ class BatchedOutputHandler:
         show_owner: bool = False,
         show_group: bool = False,
         output_format: str = "text",
+        progress: Optional["ProgressTracker"] = None,
     ):
         self.client = client
         self.batch_size = batch_size
@@ -126,6 +148,7 @@ class BatchedOutputHandler:
         self.output_format = output_format  # 'text' or 'json'
         self.batch = []
         self.lock = asyncio.Lock()
+        self.progress = progress
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -168,6 +191,10 @@ class BatchedOutputHandler:
 
         # Output batch
         for entry in self.batch:
+            # Check if we can output more results (respects --limit)
+            if self.progress and not self.progress.can_output():
+                break
+
             if self.output_format == "json":
                 print(json_parser.dumps(entry))
             else:
@@ -196,6 +223,10 @@ class BatchedOutputHandler:
 
                 print(output_line)
             sys.stdout.flush()
+
+            # Increment output counter
+            if self.progress:
+                await self.progress.increment_output()
 
         # Clear batch
         self.batch = []

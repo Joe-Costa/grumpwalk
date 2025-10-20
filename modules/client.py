@@ -163,7 +163,7 @@ class AsyncQumuloClient:
         return all_entries
 
     async def enumerate_directory_streaming(
-        self, session: aiohttp.ClientSession, path: str, callback
+        self, session: aiohttp.ClientSession, path: str, callback, should_continue=None
     ) -> int:
         """
         Stream directory entries without accumulating in memory.
@@ -177,6 +177,7 @@ class AsyncQumuloClient:
             path: Directory path
             callback: Async function that receives list of entries per page
                      Returns: (matching_entries, subdirs) tuple
+            should_continue: Optional callable that returns False to stop enumeration early
 
         Returns:
             Total number of entries processed
@@ -185,6 +186,10 @@ class AsyncQumuloClient:
         after_token = None
 
         while True:
+            # Check if we should continue (for early exit on limit)
+            if should_continue and not should_continue():
+                break
+
             response = await self.get_directory_page(
                 session, path, limit=1000, after_token=after_token
             )
@@ -575,6 +580,7 @@ class AsyncQumuloClient:
         collect_results: bool = True,
         verbose: bool = False,
         progress: Optional["ProgressTracker"] = None,
+        output_callback=None,
     ) -> tuple:
         """
         Automatically choose between batch mode and streaming mode based on directory size.
@@ -654,24 +660,37 @@ class AsyncQumuloClient:
                         subdirs.append(entry["path"])
 
                     # Apply filter and collect results
+                    is_match = False
                     if file_filter:
                         if file_filter(entry):
+                            is_match = True
                             match_count += 1
                             page_matches += 1
                             if collect_results:
                                 matching_entries.append(entry)
                     else:
+                        is_match = True
                         match_count += 1
                         page_matches += 1
                         if collect_results:
                             matching_entries.append(entry)
 
+                    # Output immediately if callback provided and entry matches
+                    if is_match and output_callback:
+                        # Check limit before outputting
+                        if progress and not progress.can_output():
+                            return  # Stop processing this page
+                        await output_callback(entry)
+                        if progress:
+                            await progress.increment_output()
+
                 # Update progress after each page in streaming mode
                 if progress:
                     await progress.update(page_size, 0, page_matches)
 
-            # Stream directory entries
-            await self.enumerate_directory_streaming(session, path, process_page)
+            # Stream directory entries with early exit check
+            should_continue = lambda: not progress or progress.can_output()
+            await self.enumerate_directory_streaming(session, path, process_page, should_continue)
         else:
             # Use batch mode - existing behavior
             entries = await self.enumerate_directory(session, path)
@@ -700,15 +719,27 @@ class AsyncQumuloClient:
                     subdirs.append(entry["path"])
 
                 # Apply filter and collect results
+                is_match = False
                 if file_filter:
                     if file_filter(entry):
+                        is_match = True
                         match_count += 1
                         if collect_results:
                             matching_entries.append(entry)
                 else:
+                    is_match = True
                     match_count += 1
                     if collect_results:
                         matching_entries.append(entry)
+
+                # Output immediately if callback provided and entry matches
+                if is_match and output_callback:
+                    # Check limit before outputting
+                    if progress and not progress.can_output():
+                        break  # Stop processing entries
+                    await output_callback(entry)
+                    if progress:
+                        await progress.increment_output()
 
         return (matching_entries, subdirs, match_count, total_processed)
 
@@ -954,6 +985,7 @@ class AsyncQumuloClient:
                 collect_results,
                 verbose,
                 progress,
+                output_callback,
             )
         )
 
@@ -1066,9 +1098,9 @@ class AsyncQumuloClient:
             matching_entries = filtered_entries
 
         # Output matches immediately if callback provided
-        if output_callback and matching_entries:
-            for entry in matching_entries:
-                await output_callback(entry)
+        # NOTE: Entries are already output during enumeration in enumerate_directory_adaptive
+        # This section is kept for backwards compatibility but should not output duplicates
+        # since output_callback is now called during enumeration
 
         # Update progress tracker for batch mode
         # In streaming mode, progress is already updated per-page inside enumerate_directory_adaptive

@@ -1947,9 +1947,10 @@ async def main_async(args):
         owner_filter_info = {"auth_ids": owner_auth_ids}
 
     # Create progress tracker with optional limit for early exit
+    # Progress tracker is needed if --progress or --limit is specified
     progress = (
         ProgressTracker(verbose=args.progress, limit=args.limit)
-        if args.progress
+        if args.progress or args.limit
         else None
     )
 
@@ -2016,6 +2017,7 @@ async def main_async(args):
                 show_owner=args.show_owner,
                 show_group=args.show_group,
                 output_format=output_format,
+                progress=progress,
             )
 
             async def output_callback(entry):
