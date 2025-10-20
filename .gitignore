@@ -14,3 +14,4 @@ benchmark_*
 claude_*
 __pycache__/
 test_range_*.py
+HELP_ORGANIZATION_DESIGN.md
