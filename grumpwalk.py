@@ -2701,6 +2701,12 @@ async def apply_acl_to_tree(
     # Remove target path from list (already applied)
     matching_files = [f for f in matching_files if f['path'] != target_path]
 
+    # Apply limit if specified
+    if args and args.limit and len(matching_files) > args.limit:
+        matching_files = matching_files[:args.limit]
+        if progress:
+            print(f"[ACL CLONE] Limiting to {args.limit:,} objects", file=sys.stderr)
+
     total_to_process = len(matching_files)
     processed = 0
 
