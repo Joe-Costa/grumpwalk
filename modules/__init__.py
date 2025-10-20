@@ -38,6 +38,11 @@ from .stats import (
     OwnerStats,
 )
 
+# Import async Qumulo API client
+from .client import (
+    AsyncQumuloClient,
+)
+
 __all__ = [
     # Utils
     "format_http_error",
@@ -61,4 +66,6 @@ __all__ = [
     "save_identity_cache",
     # Stats
     "OwnerStats",
+    # Client
+    "AsyncQumuloClient",
 ]
