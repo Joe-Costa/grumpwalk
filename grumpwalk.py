@@ -2491,32 +2491,7 @@ async def main_async(args):
                 else:
                     return "N/A"
 
-            # Calculate detection method info for summary message
-            if args.by_size:
-                confidence_msg = "Detection method: Size+metadata only (may have false positives)"
-            else:
-                # Get sample point count from first group (representative)
-                first_file = next(iter(similar_files.values()))[0]
-                file_size = int(first_file.get('size', 0))
-                chunk_size = args.sample_size if args.sample_size else 65536
-                sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
-                num_points = len(sample_offsets)
-
-                # Calculate representative coverage percentage
-                coverage_str = calculate_coverage(file_size)
-
-                # Human-readable chunk size
-                if chunk_size >= 1048576:
-                    chunk_str = f"{chunk_size / 1048576:.1f}MB".rstrip('0').rstrip('.')
-                elif chunk_size >= 1024:
-                    chunk_str = f"{chunk_size / 1024:.0f}KB"
-                else:
-                    chunk_str = f"{chunk_size}B"
-
-                confidence_msg = f"Detection method: {num_points}-point sampling ({chunk_str} chunks, {coverage_str} coverage)"
-
             print(f"\nFound {total_similar:,} similar files in {total_groups:,} groups", file=sys.stderr)
-            print(f"{confidence_msg}", file=sys.stderr)
             print(f"{'=' * 70}\n", file=sys.stderr)
 
             # Handle CSV output for similar files
