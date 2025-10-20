@@ -43,6 +43,13 @@ from .client import (
     AsyncQumuloClient,
 )
 
+# Import filtering functions
+from .filters import (
+    resolve_owner_filters,
+    glob_to_regex,
+    create_file_filter,
+)
+
 __all__ = [
     # Utils
     "format_http_error",
@@ -68,4 +75,8 @@ __all__ = [
     "OwnerStats",
     # Client
     "AsyncQumuloClient",
+    # Filters
+    "resolve_owner_filters",
+    "glob_to_regex",
+    "create_file_filter",
 ]
