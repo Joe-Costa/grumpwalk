@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 
 """
-Qumulo File Filter - Async Python version with aiohttp
-
-High-performance async implementation using direct REST API calls instead of qq CLI.
-Applies lessons learned from benchmark_async_aiohttp.py for 6-7x performance improvement.
+Qumulo File Filter and API Tree Walk Tool
 
 Usage:
     ./grumpwalk.py --host <cluster> --path <path> [OPTIONS]
 
-Key improvements over bash version:
-- Direct REST API calls via aiohttp (no subprocess overhead)
-- Concurrent HTTP requests with asyncio
-- Connection pooling for efficiency
-- Progress reporting in real-time
-- Multi-node support for load distribution
 """
 
 import argparse
