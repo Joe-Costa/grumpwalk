@@ -16,6 +16,7 @@ High-performance async file search tool for Qumulo storage systems.
 - **Directory scope preview** - Shows total subdirs/files before search
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
+- **ACL and owner/group management** - Copy ACLs, owner, and group between objects
 - **Similarity detection** - Find similar files using adaptive sampling
 
 ## Requirements
@@ -55,6 +56,12 @@ pip install -r requirements.txt
 
 # Generate owner capacity report
 ./grumpwalk.py --host cluster.example.com --path /data --owner-report --csv-out report.csv
+
+# Copy ACL from source to target
+./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls
+
+# Copy owner and group only (no ACL changes)
+./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --copy-owner --copy-group --owner-group-only --propagate-acls
 
 # Find similar files
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
@@ -118,6 +125,15 @@ pip install -r requirements.txt
 - ACLs are returned in NFSv4 shorthand for brevity and compactness (`rwaxdDtTnNcCoy`).
 - These rights map directly to the 14 NTFS rights in an ACE
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
+
+### ACL Management Options
+- `--source-acl PATH` - Source object path
+- `--acl-target PATH` - Target object/directory path
+- `--propagate-acls` - Apply to all child objects recursively
+- `--continue-on-error` - Continue on permission errors
+- `--copy-owner` - Copy owner from source
+- `--copy-group` - Copy group from source
+- `--owner-group-only` - Copy only owner/group, skip ACL
 
 ### Similarity Detection Options
 - `--find-similar` - Find similar files using metadata + sample hashing
@@ -236,6 +252,35 @@ pip install -r requirements.txt
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --acl-report --acl-csv permissions.csv \
   --acl-resolve-names --show-owner --show-group --progress
+```
+
+### Copy ACL to directory and all children
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /source/dir --acl-target /target/dir \
+  --propagate-acls --progress
+```
+
+### Copy ACL with owner and group
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /source/dir --acl-target /target/dir \
+  --copy-owner --copy-group --propagate-acls --progress
+```
+
+### Copy only owner and group (no ACL)
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /source/dir --acl-target /target/dir \
+  --copy-owner --copy-group --owner-group-only \
+  --propagate-acls --progress
+```
+
+### Copy ACL to filtered files only
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /source/dir --acl-target /target/dir \
+  --propagate-acls --older-than 30 --type file --progress
 ```
 
 ### Find similar files with custom sampling
