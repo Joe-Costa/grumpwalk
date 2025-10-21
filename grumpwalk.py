@@ -2481,15 +2481,28 @@ async def main_async(args):
             def calculate_coverage(file_size):
                 if args.by_size:
                     return "Low (size+metadata only)"
-                chunk_size = args.sample_size if args.sample_size else 65536
-                sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
-                num_points = len(sample_offsets)
-                if file_size > 0:
-                    total_sampled = num_points * chunk_size
-                    coverage_pct = min(100.0, (total_sampled / file_size) * 100)
-                    return f"{coverage_pct:.1f}%" if coverage_pct < 100 else "100%"
-                else:
+                if file_size == 0:
                     return "N/A"
+
+                chunk_size = args.sample_size if args.sample_size else 65536
+                requested_points = args.sample_points if args.sample_points else 11
+
+                # If requested sampling capacity exceeds file size, report 100% coverage
+                # This handles cases where large chunks + many points are requested for small files
+                requested_capacity = requested_points * chunk_size
+                if requested_capacity >= file_size:
+                    return "100%"
+
+                sample_offsets = calculate_sample_points(file_size, args.sample_points, chunk_size)
+
+                # Calculate actual bytes that would be read by summing bytes at each offset
+                total_bytes_sampled = 0
+                for offset in sample_offsets:
+                    bytes_at_offset = min(chunk_size, file_size - offset)
+                    total_bytes_sampled += bytes_at_offset
+
+                coverage_pct = min(100.0, (total_bytes_sampled / file_size) * 100)
+                return f"{coverage_pct:.1f}%" if coverage_pct < 100 else "100%"
 
             print(f"\nFound {total_similar:,} similar files in {total_groups:,} groups", file=sys.stderr)
             print(f"{'=' * 70}\n", file=sys.stderr)
