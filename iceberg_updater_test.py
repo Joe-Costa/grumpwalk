@@ -315,15 +315,15 @@ class QumuloNotificationListener:
 
 
 async def fetch_file_attributes(
-    session: aiohttp.ClientSession, host: str, port: int, path: str, bearer_token: str
+    session: aiohttp.ClientSession, host: str, port: int, file_id: str, bearer_token: str
 ) -> Optional[dict]:
-    """Fetch file attributes from Qumulo API."""
+    """Fetch file attributes from Qumulo API using file ID."""
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    encoded_path = quote(path, safe="")
-    url = f"https://{host}:{port}/v1/files/{encoded_path}/info/attributes"
+    # Use file ID directly - no URL encoding needed
+    url = f"https://{host}:{port}/v1/files/{file_id}/info/attributes"
 
     headers = {"Authorization": f"Bearer {bearer_token}"}
 
@@ -332,10 +332,10 @@ async def fetch_file_attributes(
             if resp.status == 200:
                 return await resp.json()
             else:
-                logger.error(f"Failed to fetch attributes for {path}: {resp.status}")
+                logger.error(f"Failed to fetch attributes for file ID {file_id}: {resp.status}")
                 return None
     except Exception as e:
-        logger.error(f"Error fetching attributes for {path}: {e}")
+        logger.error(f"Error fetching attributes for file ID {file_id}: {e}")
         return None
 
 
@@ -410,17 +410,22 @@ async def main():
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 event_type = event.get("type", "unknown")
                 path = event.get("path", "")
+                spine = event.get("spine", [])
+
+                # Extract file ID from spine (last element is the target file/dir ID)
+                file_id = spine[-1] if spine else None
 
                 logger.info(f"[{timestamp}] Event #{event_count}: {event_type} - {path}")
 
                 # Process event based on type
                 if event_type in ["child_file_added", "child_dir_added"]:
                     # Fetch attributes and add to table
-                    attrs = await fetch_file_attributes(
-                        session, args.host, args.port, path, token
-                    )
-                    if attrs:
-                        updater.handle_file_added(path, attrs)
+                    if file_id:
+                        attrs = await fetch_file_attributes(
+                            session, args.host, args.port, file_id, token
+                        )
+                        if attrs:
+                            updater.handle_file_added(path, attrs)
 
                 elif event_type in ["child_file_removed", "child_dir_removed", "self_removed"]:
                     updater.handle_file_removed(path)
@@ -429,11 +434,12 @@ async def main():
                     updater.handle_file_removed(path)
 
                 elif event_type in ["child_file_moved_to", "child_dir_moved_to"]:
-                    attrs = await fetch_file_attributes(
-                        session, args.host, args.port, path, token
-                    )
-                    if attrs:
-                        updater.handle_file_added(path, attrs)
+                    if file_id:
+                        attrs = await fetch_file_attributes(
+                            session, args.host, args.port, file_id, token
+                        )
+                        if attrs:
+                            updater.handle_file_added(path, attrs)
 
                 elif event_type in [
                     "child_size_changed",
@@ -446,11 +452,12 @@ async def main():
                     "child_extra_attrs_changed",
                     "child_data_written",
                 ]:
-                    attrs = await fetch_file_attributes(
-                        session, args.host, args.port, path, token
-                    )
-                    if attrs:
-                        updater.handle_file_modified(path, attrs)
+                    if file_id:
+                        attrs = await fetch_file_attributes(
+                            session, args.host, args.port, file_id, token
+                        )
+                        if attrs:
+                            updater.handle_file_modified(path, attrs)
 
                 # Check limit
                 if args.limit and event_count >= args.limit:

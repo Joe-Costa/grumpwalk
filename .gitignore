@@ -16,3 +16,8 @@ __pycache__/
 test_range_*.py
 HELP_ORGANIZATION_DESIGN.md
 dataset4/
+*.parquet
+*.metadata.json
+*.avro
+dataset_test/
+iceberg_test_catalog/
