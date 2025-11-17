@@ -284,6 +284,11 @@ pip install -r requirements.txt
 ```
 
 ### Find similar files with custom sampling
+
+**IMPORTANT NOTE!  File Similarity provides a list of files that might be similar, but is not built to perfom this operation**
+**with 100% accruacy! You should perform more extensive checksumming of any returned files before deleting anything!**
+**USE THIS FEATURE AT YOUR OWN RISK!**
+
 ```bash
 # Estimate data transfer before running
 ./grumpwalk.py --host cluster.example.com --path /backups \
