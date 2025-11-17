@@ -23,6 +23,13 @@ from typing import List, Optional, Dict, Set, Tuple
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
+# Optional argcomplete support for bash completion
+try:
+    import argcomplete
+    ARGCOMPLETE_AVAILABLE = True
+except ImportError:
+    ARGCOMPLETE_AVAILABLE = False
+
 # Import modular components
 from modules import (
     format_http_error,
@@ -3332,6 +3339,10 @@ Examples:
         default=100,
         help="Maximum HTTP connections in pool (default: 100)",
     )
+
+    # Enable argcomplete bash completion if available
+    if ARGCOMPLETE_AVAILABLE:
+        argcomplete.autocomplete(parser)
 
     args = parser.parse_args()
 

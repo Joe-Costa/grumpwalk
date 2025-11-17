@@ -25,6 +25,7 @@ High-performance async file search tool for Qumulo storage systems.
 - `aiohttp` - Install with: `pip install aiohttp`
 - `qumulo_api` - Install with: `pip install qumulo_api`
 - `ujson` (optional) - For faster JSON parsing: `pip install ujson`
+- `argcomplete` - For bash completion support: `pip install argcomplete`
 - Qumulo cluster credentials (use `qq login`)
 
 ## Installation
@@ -34,6 +35,27 @@ git clone https://github.com/Joe-Costa/grumpwalk.git
 cd grumpwalk
 chmod +x grumpwalk.py
 pip install -r requirements.txt
+```
+
+### Bash Completion Setup (Optional)
+
+To enable tab completion for command-line arguments:
+
+```bash
+# For current session only
+eval "$(register-python-argcomplete grumpwalk.py)"
+
+# For permanent setup, add to your ~/.bashrc or ~/.bash_profile
+echo 'eval "$(register-python-argcomplete grumpwalk.py)"' >> ~/.bashrc
+
+# Or for zsh users, add to ~/.zshrc
+echo 'eval "$(register-python-argcomplete grumpwalk.py)"' >> ~/.zshrc
+```
+
+After enabling, you can use Tab to autocomplete options:
+```bash
+./grumpwalk.py --ho<TAB>     # completes to --host
+./grumpwalk.py --type <TAB>  # shows: file directory symlink
 ```
 ## Logging into a cluster
 
