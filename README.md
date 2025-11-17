@@ -39,9 +39,22 @@ pip install -r requirements.txt
 
 ### Bash Completion Setup (Optional)
 
-To enable tab completion for command-line arguments:
+To enable tab completion for command-line arguments, use the provided setup script:
 
 ```bash
+# Automated setup (installs argcomplete and configures your shell)
+./setup_completion.sh
+
+# Then reload your shell config
+source ~/.bashrc  # or source ~/.zshrc for zsh
+```
+
+**Manual setup** (if you prefer):
+
+```bash
+# Install argcomplete for current user
+python3 -m pip install --user argcomplete
+
 # For current session only
 eval "$(register-python-argcomplete grumpwalk.py)"
 
