@@ -17,6 +17,12 @@ if [[ ! -f "$GRUMPWALK_PATH" ]]; then
     exit 1
 fi
 
+# Ensure ~/.local/bin is in PATH (needed for register-python-argcomplete)
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    echo "Adding ~/.local/bin to PATH for this session..."
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
 # Check if argcomplete is installed
 if ! python3 -c "import argcomplete" 2>/dev/null; then
     echo "argcomplete is not installed."
@@ -34,13 +40,24 @@ if ! python3 -c "import argcomplete" 2>/dev/null; then
     echo
 fi
 
+# Verify register-python-argcomplete is available
+if ! command -v register-python-argcomplete &> /dev/null; then
+    echo "Warning: register-python-argcomplete not found in PATH"
+    echo "Checking ~/.local/bin..."
+    if [[ -f "$HOME/.local/bin/register-python-argcomplete" ]]; then
+        echo "Found in ~/.local/bin"
+        export PATH="$HOME/.local/bin:$PATH"
+    else
+        echo "Error: Cannot find register-python-argcomplete executable"
+        echo "Please ensure argcomplete is properly installed"
+        exit 1
+    fi
+fi
+
 # Detect shell
 SHELL_NAME=$(basename "$SHELL")
 echo "Detected shell: $SHELL_NAME"
 echo
-
-# Generate the completion command
-COMPLETION_CMD="eval \"\$(register-python-argcomplete $GRUMPWALK_PATH)\""
 
 # Function to add completion to config file
 add_to_config() {
@@ -56,13 +73,43 @@ add_to_config() {
     # Check if already configured
     if grep -q "$marker" "$config_file" 2>/dev/null; then
         echo "Completion already configured in $config_file"
-        return 0
+        echo "Removing old configuration..."
+        # Remove old configuration (from marker to next empty line or EOF)
+        # Create a temp file
+        local temp_file="${config_file}.tmp"
+        local in_section=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" == *"$marker"* ]]; then
+                in_section=1
+                continue
+            fi
+            if [[ $in_section -eq 1 ]]; then
+                # Check if we've reached the end of the section (empty line or new comment)
+                if [[ -z "$line" ]] || [[ "$line" =~ ^[^#] ]]; then
+                    in_section=0
+                    echo "$line" >> "$temp_file"
+                fi
+                continue
+            fi
+            echo "$line" >> "$temp_file"
+        done < "$config_file"
+        mv "$temp_file" "$config_file"
     fi
 
     # Add completion configuration
+    # Support multiple invocation methods
     echo "" >> "$config_file"
     echo "$marker" >> "$config_file"
-    echo "$COMPLETION_CMD" >> "$config_file"
+    echo "# Ensure ~/.local/bin is in PATH (needed for argcomplete)" >> "$config_file"
+    echo "if [[ \":\$PATH:\" != *\":\$HOME/.local/bin:\"* ]]; then" >> "$config_file"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$config_file"
+    echo "fi" >> "$config_file"
+    echo "# Enable argcomplete for grumpwalk.py (supports multiple invocation paths)" >> "$config_file"
+    echo "if command -v register-python-argcomplete &> /dev/null; then" >> "$config_file"
+    echo "    eval \"\$(register-python-argcomplete grumpwalk.py)\" 2>/dev/null" >> "$config_file"
+    echo "    eval \"\$(register-python-argcomplete ./grumpwalk.py)\" 2>/dev/null" >> "$config_file"
+    echo "    eval \"\$(register-python-argcomplete $GRUMPWALK_PATH)\" 2>/dev/null" >> "$config_file"
+    echo "fi" >> "$config_file"
     echo "Added completion configuration to $config_file"
 }
 
@@ -100,5 +147,10 @@ echo
 echo "Or start a new terminal session."
 echo
 echo "Test completion with:"
-echo "    $GRUMPWALK_PATH --ho<TAB>"
-echo "    $GRUMPWALK_PATH --type <TAB>"
+echo "    grumpwalk.py --ho<TAB>"
+echo "    ./grumpwalk.py --type <TAB>"
+echo
+echo "Note: Completion works with any of these invocation methods:"
+echo "  - grumpwalk.py (if in PATH)"
+echo "  - ./grumpwalk.py (relative path)"
+echo "  - $GRUMPWALK_PATH (absolute path)"

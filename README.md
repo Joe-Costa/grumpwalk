@@ -70,6 +70,36 @@ After enabling, you can use Tab to autocomplete options:
 ./grumpwalk.py --ho<TAB>     # completes to --host
 ./grumpwalk.py --type <TAB>  # shows: file directory symlink
 ```
+
+**Troubleshooting tab completion:**
+
+If tab completion isn't working after setup:
+
+1. **Reload your shell configuration:**
+   ```bash
+   source ~/.bashrc  # or source ~/.zshrc for zsh
+   ```
+
+2. **Check if register-python-argcomplete is in PATH:**
+   ```bash
+   which register-python-argcomplete
+   # Should show: ~/.local/bin/register-python-argcomplete
+   ```
+
+3. **If not found, add ~/.local/bin to PATH manually:**
+   ```bash
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+4. **Re-run the setup script:**
+   ```bash
+   ./setup_completion.sh
+   source ~/.bashrc
+   ```
+
+5. **Test in a new shell session** - Sometimes completion only works in fresh shells
+
 ## Logging into a cluster
 
 Since we've installed the `qq` CLI you can login with:
