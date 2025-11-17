@@ -35,6 +35,21 @@ cd grumpwalk
 chmod +x grumpwalk.py
 pip install -r requirements.txt
 ```
+## Logging into a cluster
+
+Since we've installed the `qq` CLI you can login with:
+
+**Login with a user that has the correct RBAC rights for any operations you want `grumpwalk.py` to perform!**
+
+`qq --host cluster.example.com login -u "DOMAIN\user"`
+
+This will save a `.qfsd_cred` file in your current user's home directory. 
+
+## Helpful Qumulo Care Articles:
+
+[How to get an Access Token](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
+
+[Qumulo Role Based Access Control](https://care.qumulo.com/hc/en-us/articles/360036591633-Role-Based-Access-Control-RBAC-with-Qumulo-Core#managing-roles-by-using-the-web-ui-0-7)
 
 ## Quick Examples
 
