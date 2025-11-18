@@ -2,6 +2,9 @@
 
 High-performance async file search tool for Qumulo storage systems.
 
+I've observed performance as high as 12k objects per second processed against an old QC24 Qumulo cluster.<br>The lower the latency you have between where this code is running and the Qumulo cluster the better your performance
+will be.<br>Some operations will read contents of files, which might be slow over the public internet & VPN.
+
 ## Features
 
 - **Fast async operations** - Direct REST API calls with concurrent requests
