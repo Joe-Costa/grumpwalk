@@ -1786,11 +1786,12 @@ async def main_async(args):
         print(f"Target path:      {args.acl_target}", file=sys.stderr)
         if args.propagate_acls:
             print(f"Propagate:        Enabled", file=sys.stderr)
+        print(f"ACL concurrency:  {args.acl_concurrency}", file=sys.stderr)
     else:
         print(f"Path:             {args.path}", file=sys.stderr)
 
     print(f"JSON parser:      {JSON_PARSER_NAME}", file=sys.stderr)
-    print(f"Max concurrent:   {args.max_concurrent}", file=sys.stderr)
+    print(f"Walk concurrency: {args.max_concurrent}", file=sys.stderr)
     print(f"Connection pool:  {args.connector_limit}", file=sys.stderr)
     if args.max_depth:
         print(f"Max depth:        {args.max_depth}", file=sys.stderr)
