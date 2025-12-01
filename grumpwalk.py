@@ -788,9 +788,6 @@ async def apply_acl_to_tree(
     if not propagate:
         return stats
 
-    if progress:
-        print(f"[ACL CLONE] Streaming tree walk with concurrent ACL application...", file=sys.stderr)
-
     # Create a ProgressTracker to count examined vs matched objects
     walk_progress = ProgressTracker(verbose=False, limit=args.limit if args else None)
 
