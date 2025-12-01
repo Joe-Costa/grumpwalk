@@ -250,7 +250,7 @@ This will save a `.qfsd_cred` file in your current user's home directory.
 ### Performance Options
 - `--max-concurrent N` - Concurrent operations (default: 100)
 - `--connector-limit N` - HTTP connection pool size (default: 100)
-- `--profile` - Performance profiling
+- `--profile` - Performance profiling for user lookup operations (Useful to detect AD or LDAP latency)
 
 ### Connection Options
 - `--port PORT` - API port (default: 8000)
