@@ -2,8 +2,14 @@
 
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
+- **Find files by name or timestamps**
+- **Easily replace permissions on thousands of files**
+- **Find similar files**
+- **Find and resolve symlinks**
+- **And more!**
+
 I've observed performance as high as 12k objects per second processed against an old QC24 Qumulo cluster.<br>The lower the latency you have between where this code is running and the Qumulo cluster the better your performance
-will be.<br>Some operations will read contents of files, which might be slow over the public internet & VPN.
+will be.<br>Keep in mind that some operations will read contents of files, which might be slower over low bandwidth public internet & VPN connections.
 
 ## Features
 
