@@ -872,7 +872,7 @@ async def apply_acl_to_tree(
     # Consumer: process entries from queue in batches
     async def consumer():
         """Process entries from queue, applying ACLs in batches."""
-        batch_size = 100
+        batch_size = 500
         batch = []
         processed = 0
 
