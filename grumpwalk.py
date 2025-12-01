@@ -884,13 +884,11 @@ async def apply_acl_to_tree(
                     'message': error_msg
                 })
 
-                # Handle errors based on settings
-                is_401 = '401' in error_msg or 'Unauthorized' in error_msg.lower()
-
-                if is_401 and continue_on_error:
+                # Handle errors based on continue_on_error setting
+                if continue_on_error:
                     # Log and continue
                     if progress:
-                        print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
+                        print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
                 else:
                     # Pause and prompt
                     print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
@@ -919,13 +917,11 @@ async def apply_acl_to_tree(
                         'message': error_msg
                     })
 
-                    # Handle errors based on settings
-                    is_401 = '401' in error_msg or 'Unauthorized' in error_msg.lower()
-
-                    if is_401 and continue_on_error:
+                    # Handle errors based on continue_on_error setting
+                    if continue_on_error:
                         # Log and continue
                         if progress:
-                            print(f"\n[WARN] 401 error on {path}, continuing...", file=sys.stderr)
+                            print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
                     else:
                         # Pause and prompt
                         print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
@@ -3224,7 +3220,7 @@ Examples:
     acl_management.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="Continue on permission errors"
+        help="Continue ACL propagation on errors without prompting (errors logged to stderr)"
     )
 
     acl_management.add_argument(
