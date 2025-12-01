@@ -698,6 +698,8 @@ async def apply_acl_to_tree(
 
     Children are filtered using the standard file_filter (Universal Filters).
 
+    Uses streaming mode with bounded queue for memory efficiency on large trees.
+
     Args:
         client: AsyncQumuloClient instance
         session: aiohttp session
@@ -706,7 +708,7 @@ async def apply_acl_to_tree(
         propagate: If True, apply to all matching descendants
         file_filter: Filter function for matching objects
         progress: Show progress output
-        continue_on_error: Continue on 401 errors after initial success
+        continue_on_error: Continue on errors without prompting
         args: Command line arguments for filter parameters
         owner_group_data: Owner/group data from source (optional)
         copy_owner: Copy owner from source
@@ -786,43 +788,21 @@ async def apply_acl_to_tree(
     if not propagate:
         return stats
 
-    # Walk the tree to get all objects
     if progress:
-        print(f"[ACL CLONE] Scanning tree for child objects...", file=sys.stderr)
+        print(f"[ACL CLONE] Streaming tree walk with concurrent ACL application...", file=sys.stderr)
 
     # Create a ProgressTracker to count examined vs matched objects
     walk_progress = ProgressTracker(verbose=False, limit=args.limit if args else None)
 
-    matching_files = await client.walk_tree_async(
-        session=session,
-        path=target_path,
-        max_depth=args.max_depth if args else None,
-        progress=walk_progress,  # Track objects for skipped count
-        file_filter=file_filter,
-        collect_results=True
-    )
+    # Bounded queue for memory-efficient streaming (max 10K entries = ~15-20MB)
+    # This allows tree walk to run ahead while ACL application catches up
+    entry_queue = asyncio.Queue(maxsize=10000)
 
-    # Remove target path from list (already applied)
-    matching_files = [f for f in matching_files if f['path'] != target_path]
-
-    # Calculate skipped objects: examined - matched
-    # We need to subtract the target path itself (1) since it was processed separately
-    stats['objects_skipped'] = walk_progress.total_objects - walk_progress.matches
-
-    # Apply limit if specified
-    if args and args.limit and len(matching_files) > args.limit:
-        matching_files = matching_files[:args.limit]
-        if progress:
-            print(f"[ACL CLONE] Limiting to {args.limit:,} objects", file=sys.stderr)
-
-    total_to_process = len(matching_files)
-    processed = 0
-
-    if progress:
-        print(f"[ACL CLONE] Found {total_to_process:,} child objects to process", file=sys.stderr)
-
-    # Batch size for parallel ACL application
-    batch_size = 100
+    # Shared state for producer/consumer coordination
+    producer_done = asyncio.Event()
+    abort_requested = asyncio.Event()
+    limit_reached = asyncio.Event()
+    entries_queued = [0]  # Use list for mutability in nested function
 
     # Helper async function to apply both ACL and owner/group to a single file
     async def apply_to_single_file(path: str):
@@ -853,109 +833,184 @@ async def apply_acl_to_tree(
         # Return combined result
         return (acl_success and og_success, error_msg)
 
-    # Process files in batches for parallel application
-    for i in range(0, total_to_process, batch_size):
-        batch = matching_files[i:i + batch_size]
+    # Output callback for streaming - adds entries to queue
+    async def queue_entry(entry):
+        """Callback to add matching entries to the processing queue."""
+        # Skip if abort requested or limit reached
+        if abort_requested.is_set() or limit_reached.is_set():
+            return
 
-        # Create tasks for parallel execution
-        tasks = []
-        paths = []
-        for entry in batch:
-            path = entry['path']
-            paths.append(path)
-            task = apply_to_single_file(path)
-            tasks.append(task)
+        # Skip target path (already applied)
+        if entry.get('path') == target_path:
+            return
 
-        # Execute all tasks in this batch concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Check limit
+        if args and args.limit and entries_queued[0] >= args.limit:
+            limit_reached.set()
+            return
 
-        # Process results from this batch
-        for path, result in zip(paths, results):
-            processed += 1
-            stats['total_objects_processed'] += 1
+        # Add to queue (blocks if queue is full, providing backpressure)
+        await entry_queue.put(entry)
+        entries_queued[0] += 1
 
-            if isinstance(result, Exception):
-                # Task raised an exception
-                stats['objects_failed'] += 1
-                error_msg = str(result)
-                stats['errors'].append({
-                    'path': path,
-                    'error_code': 'EXCEPTION',
-                    'message': error_msg
-                })
-
-                # Handle errors based on continue_on_error setting
-                if continue_on_error:
-                    # Log and continue
-                    if progress:
-                        print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
-                else:
-                    # Pause and prompt
-                    print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
-                    print(f"[ERROR] {error_msg}", file=sys.stderr)
-
-                    while True:
-                        response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
-                        if response in ['c', 'continue']:
-                            break
-                        elif response in ['a', 'abort']:
-                            print("[INFO] Operation aborted by user.", file=sys.stderr)
-                            return stats
-                        print("Invalid response. Please enter 'c' or 'a'.")
-
-            elif isinstance(result, tuple):
-                # Normal return: (success: bool, error_msg: Optional[str])
-                success, error_msg = result
-
-                if success:
-                    stats['objects_changed'] += 1
-                else:
-                    stats['objects_failed'] += 1
-                    stats['errors'].append({
-                        'path': path,
-                        'error_code': 'APPLY_FAILURE',
-                        'message': error_msg
-                    })
-
-                    # Handle errors based on continue_on_error setting
-                    if continue_on_error:
-                        # Log and continue
-                        if progress:
-                            print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
-                    else:
-                        # Pause and prompt
-                        print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
-                        print(f"[ERROR] {error_msg}", file=sys.stderr)
-
-                        while True:
-                            response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
-                            if response in ['c', 'continue']:
-                                break
-                            elif response in ['a', 'abort']:
-                                print("[INFO] Operation aborted by user.", file=sys.stderr)
-                                return stats
-                            print("Invalid response. Please enter 'c' or 'a'.")
-
-        # Progress reporting after each batch
-        if progress:
-            elapsed = time.time() - start_time
-            rate = processed / elapsed if elapsed > 0 else 0
-            remaining = total_to_process - processed
-            eta_seconds = remaining / rate if rate > 0 else 0
-            eta_str = format_time_estimate(eta_seconds)
-
-            print(
-                f"\r[ACL CLONE] Changed: {stats['objects_changed']:,} | "
-                f"Failed: {stats['objects_failed']:,} | "
-                f"Remaining: {remaining:,} | "
-                f"Est: {eta_str}",
-                end='',
-                file=sys.stderr
+    # Producer: walk tree and stream entries to queue
+    async def producer():
+        """Walk tree and stream matching entries to queue."""
+        try:
+            await client.walk_tree_async(
+                session=session,
+                path=target_path,
+                max_depth=args.max_depth if args else None,
+                progress=walk_progress,
+                file_filter=file_filter,
+                collect_results=False,  # Memory-efficient streaming mode
+                output_callback=queue_entry,
             )
-            sys.stderr.flush()
+        except Exception as e:
+            if progress:
+                print(f"\n[ERROR] Tree walk failed: {e}", file=sys.stderr)
+        finally:
+            producer_done.set()
+
+    # Consumer: process entries from queue in batches
+    async def consumer():
+        """Process entries from queue, applying ACLs in batches."""
+        batch_size = 100
+        batch = []
+        processed = 0
+
+        while True:
+            # Check for abort
+            if abort_requested.is_set():
+                break
+
+            # Try to fill batch
+            try:
+                # Use timeout to periodically check if producer is done
+                entry = await asyncio.wait_for(entry_queue.get(), timeout=0.1)
+                batch.append(entry)
+
+                # Continue filling batch if more entries available
+                while len(batch) < batch_size:
+                    try:
+                        entry = entry_queue.get_nowait()
+                        batch.append(entry)
+                    except asyncio.QueueEmpty:
+                        break
+
+            except asyncio.TimeoutError:
+                # No entry available, check if producer is done
+                if producer_done.is_set() and entry_queue.empty():
+                    break
+                # Process partial batch if we have entries
+                if not batch:
+                    continue
+
+            # Process batch if we have entries
+            if batch:
+                # Create tasks for parallel execution
+                tasks = []
+                paths = []
+                for entry in batch:
+                    path = entry['path']
+                    paths.append(path)
+                    tasks.append(apply_to_single_file(path))
+
+                # Execute all tasks in this batch concurrently
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process results
+                for path, result in zip(paths, results):
+                    processed += 1
+                    stats['total_objects_processed'] += 1
+
+                    if isinstance(result, Exception):
+                        stats['objects_failed'] += 1
+                        error_msg = str(result)
+                        stats['errors'].append({
+                            'path': path,
+                            'error_code': 'EXCEPTION',
+                            'message': error_msg
+                        })
+
+                        if continue_on_error:
+                            if progress:
+                                print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
+                        else:
+                            print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
+                            print(f"[ERROR] {error_msg}", file=sys.stderr)
+
+                            while True:
+                                response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                                if response in ['c', 'continue']:
+                                    break
+                                elif response in ['a', 'abort']:
+                                    print("[INFO] Operation aborted by user.", file=sys.stderr)
+                                    abort_requested.set()
+                                    return
+                                print("Invalid response. Please enter 'c' or 'a'.")
+
+                    elif isinstance(result, tuple):
+                        success, error_msg = result
+
+                        if success:
+                            stats['objects_changed'] += 1
+                        else:
+                            stats['objects_failed'] += 1
+                            stats['errors'].append({
+                                'path': path,
+                                'error_code': 'APPLY_FAILURE',
+                                'message': error_msg
+                            })
+
+                            if continue_on_error:
+                                if progress:
+                                    print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
+                            else:
+                                print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
+                                print(f"[ERROR] {error_msg}", file=sys.stderr)
+
+                                while True:
+                                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                                    if response in ['c', 'continue']:
+                                        break
+                                    elif response in ['a', 'abort']:
+                                        print("[INFO] Operation aborted by user.", file=sys.stderr)
+                                        abort_requested.set()
+                                        return
+                                    print("Invalid response. Please enter 'c' or 'a'.")
+
+                # Progress reporting after each batch
+                if progress:
+                    elapsed = time.time() - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    queue_size = entry_queue.qsize()
+
+                    # Show queue size to indicate backpressure
+                    print(
+                        f"\r[ACL CLONE] Changed: {stats['objects_changed']:,} | "
+                        f"Failed: {stats['objects_failed']:,} | "
+                        f"Processed: {processed:,} | "
+                        f"Queue: {queue_size:,} | "
+                        f"Rate: {rate:.0f}/s",
+                        end='',
+                        file=sys.stderr
+                    )
+                    sys.stderr.flush()
+
+                # Clear batch for next iteration
+                batch = []
+
+    # Run producer and consumer concurrently
+    await asyncio.gather(producer(), consumer())
+
+    # Calculate skipped objects from progress tracker
+    stats['objects_skipped'] = walk_progress.total_objects - walk_progress.matches
 
     if progress:
         print()  # New line after progress
+        elapsed = time.time() - start_time
+        print(f"[ACL CLONE] Completed in {elapsed:.1f}s", file=sys.stderr)
 
     return stats
 
