@@ -149,6 +149,9 @@ This will save a `.qfsd_cred` file in your current user's home directory.
 # Copy ACL from source to target
 ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls
 
+# Apply ACL from local JSON file
+./grumpwalk.py --host cluster.example.com --source-acl-file acl.json --acl-target /target/dir --propagate-acls
+
 # Copy owner and group only (no ACL changes)
 ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --copy-owner --copy-group --owner-group-only --propagate-acls
 
@@ -216,13 +219,15 @@ This will save a `.qfsd_cred` file in your current user's home directory.
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
 
 ### ACL Management Options
-- `--source-acl PATH` - Source object path
+- `--source-acl PATH` - Source ACL from cluster path
+- `--source-acl-file FILE` - Source ACL from local JSON file
 - `--acl-target PATH` - Target object/directory path
 - `--propagate-acls` - Apply to all child objects recursively
-- `--continue-on-error` - Continue on permission errors
+- `--continue-on-error` - Continue on errors without prompting
 - `--copy-owner` - Copy owner from source
 - `--copy-group` - Copy group from source
 - `--owner-group-only` - Copy only owner/group, skip ACL
+- `--acl-concurrency N` - Concurrent ACL operations (default: 100, try 500 for faster throughput)
 
 ### Similarity Detection Options
 - `--find-similar` - Find similar files using metadata + sample hashing

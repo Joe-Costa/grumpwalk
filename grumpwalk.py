@@ -1768,7 +1768,7 @@ async def generate_owner_report(
 async def main_async(args):
     """Main async function."""
     # Determine if we're in ACL cloning mode
-    acl_cloning_mode = args.source_acl and args.acl_target
+    acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
 
     print("=" * 70, file=sys.stderr)
     if acl_cloning_mode:
@@ -1779,7 +1779,10 @@ async def main_async(args):
     print(f"Cluster:          {args.host}", file=sys.stderr)
 
     if acl_cloning_mode:
-        print(f"Source ACL:       {args.source_acl}", file=sys.stderr)
+        if args.source_acl_file:
+            print(f"Source ACL:       {args.source_acl_file} (file)", file=sys.stderr)
+        else:
+            print(f"Source ACL:       {args.source_acl}", file=sys.stderr)
         print(f"Target path:      {args.acl_target}", file=sys.stderr)
         if args.propagate_acls:
             print(f"Propagate:        Enabled", file=sys.stderr)
@@ -1823,30 +1826,55 @@ async def main_async(args):
     )
 
     # ACL Cloning Mode
-    if args.source_acl or args.acl_target:
-        # Validate: both flags must be provided together
-        if not (args.source_acl and args.acl_target):
-            print("[ERROR] Both --source-acl and --acl-target must be specified together", file=sys.stderr)
+    if args.source_acl or args.source_acl_file or args.acl_target:
+        # Validate: need a source and a target
+        if not ((args.source_acl or args.source_acl_file) and args.acl_target):
+            print("[ERROR] Both a source (--source-acl or --source-acl-file) and --acl-target must be specified", file=sys.stderr)
+            sys.exit(1)
+
+        # Validate: can't specify both source types
+        if args.source_acl and args.source_acl_file:
+            print("[ERROR] Cannot specify both --source-acl and --source-acl-file", file=sys.stderr)
             sys.exit(1)
 
         async with client.create_session() as session:
-            # Step 1: Retrieve source ACL
-            if args.verbose:
-                print(f"[INFO] Retrieving ACL from: {args.source_acl}", file=sys.stderr)
+            # Step 1: Get source ACL (from file or cluster)
+            if args.source_acl_file:
+                # Load ACL from local JSON file
+                try:
+                    with open(args.source_acl_file, 'r') as f:
+                        source_acl = json.load(f)
+                    if args.verbose:
+                        ace_count = len(source_acl.get('acl', {}).get('aces', []))
+                        print(f"[INFO] Loaded ACL from file with {ace_count} ACEs", file=sys.stderr)
+                except FileNotFoundError:
+                    print(f"[ERROR] ACL file not found: {args.source_acl_file}", file=sys.stderr)
+                    sys.exit(1)
+                except json.JSONDecodeError as e:
+                    print(f"[ERROR] Invalid JSON in ACL file: {e}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                # Retrieve ACL from cluster
+                if args.verbose:
+                    print(f"[INFO] Retrieving ACL from: {args.source_acl}", file=sys.stderr)
 
-            source_acl = await client.get_file_acl(session, args.source_acl)
+                source_acl = await client.get_file_acl(session, args.source_acl)
 
-            if not source_acl:
-                print(f"[ERROR] Could not retrieve ACL from {args.source_acl}", file=sys.stderr)
-                sys.exit(1)
+                if not source_acl:
+                    print(f"[ERROR] Could not retrieve ACL from {args.source_acl}", file=sys.stderr)
+                    sys.exit(1)
 
-            if args.verbose:
-                ace_count = len(source_acl.get('acl', {}).get('aces', []))
-                print(f"[INFO] Retrieved ACL with {ace_count} ACEs", file=sys.stderr)
+                if args.verbose:
+                    ace_count = len(source_acl.get('acl', {}).get('aces', []))
+                    print(f"[INFO] Retrieved ACL with {ace_count} ACEs", file=sys.stderr)
 
             # Step 1b: Retrieve owner/group if requested
             owner_group_data = None
             if args.copy_owner or args.copy_group:
+                if args.source_acl_file:
+                    print("[ERROR] Cannot use --copy-owner or --copy-group with --source-acl-file", file=sys.stderr)
+                    sys.exit(1)
+
                 if args.verbose:
                     print(f"[INFO] Retrieving owner/group from: {args.source_acl}", file=sys.stderr)
 
@@ -1862,17 +1890,18 @@ async def main_async(args):
                     if args.copy_group:
                         print(f"[INFO] Source group: {owner_group_data.get('group')}", file=sys.stderr)
 
-            # Step 2: Check ACL type compatibility and warn if needed
-            proceed = await check_acl_type_compatibility(
-                client=client,
-                session=session,
-                source_path=args.source_acl,
-                target_path=args.acl_target,
-                propagate=args.propagate_acls
-            )
+            # Step 2: Check ACL type compatibility and warn if needed (skip if using file)
+            if not args.source_acl_file:
+                proceed = await check_acl_type_compatibility(
+                    client=client,
+                    session=session,
+                    source_path=args.source_acl,
+                    target_path=args.acl_target,
+                    propagate=args.propagate_acls
+                )
 
-            if not proceed:
-                sys.exit(0)
+                if not proceed:
+                    sys.exit(0)
 
             # Step 3: Build file filter from Universal Filters (reuse existing logic)
             owner_auth_ids = None
@@ -1910,7 +1939,10 @@ async def main_async(args):
             else:
                 print("\nACL CLONING SUMMARY", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
-            print(f"Source:            {args.source_acl}", file=sys.stderr)
+            if args.source_acl_file:
+                print(f"Source:            {args.source_acl_file} (file)", file=sys.stderr)
+            else:
+                print(f"Source:            {args.source_acl}", file=sys.stderr)
             print(f"Target path:       {args.acl_target}", file=sys.stderr)
 
             # Show what was copied
@@ -3256,8 +3288,14 @@ Examples:
 
     acl_management.add_argument(
         "--source-acl",
-        help="Source object path",
+        help="Source object path on cluster",
         metavar="PATH"
+    )
+
+    acl_management.add_argument(
+        "--source-acl-file",
+        help="Source ACL from local JSON file",
+        metavar="FILE"
     )
 
     acl_management.add_argument(
@@ -3406,19 +3444,19 @@ Examples:
     args = parser.parse_args()
 
     # Validate arguments
-    # Check that either --path OR (--source-acl + --acl-target) are provided
-    acl_cloning_mode = args.source_acl and args.acl_target
+    # Check that either --path OR (--source-acl/--source-acl-file + --acl-target) are provided
+    acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
     if not args.path and not acl_cloning_mode:
         print(
-            "Error: Either --path is required OR both --source-acl and --acl-target for ACL cloning",
+            "Error: Either --path is required OR a source (--source-acl or --source-acl-file) and --acl-target for ACL cloning",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Validate owner/group flags
+    # Validate owner/group flags (only work with --source-acl, not --source-acl-file)
     if (args.copy_owner or args.copy_group) and not args.source_acl:
         print(
-            "Error: --copy-owner and --copy-group require --source-acl",
+            "Error: --copy-owner and --copy-group require --source-acl (not --source-acl-file)",
             file=sys.stderr,
         )
         sys.exit(1)
