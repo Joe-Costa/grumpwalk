@@ -2,7 +2,7 @@
 
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
-- **Find files by name or timestamps**
+- **Find files by name, owner, size or timestamps**
 - **Easily replace permissions on thousands of files**
 - **Find similar files**
 - **Find and resolve symlinks**
