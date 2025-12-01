@@ -687,7 +687,8 @@ async def apply_acl_to_tree(
     owner_group_data: Optional[dict] = None,
     copy_owner: bool = False,
     copy_group: bool = False,
-    owner_group_only: bool = False
+    owner_group_only: bool = False,
+    acl_concurrency: int = 100
 ) -> dict:
     """
     Apply ACL and/or owner/group to target path, optionally propagating to filtered children.
@@ -714,6 +715,7 @@ async def apply_acl_to_tree(
         copy_owner: Copy owner from source
         copy_group: Copy group from source
         owner_group_only: Apply only owner/group, not ACL
+        acl_concurrency: Number of concurrent ACL operations (default 100)
 
     Returns:
         Statistics dict:
@@ -872,7 +874,7 @@ async def apply_acl_to_tree(
     # Consumer: process entries from queue in batches
     async def consumer():
         """Process entries from queue, applying ACLs in batches."""
-        batch_size = 1000
+        batch_size = acl_concurrency
         batch = []
         processed = 0
 
@@ -1896,7 +1898,8 @@ async def main_async(args):
                 owner_group_data=owner_group_data,
                 copy_owner=args.copy_owner,
                 copy_group=args.copy_group,
-                owner_group_only=args.owner_group_only
+                owner_group_only=args.owner_group_only,
+                acl_concurrency=args.acl_concurrency
             )
 
             # Step 5: Print summary
@@ -3291,6 +3294,14 @@ Examples:
         "--owner-group-only",
         action="store_true",
         help="Copy only owner/group, skip ACL"
+    )
+
+    acl_management.add_argument(
+        "--acl-concurrency",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Concurrent ACL operations during propagation (default: 100, try 500 for faster throughput)"
     )
 
     # ============================================================================
