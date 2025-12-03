@@ -119,6 +119,14 @@ Since we've installed the `qq` CLI you can login with:
 
 This will save a `.qfsd_cred` file in your current user's home directory. 
 
+## An important note about access_time
+
+If your cluster does not have `atime` attribute tracking of file read or write then be aware that the `atime` attribute will be the same as the file creation time.
+<br>Updating the `atime` attribute on file read and write ops is disabled by default on Qumulo clusters, you can learn more about this feature here:<br><br>
+[Enabling Access Time Updates for File and Directory Reads in Qumulo Core](https://care.qumulo.com/s/article/Enabling-Access-Time-Updates-for-File-and-Directory-Reads-in-Qumulo-Core?)
+
+
+
 ## Helpful Qumulo Care Articles:
 
 [How to get an Access Token](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
