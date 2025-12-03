@@ -122,7 +122,9 @@ This will save a `.qfsd_cred` file in your current user's home directory.
 ## An important note about access_time
 
 If your cluster does not have `atime` updating enabled then be aware that the `access_time` attribute will remain the same as the file creation time.
-<br>Updating the `atime` attribute on file read and write ops is disabled by default on Qumulo clusters, you can learn more about this feature here:<br><br>
+<br><br>
+Updating the `atime` attribute on file read and write ops is disabled by default on Qumulo clusters, you can learn more about this feature here:
+<br><br>
 [Enabling Access Time Updates for File and Directory Reads in Qumulo Core](https://care.qumulo.com/s/article/Enabling-Access-Time-Updates-for-File-and-Directory-Reads-in-Qumulo-Core?)
 
 
