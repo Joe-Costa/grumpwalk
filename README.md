@@ -308,7 +308,7 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 **--omit-path** - Exact absolute path filtering (no wildcards):
 ```bash
 --omit-path /home/joe/100k      # Skip this exact path only
---omit-path /data/archive       # Must start with / for filter to work
+--omit-path /data/archive       # Must start with / for filter to work (From Qumulo root, not Share root)
 --omit-path /tmp/cache          # Can specify multiple paths
 ```
 
