@@ -2764,6 +2764,16 @@ async def main_async(args):
         args.add_rights or args.remove_rights
     )
 
+    # Check for mutually exclusive flags: ACL cloning vs ACE manipulation
+    acl_cloning_mode = args.source_acl or args.source_acl_file
+    if ace_manipulation_mode and acl_cloning_mode:
+        print("[ERROR] ACL cloning (--source-acl, --source-acl-file, --acl-target) cannot be combined with", file=sys.stderr)
+        print("        ACE manipulation (--add-ace, --remove-ace, --replace-ace, --add-rights, --remove-rights)", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("        Use ACL cloning to copy an entire ACL from one path to another.", file=sys.stderr)
+        print("        Use ACE manipulation to surgically modify individual ACEs.", file=sys.stderr)
+        sys.exit(1)
+
     if ace_manipulation_mode:
         if not args.path:
             print("[ERROR] --path is required for ACE manipulation", file=sys.stderr)
