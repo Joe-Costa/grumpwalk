@@ -549,6 +549,490 @@ def analyze_acl_structure(qacl_data: Dict) -> Dict:
     }
 
 
+# ============================================================================
+# ACE MANIPULATION FUNCTIONS
+# ============================================================================
+
+# Reverse mapping: NFSv4 shorthand -> Qumulo rights
+NFSV4_TO_QACL_RIGHTS = {
+    'r': 'READ',
+    'w': 'MODIFY',
+    'a': 'EXTEND',
+    'x': 'EXECUTE',
+    'd': 'DELETE',
+    'D': 'DELETE_CHILD',
+    't': 'READ_ATTR',
+    'T': 'WRITE_ATTR',
+    'n': 'READ_EA',
+    'N': 'WRITE_EA',
+    'c': 'READ_ACL',
+    'C': 'WRITE_ACL',
+    'o': 'CHANGE_OWNER',
+    'y': 'SYNCHRONIZE',
+}
+
+# Reverse mapping: NFSv4 shorthand -> Qumulo flags
+NFSV4_TO_QACL_FLAGS = {
+    'f': 'OBJECT_INHERIT',
+    'd': 'CONTAINER_INHERIT',
+    'n': 'NO_PROPAGATE_INHERIT',
+    'i': 'INHERIT_ONLY',
+    'I': 'INHERITED',
+}
+
+# Well-known trustee names that map to specific identities
+WELL_KNOWN_TRUSTEES = {
+    'everyone': {'sid': 'S-1-1-0', 'name': 'Everyone'},
+    'everyone@': {'sid': 'S-1-1-0', 'name': 'Everyone'},
+    'owner@': {'special': 'OWNER'},
+    'group@': {'special': 'GROUP'},
+}
+
+
+def nfsv4_rights_to_qacl(rights_str: str) -> List[str]:
+    """
+    Convert NFSv4 rights shorthand to Qumulo rights list.
+
+    Args:
+        rights_str: String like 'rwx' or 'rwaxdDtTnNcCoy'
+
+    Returns:
+        List of Qumulo rights like ['READ', 'MODIFY', 'EXECUTE']
+    """
+    rights = []
+    for char in rights_str:
+        if char in NFSV4_TO_QACL_RIGHTS:
+            rights.append(NFSV4_TO_QACL_RIGHTS[char])
+        else:
+            print(f"[WARN] Unknown right character '{char}' in pattern", file=sys.stderr)
+    return rights
+
+
+def nfsv4_flags_to_qacl(flags_str: str) -> List[str]:
+    """
+    Convert NFSv4 flags shorthand to Qumulo flags list.
+
+    Args:
+        flags_str: String like 'fd' or 'fdI'
+
+    Returns:
+        List of Qumulo flags like ['OBJECT_INHERIT', 'CONTAINER_INHERIT']
+    """
+    flags = []
+    for char in flags_str:
+        if char in NFSV4_TO_QACL_FLAGS:
+            flags.append(NFSV4_TO_QACL_FLAGS[char])
+        elif char == 'g':
+            pass  # 'g' is group indicator, not a flag
+        else:
+            print(f"[WARN] Unknown flag character '{char}' in pattern", file=sys.stderr)
+    return flags
+
+
+def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
+    """
+    Parse ACE pattern strings into structured dict.
+
+    Formats:
+    - 'Type:Trustee' for removal (e.g., 'Allow:Everyone')
+    - 'Type:Trustee:Rights' for rights modification (e.g., 'Allow:Everyone:rx')
+    - 'Type:Flags:Trustee:Rights' for adding (e.g., 'Allow:fd:jsmith:rwx')
+
+    Args:
+        pattern: The pattern string to parse
+        pattern_type: One of 'remove', 'add', 'add_rights', 'remove_rights'
+
+    Returns:
+        Dict with keys: type, flags, trustee, rights, raw_trustee
+        Returns None if pattern is invalid
+    """
+    parts = pattern.split(':')
+
+    result = {
+        'type': None,
+        'flags': [],
+        'trustee': None,
+        'rights': [],
+        'raw_trustee': None,
+    }
+
+    # Parse ACE type (Allow/Deny)
+    if len(parts) < 2:
+        print(f"[ERROR] Invalid ACE pattern '{pattern}': expected at least Type:Trustee", file=sys.stderr)
+        return None
+
+    ace_type = parts[0].upper()
+    if ace_type in ('ALLOW', 'ALLOWED', 'A'):
+        result['type'] = 'ALLOWED'
+    elif ace_type in ('DENY', 'DENIED', 'D'):
+        result['type'] = 'DENIED'
+    else:
+        print(f"[ERROR] Invalid ACE type '{parts[0]}': expected Allow or Deny", file=sys.stderr)
+        return None
+
+    if pattern_type == 'remove':
+        # Format: Type:Trustee
+        if len(parts) != 2:
+            print(f"[ERROR] Invalid remove pattern '{pattern}': expected Type:Trustee", file=sys.stderr)
+            return None
+        result['raw_trustee'] = parts[1]
+
+    elif pattern_type in ('add_rights', 'remove_rights'):
+        # Format: Type:Trustee:Rights
+        if len(parts) != 3:
+            print(f"[ERROR] Invalid rights pattern '{pattern}': expected Type:Trustee:Rights", file=sys.stderr)
+            return None
+        result['raw_trustee'] = parts[1]
+        result['rights'] = nfsv4_rights_to_qacl(parts[2])
+
+    elif pattern_type == 'add':
+        # Format: Type:Flags:Trustee:Rights
+        if len(parts) != 4:
+            print(f"[ERROR] Invalid add pattern '{pattern}': expected Type:Flags:Trustee:Rights", file=sys.stderr)
+            return None
+        result['flags'] = nfsv4_flags_to_qacl(parts[1])
+        result['raw_trustee'] = parts[2]
+        result['rights'] = nfsv4_rights_to_qacl(parts[3])
+
+    return result
+
+
+def normalize_trustee_for_match(trustee_info: dict) -> str:
+    """
+    Create a normalized string representation of a trustee for matching.
+
+    Handles both API formats:
+    - Current: trustee is auth_id string, trustee_details has id_type/id_value
+    - Legacy: trustee is dict with domain, sid, uid, gid, name
+
+    Args:
+        trustee_info: Dict with 'trustee' and optionally 'trustee_details'
+
+    Returns:
+        Normalized string for comparison (lowercase)
+    """
+    trustee = trustee_info.get('trustee')
+    details = trustee_info.get('trustee_details', {})
+
+    # Check for well-known SID (Everyone)
+    if details.get('id_value') == 'S-1-1-0':
+        return 'everyone'
+    if isinstance(trustee, dict) and trustee.get('sid') == 'S-1-1-0':
+        return 'everyone'
+
+    # Try id_value from details
+    id_type = details.get('id_type', '')
+    id_value = details.get('id_value', '')
+
+    if id_type == 'NFS_UID':
+        return f'uid:{id_value}'.lower()
+    elif id_type == 'NFS_GID':
+        return f'gid:{id_value}'.lower()
+    elif id_type == 'SMB_SID':
+        return f'sid:{id_value}'.lower()
+    elif id_type in ('LOCAL_USER', 'LOCAL_GROUP'):
+        return id_value.lower() if id_value else str(trustee).lower()
+
+    # Legacy format handling
+    if isinstance(trustee, dict):
+        domain = trustee.get('domain', '')
+        name = trustee.get('name', '')
+        sid = trustee.get('sid', '')
+        uid = trustee.get('uid')
+        gid = trustee.get('gid')
+
+        if domain == 'WORLD':
+            return 'everyone'
+        elif domain == 'POSIX_USER' and uid is not None:
+            return f'uid:{uid}'
+        elif domain == 'POSIX_GROUP' and gid is not None:
+            return f'gid:{gid}'
+        elif name:
+            return name.lower()
+        elif sid:
+            return f'sid:{sid}'.lower()
+
+    # Fallback to auth_id
+    return str(trustee).lower()
+
+
+def normalize_pattern_trustee(raw_trustee: str) -> str:
+    """
+    Normalize a user-provided trustee pattern for matching.
+
+    Args:
+        raw_trustee: User input like 'Everyone', 'uid:1001', 'DOMAIN\\user'
+
+    Returns:
+        Normalized string for comparison (lowercase)
+    """
+    trustee = raw_trustee.strip().lower()
+
+    # Handle well-known names
+    if trustee in ('everyone', 'everyone@'):
+        return 'everyone'
+
+    # Handle prefixed formats
+    if trustee.startswith('uid:') or trustee.startswith('gid:') or trustee.startswith('sid:'):
+        return trustee
+
+    # Handle domain\\user format (normalize backslash)
+    if '\\' in trustee:
+        return trustee.replace('\\\\', '\\')
+
+    return trustee
+
+
+def match_ace(ace: dict, pattern: dict) -> bool:
+    """
+    Check if an ACE matches a pattern (by type and trustee).
+
+    Args:
+        ace: ACE dict from API with type, trustee, trustee_details
+        pattern: Parsed pattern dict with type, raw_trustee
+
+    Returns:
+        True if ACE matches the pattern
+    """
+    # Check type match
+    if ace.get('type') != pattern.get('type'):
+        return False
+
+    # Normalize both trustees for comparison
+    ace_trustee = normalize_trustee_for_match({
+        'trustee': ace.get('trustee'),
+        'trustee_details': ace.get('trustee_details', {})
+    })
+    pattern_trustee = normalize_pattern_trustee(pattern.get('raw_trustee', ''))
+
+    return ace_trustee == pattern_trustee
+
+
+def sort_aces_canonical(aces: List[dict]) -> List[dict]:
+    """
+    Sort ACEs into Windows canonical order.
+
+    Order:
+    1. Explicit DENY (no INHERITED flag)
+    2. Explicit ALLOW (no INHERITED flag)
+    3. Inherited DENY (with INHERITED flag)
+    4. Inherited ALLOW (with INHERITED flag)
+
+    Args:
+        aces: List of ACE dicts
+
+    Returns:
+        Sorted list of ACE dicts
+    """
+    def ace_sort_key(ace: dict) -> tuple:
+        is_inherited = 'INHERITED' in ace.get('flags', [])
+        is_deny = ace.get('type') == 'DENIED'
+        # Sort order: (inherited?, not deny?) -> (0,0), (0,1), (1,0), (1,1)
+        return (is_inherited, not is_deny)
+
+    return sorted(aces, key=ace_sort_key)
+
+
+def break_acl_inheritance(acl: dict) -> dict:
+    """
+    Break inheritance at this path by converting inherited ACEs to explicit.
+
+    This:
+    1. Removes 'INHERITED' flag from all ACEs
+    2. Adds 'DACL_PROTECTED' to control flags (blocks parent inheritance)
+    3. Removes 'AUTO_INHERIT' from control flags
+    4. Keeps 'PRESENT' in control flags
+
+    Args:
+        acl: ACL dict (may have nested 'acl' structure)
+
+    Returns:
+        Modified ACL dict with inheritance broken
+    """
+    import copy
+    result = copy.deepcopy(acl)
+
+    # Handle nested structure
+    if 'acl' in result and 'aces' not in result:
+        inner = result['acl']
+    else:
+        inner = result
+
+    # Remove INHERITED flag from all ACEs
+    for ace in inner.get('aces', []):
+        flags = ace.get('flags', [])
+        if 'INHERITED' in flags:
+            flags.remove('INHERITED')
+            ace['flags'] = flags
+
+    # Update control flags
+    control = set(inner.get('control', []))
+    control.add('PRESENT')
+    control.add('DACL_PROTECTED')
+    control.discard('AUTO_INHERIT')
+    inner['control'] = list(control)
+
+    return result
+
+
+def needs_inheritance_break(acl: dict, patterns: List[dict]) -> bool:
+    """
+    Check if any pattern targets an inherited ACE.
+
+    Args:
+        acl: ACL dict
+        patterns: List of parsed patterns
+
+    Returns:
+        True if any pattern matches an inherited ACE
+    """
+    # Handle nested structure
+    if 'acl' in acl and 'aces' not in acl:
+        aces = acl['acl'].get('aces', [])
+    else:
+        aces = acl.get('aces', [])
+
+    for ace in aces:
+        if 'INHERITED' in ace.get('flags', []):
+            for pattern in patterns:
+                if match_ace(ace, pattern):
+                    return True
+    return False
+
+
+def apply_ace_modifications(
+    acl: dict,
+    remove_patterns: List[dict],
+    add_aces: List[dict],
+    add_rights_patterns: List[dict],
+    remove_rights_patterns: List[dict]
+) -> Tuple[dict, dict]:
+    """
+    Apply all ACE modifications to an ACL in memory.
+
+    Processing order:
+    1. Check if inheritance break needed, apply if so
+    2. Remove matching ACEs
+    3. Remove rights from matching ACEs (delete if empty)
+    4. Add rights to matching ACEs (merge)
+    5. Add new ACEs (merge if same type+trustee exists)
+    6. Re-sort into canonical order
+
+    Args:
+        acl: ACL dict to modify
+        remove_patterns: Patterns for ACEs to remove
+        add_aces: Patterns for ACEs to add
+        add_rights_patterns: Patterns for rights to add
+        remove_rights_patterns: Patterns for rights to remove
+
+    Returns:
+        Tuple of (modified_acl, stats_dict)
+        stats_dict has keys: removed, added, modified, inheritance_broken
+    """
+    import copy
+    result = copy.deepcopy(acl)
+
+    stats = {
+        'removed': 0,
+        'added': 0,
+        'modified': 0,
+        'inheritance_broken': False,
+    }
+
+    # Handle nested structure
+    if 'acl' in result and 'aces' not in result:
+        inner = result['acl']
+    else:
+        inner = result
+
+    aces = inner.get('aces', [])
+
+    # Collect all patterns that might affect inherited ACEs
+    all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns
+    if needs_inheritance_break(acl, all_patterns):
+        result = break_acl_inheritance(result)
+        stats['inheritance_broken'] = True
+        # Re-get inner after breaking inheritance
+        if 'acl' in result and 'aces' not in result:
+            inner = result['acl']
+        else:
+            inner = result
+        aces = inner.get('aces', [])
+
+    # 1. Remove matching ACEs
+    new_aces = []
+    for ace in aces:
+        should_remove = False
+        for pattern in remove_patterns:
+            if match_ace(ace, pattern):
+                should_remove = True
+                stats['removed'] += 1
+                break
+        if not should_remove:
+            new_aces.append(ace)
+    aces = new_aces
+
+    # 2. Remove rights from matching ACEs
+    for pattern in remove_rights_patterns:
+        for ace in aces:
+            if match_ace(ace, pattern):
+                rights_to_remove = set(pattern.get('rights', []))
+                current_rights = set(ace.get('rights', []))
+                new_rights = current_rights - rights_to_remove
+                if new_rights != current_rights:
+                    stats['modified'] += 1
+                ace['rights'] = list(new_rights)
+
+    # Remove ACEs with no rights left
+    aces = [ace for ace in aces if ace.get('rights')]
+
+    # 3. Add rights to matching ACEs
+    for pattern in add_rights_patterns:
+        matched = False
+        for ace in aces:
+            if match_ace(ace, pattern):
+                rights_to_add = set(pattern.get('rights', []))
+                current_rights = set(ace.get('rights', []))
+                new_rights = current_rights | rights_to_add
+                if new_rights != current_rights:
+                    stats['modified'] += 1
+                ace['rights'] = list(new_rights)
+                matched = True
+        if not matched:
+            print(f"[WARN] No matching ACE found for --add-rights pattern", file=sys.stderr)
+
+    # 4. Add new ACEs (merge if same type+trustee exists)
+    for pattern in add_aces:
+        merged = False
+        for ace in aces:
+            if match_ace(ace, pattern):
+                # Merge rights into existing ACE
+                existing_rights = set(ace.get('rights', []))
+                new_rights = set(pattern.get('rights', []))
+                ace['rights'] = list(existing_rights | new_rights)
+                stats['modified'] += 1
+                merged = True
+                break
+
+        if not merged:
+            # Create new ACE (trustee will need to be resolved to auth_id later)
+            new_ace = {
+                'type': pattern['type'],
+                'flags': pattern.get('flags', []),
+                'trustee': pattern.get('raw_trustee'),  # Will be resolved later
+                'rights': pattern.get('rights', []),
+                '_needs_resolution': True,  # Marker for trustee resolution
+            }
+            aces.append(new_ace)
+            stats['added'] += 1
+
+    # 5. Re-sort into canonical order
+    aces = sort_aces_canonical(aces)
+
+    inner['aces'] = aces
+    return result, stats
+
+
 async def get_file_type(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -1974,6 +2458,228 @@ async def main_async(args):
 
         return  # Exit after ACL operation
 
+    # ACE MANIPULATION MODE
+    # Check if any ACE manipulation flags are specified
+    ace_manipulation_mode = (
+        args.remove_aces or args.add_aces or
+        args.add_rights or args.remove_rights
+    )
+
+    if ace_manipulation_mode:
+        if not args.path:
+            print("[ERROR] --path is required for ACE manipulation", file=sys.stderr)
+            sys.exit(1)
+
+        print("\n[INFO] ACE Manipulation Mode", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+
+        # Parse all patterns
+        remove_patterns = []
+        add_patterns = []
+        add_rights_patterns = []
+        remove_rights_patterns = []
+
+        if args.remove_aces:
+            for pattern in args.remove_aces:
+                parsed = parse_ace_pattern(pattern, 'remove')
+                if parsed:
+                    remove_patterns.append(parsed)
+                else:
+                    sys.exit(1)
+
+        if args.add_aces:
+            for pattern in args.add_aces:
+                parsed = parse_ace_pattern(pattern, 'add')
+                if parsed:
+                    add_patterns.append(parsed)
+                else:
+                    sys.exit(1)
+
+        if args.add_rights:
+            for pattern in args.add_rights:
+                parsed = parse_ace_pattern(pattern, 'add_rights')
+                if parsed:
+                    add_rights_patterns.append(parsed)
+                else:
+                    sys.exit(1)
+
+        if args.remove_rights:
+            for pattern in args.remove_rights:
+                parsed = parse_ace_pattern(pattern, 'remove_rights')
+                if parsed:
+                    remove_rights_patterns.append(parsed)
+                else:
+                    sys.exit(1)
+
+        # Show what will be done
+        if remove_patterns:
+            print(f"ACEs to remove:    {len(remove_patterns)}", file=sys.stderr)
+        if add_patterns:
+            print(f"ACEs to add:       {len(add_patterns)}", file=sys.stderr)
+        if add_rights_patterns:
+            print(f"Rights to add:     {len(add_rights_patterns)}", file=sys.stderr)
+        if remove_rights_patterns:
+            print(f"Rights to remove:  {len(remove_rights_patterns)}", file=sys.stderr)
+        if args.propagate_ace_changes:
+            print(f"Propagate:         Enabled", file=sys.stderr)
+        if args.ace_dry_run:
+            print(f"Dry run:           Enabled (no changes will be made)", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+
+        async with client.create_session() as session:
+            # Step 1: Get current ACL from path
+            print(f"\n[INFO] Retrieving ACL from: {args.path}", file=sys.stderr)
+            current_acl = await client.get_file_acl(session, args.path)
+
+            if not current_acl:
+                print(f"[ERROR] Could not retrieve ACL from {args.path}", file=sys.stderr)
+                sys.exit(1)
+
+            # Show current ACL summary
+            acl_inner = current_acl.get('acl', current_acl)
+            current_aces = acl_inner.get('aces', [])
+            inherited_count = sum(1 for ace in current_aces if 'INHERITED' in ace.get('flags', []))
+            print(f"[INFO] Current ACL has {len(current_aces)} ACEs ({inherited_count} inherited)", file=sys.stderr)
+
+            # Step 2: Apply modifications in memory
+            modified_acl, stats = apply_ace_modifications(
+                current_acl,
+                remove_patterns,
+                add_patterns,
+                add_rights_patterns,
+                remove_rights_patterns
+            )
+
+            # Show modification summary
+            print(f"\n[INFO] Modifications:", file=sys.stderr)
+            print(f"  ACEs removed:         {stats['removed']}", file=sys.stderr)
+            print(f"  ACEs added:           {stats['added']}", file=sys.stderr)
+            print(f"  ACEs modified:        {stats['modified']}", file=sys.stderr)
+            if stats['inheritance_broken']:
+                print(f"  Inheritance:          BROKEN (converted to explicit)", file=sys.stderr)
+
+            # Show resulting ACL summary
+            mod_inner = modified_acl.get('acl', modified_acl)
+            new_aces = mod_inner.get('aces', [])
+            print(f"  Resulting ACE count:  {len(new_aces)}", file=sys.stderr)
+
+            # Dry run: show what would happen and exit
+            if args.ace_dry_run:
+                print("\n[DRY RUN] Would apply the following ACL:", file=sys.stderr)
+                print("-" * 60, file=sys.stderr)
+
+                # Show each ACE in readable format
+                is_dir = True  # Assume directory for display purposes
+                for i, ace in enumerate(new_aces):
+                    ace_str = qacl_ace_to_readable(ace, is_dir)
+                    marker = ""
+                    if ace.get('_needs_resolution'):
+                        marker = " [NEW - trustee needs resolution]"
+                    print(f"  {i+1}. {ace_str}{marker}", file=sys.stderr)
+
+                print("-" * 60, file=sys.stderr)
+                print("[DRY RUN] No changes were made.", file=sys.stderr)
+                return
+
+            # Step 3: Save backup if requested
+            if args.ace_backup:
+                import json
+                backup_data = {
+                    'path': args.path,
+                    'original_acl': current_acl,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                try:
+                    with open(args.ace_backup, 'w') as f:
+                        json.dump(backup_data, f, indent=2)
+                    print(f"[INFO] Backup saved to: {args.ace_backup}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[ERROR] Failed to save backup: {e}", file=sys.stderr)
+                    sys.exit(1)
+
+            # Step 4: Resolve any new trustees that need auth_id
+            for ace in new_aces:
+                if ace.get('_needs_resolution'):
+                    raw_trustee = ace.get('trustee')
+                    print(f"[INFO] Resolving trustee: {raw_trustee}", file=sys.stderr)
+
+                    # Use parse_trustee to get the right format for identity resolution
+                    trustee_spec = parse_trustee(raw_trustee)
+                    payload = trustee_spec['payload']
+                    id_type = trustee_spec['type']
+
+                    # Extract identifier from payload
+                    if id_type == 'uid':
+                        identifier = payload.get('uid')
+                    elif id_type == 'gid':
+                        identifier = payload.get('gid')
+                    elif id_type == 'sid':
+                        identifier = payload.get('sid')
+                    elif id_type == 'auth_id':
+                        identifier = payload.get('auth_id')
+                    else:  # name
+                        identifier = payload.get('name')
+
+                    # Resolve to auth_id using identity API
+                    resolved = await client.resolve_identity(session, identifier, id_type)
+
+                    if resolved and resolved.get('auth_id'):
+                        ace['trustee'] = resolved['auth_id']
+                        del ace['_needs_resolution']
+                        if args.verbose:
+                            print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
+                    else:
+                        print(f"[ERROR] Could not resolve trustee: {raw_trustee}", file=sys.stderr)
+                        sys.exit(1)
+
+            # Step 5: Apply modified ACL to target path
+            print(f"\n[INFO] Applying modified ACL to: {args.path}", file=sys.stderr)
+            success, error = await client.set_file_acl(session, args.path, modified_acl, mark_inherited=False)
+
+            if not success:
+                print(f"[ERROR] Failed to apply ACL: {error}", file=sys.stderr)
+                sys.exit(1)
+
+            print("[INFO] ACL applied successfully", file=sys.stderr)
+
+            # Step 6: Propagate to children if requested
+            if args.propagate_ace_changes:
+                print(f"\n[INFO] Propagating ACL to children of: {args.path}", file=sys.stderr)
+
+                # Resolve owner filters if any
+                owner_auth_ids = None
+                if args.owners:
+                    owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+
+                file_filter = create_file_filter(args, owner_auth_ids)
+
+                # Use existing apply_acl_to_tree for propagation
+                # The modified ACL will be inherited (mark_inherited=True for children)
+                propagate_stats = await apply_acl_to_tree(
+                    client=client,
+                    session=session,
+                    acl_data=modified_acl,
+                    target_path=args.path,
+                    propagate=True,
+                    file_filter=file_filter,
+                    progress=args.progress,
+                    continue_on_error=args.continue_on_error,
+                    args=args,
+                    acl_concurrency=args.acl_concurrency
+                )
+
+                print(f"\n[INFO] Propagation complete:", file=sys.stderr)
+                print(f"  Objects changed:  {propagate_stats['objects_changed']:,}", file=sys.stderr)
+                print(f"  Objects failed:   {propagate_stats['objects_failed']:,}", file=sys.stderr)
+                if file_filter:
+                    print(f"  Objects skipped:  {propagate_stats['objects_skipped']:,}", file=sys.stderr)
+
+                if propagate_stats['objects_failed'] > 0:
+                    sys.exit(1)
+
+        print("\n[INFO] ACE manipulation complete", file=sys.stderr)
+        return  # Exit after ACE manipulation
+
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
         print("\n[INFO] Directory statistics mode (exploration)", file=sys.stderr)
@@ -3341,6 +4047,62 @@ Examples:
         default=100,
         metavar="N",
         help="Concurrent ACL operations during propagation (default: 100, try 500 for faster throughput)"
+    )
+
+    # ============================================================================
+    # FEATURE: ACE MANIPULATION
+    # ============================================================================
+    ace_manipulation = parser.add_argument_group('Feature: ACE Manipulation',
+        'Surgically add, remove, or modify individual ACEs within ACLs')
+
+    ace_manipulation.add_argument(
+        "--remove-ace",
+        action="append",
+        dest="remove_aces",
+        metavar="PATTERN",
+        help="Remove ACE(s) matching pattern 'Type:Trustee' (e.g., 'Allow:Everyone'). Repeatable."
+    )
+
+    ace_manipulation.add_argument(
+        "--add-ace",
+        action="append",
+        dest="add_aces",
+        metavar="PATTERN",
+        help="Add ACE with pattern 'Type:Flags:Trustee:Rights' (e.g., 'Allow:fd:jsmith:rwx'). Repeatable."
+    )
+
+    ace_manipulation.add_argument(
+        "--add-rights",
+        action="append",
+        dest="add_rights",
+        metavar="PATTERN",
+        help="Add rights to existing ACE 'Type:Trustee:Rights' (e.g., 'Allow:Everyone:rx'). Repeatable."
+    )
+
+    ace_manipulation.add_argument(
+        "--remove-rights",
+        action="append",
+        dest="remove_rights",
+        metavar="PATTERN",
+        help="Remove rights from existing ACE 'Type:Trustee:Rights' (e.g., 'Allow:Everyone:w'). Repeatable."
+    )
+
+    ace_manipulation.add_argument(
+        "--propagate-ace-changes",
+        action="store_true",
+        help="Apply ACE changes to all children (establishes new inheritance from this path)"
+    )
+
+    ace_manipulation.add_argument(
+        "--ace-dry-run",
+        action="store_true",
+        help="Show what ACE changes would be made without applying them"
+    )
+
+    ace_manipulation.add_argument(
+        "--ace-backup",
+        metavar="FILE",
+        help="Save original ACLs to JSON file before making changes"
     )
 
     # ============================================================================

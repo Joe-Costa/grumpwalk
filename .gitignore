@@ -16,3 +16,6 @@ __pycache__/
 test_range_*.py
 HELP_ORGANIZATION_DESIGN.md
 CLAUDE.md
+PLAN-change*
+docs/
+codefield.md
