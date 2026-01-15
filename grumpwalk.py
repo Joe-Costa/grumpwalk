@@ -580,6 +580,47 @@ NFSV4_TO_QACL_FLAGS = {
     'I': 'INHERITED',
 }
 
+# Windows Explorer-style permission presets
+# These map to Qumulo rights to match Windows behavior
+WINDOWS_PERMISSION_PRESETS = {
+    # Read: View files/folders and their attributes
+    'read': [
+        'READ', 'READ_EA', 'READ_ATTR', 'READ_ACL', 'EXECUTE', 'SYNCHRONIZE'
+    ],
+    'r': None,  # Single 'r' handled by NFSv4 mapping
+
+    # Write: Create files/folders, modify attributes (but not delete or read)
+    # Note: DELETE_CHILD is only in Full Control
+    'write': [
+        'MODIFY', 'EXTEND', 'WRITE_EA', 'WRITE_ATTR', 'SYNCHRONIZE'
+    ],
+
+    # Read+Execute: Same as Read (Execute is included in Read for traversal)
+    'readexecute': [
+        'READ', 'READ_EA', 'READ_ATTR', 'READ_ACL', 'EXECUTE', 'SYNCHRONIZE'
+    ],
+    'rx': None,  # Handled by NFSv4
+
+    # Modify: Read + Write + Delete (everything except DELETE_CHILD, change permissions/ownership)
+    # Note: DELETE_CHILD ("Delete subfolders and files") is only in Full Control, not Modify
+    'modify': [
+        'READ', 'MODIFY', 'EXTEND', 'EXECUTE', 'DELETE',
+        'READ_ATTR', 'WRITE_ATTR', 'READ_EA', 'WRITE_EA', 'READ_ACL', 'SYNCHRONIZE'
+    ],
+
+    # Full Control: All rights including permission and ownership changes
+    'fullcontrol': [
+        'READ', 'MODIFY', 'EXTEND', 'EXECUTE', 'DELETE', 'DELETE_CHILD',
+        'READ_ATTR', 'WRITE_ATTR', 'READ_EA', 'WRITE_EA',
+        'READ_ACL', 'WRITE_ACL', 'CHANGE_OWNER', 'SYNCHRONIZE'
+    ],
+    'full': [
+        'READ', 'MODIFY', 'EXTEND', 'EXECUTE', 'DELETE', 'DELETE_CHILD',
+        'READ_ATTR', 'WRITE_ATTR', 'READ_EA', 'WRITE_EA',
+        'READ_ACL', 'WRITE_ACL', 'CHANGE_OWNER', 'SYNCHRONIZE'
+    ],
+}
+
 # Well-known trustee names that map to specific identities
 WELL_KNOWN_TRUSTEES = {
     'everyone': {'sid': 'S-1-1-0', 'name': 'Everyone'},
@@ -591,21 +632,49 @@ WELL_KNOWN_TRUSTEES = {
 
 def nfsv4_rights_to_qacl(rights_str: str) -> List[str]:
     """
-    Convert NFSv4 rights shorthand to Qumulo rights list.
+    Convert rights specification to Qumulo rights list.
+
+    Supports:
+    - NFSv4 shorthand: 'rwx', 'rwaxdDtTnNcCoy'
+    - Windows presets: 'Read', 'Write', 'Modify', 'FullControl', 'Full'
+    - Combined: 'Read+Write' or 'Modify+Co' (preset plus NFSv4 extras)
 
     Args:
-        rights_str: String like 'rwx' or 'rwaxdDtTnNcCoy'
+        rights_str: Rights specification string
 
     Returns:
         List of Qumulo rights like ['READ', 'MODIFY', 'EXECUTE']
     """
-    rights = []
+    rights = set()  # Use set to avoid duplicates
+
+    # Check for Windows preset first (case-insensitive)
+    rights_lower = rights_str.lower().replace(' ', '').replace('_', '')
+
+    # Handle combined presets like "Read+Write" or "Modify+Co"
+    if '+' in rights_str:
+        parts = rights_str.split('+')
+        for part in parts:
+            part_rights = nfsv4_rights_to_qacl(part.strip())
+            rights.update(part_rights)
+        return list(rights)
+
+    # Check for Windows preset
+    if rights_lower in WINDOWS_PERMISSION_PRESETS:
+        preset = WINDOWS_PERMISSION_PRESETS[rights_lower]
+        if preset is not None:
+            return preset.copy()
+        # If preset is None, fall through to NFSv4 handling
+
+    # NFSv4 shorthand parsing
     for char in rights_str:
         if char in NFSV4_TO_QACL_RIGHTS:
-            rights.append(NFSV4_TO_QACL_RIGHTS[char])
+            rights.add(NFSV4_TO_QACL_RIGHTS[char])
+        elif char in ' +':
+            continue  # Skip separators
         else:
             print(f"[WARN] Unknown right character '{char}' in pattern", file=sys.stderr)
-    return rights
+
+    return list(rights)
 
 
 def nfsv4_flags_to_qacl(flags_str: str) -> List[str]:
@@ -789,7 +858,7 @@ def match_ace(ace: dict, pattern: dict) -> bool:
 
     Args:
         ace: ACE dict from API with type, trustee, trustee_details
-        pattern: Parsed pattern dict with type, raw_trustee
+        pattern: Parsed pattern dict with type, raw_trustee, and optionally resolved_auth_id
 
     Returns:
         True if ACE matches the pattern
@@ -798,7 +867,17 @@ def match_ace(ace: dict, pattern: dict) -> bool:
     if ace.get('type') != pattern.get('type'):
         return False
 
-    # Normalize both trustees for comparison
+    # If pattern has resolved auth_id, compare directly
+    if pattern.get('resolved_auth_id'):
+        # Extract auth_id from ACE trustee (may be dict or string)
+        ace_trustee = ace.get('trustee')
+        if isinstance(ace_trustee, dict):
+            ace_auth_id = str(ace_trustee.get('auth_id', ''))
+        else:
+            ace_auth_id = str(ace_trustee) if ace_trustee else ''
+        return ace_auth_id == pattern['resolved_auth_id']
+
+    # Fall back to normalized string comparison
     ace_trustee = normalize_trustee_for_match({
         'trustee': ace.get('trustee'),
         'trustee_details': ace.get('trustee_details', {})
@@ -806,6 +885,119 @@ def match_ace(ace: dict, pattern: dict) -> bool:
     pattern_trustee = normalize_pattern_trustee(pattern.get('raw_trustee', ''))
 
     return ace_trustee == pattern_trustee
+
+
+async def resolve_pattern_trustees(
+    client: 'AsyncQumuloClient',
+    session: 'aiohttp.ClientSession',
+    patterns: List[dict],
+    verbose: bool = False
+) -> None:
+    """
+    Resolve trustees in patterns to auth_ids for accurate matching.
+
+    Modifies patterns in-place, adding 'resolved_auth_id' field.
+    Uses the client's persistent_identity_cache for performance.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        patterns: List of parsed patterns with 'raw_trustee' field
+        verbose: Whether to print verbose output
+    """
+    for pattern in patterns:
+        raw_trustee = pattern.get('raw_trustee')
+        if not raw_trustee:
+            continue
+
+        # Check for well-known trustees that don't need resolution
+        trustee_lower = raw_trustee.lower()
+        if trustee_lower in ('everyone', 'everyone@'):
+            # Everyone has well-known auth_id
+            pattern['resolved_auth_id'] = '8589934592'  # Well-known Everyone auth_id
+            if verbose:
+                print(f"[INFO] '{raw_trustee}' -> auth_id 8589934592 (Everyone)", file=sys.stderr)
+            continue
+
+        # Use parse_trustee to get the right format for identity resolution
+        trustee_spec = parse_trustee(raw_trustee)
+        payload = trustee_spec['payload']
+        id_type = trustee_spec['type']
+
+        # Extract identifier from payload
+        if id_type == 'uid':
+            identifier = payload.get('uid')
+        elif id_type == 'gid':
+            identifier = payload.get('gid')
+        elif id_type == 'sid':
+            identifier = payload.get('sid')
+        elif id_type == 'auth_id':
+            identifier = payload.get('auth_id')
+            # If already an auth_id, use it directly
+            pattern['resolved_auth_id'] = str(identifier)
+            if verbose:
+                print(f"[INFO] '{raw_trustee}' is already auth_id {identifier}", file=sys.stderr)
+            continue
+        else:  # name
+            identifier = payload.get('name')
+
+        # Resolve to auth_id using identity API
+        if verbose:
+            print(f"[INFO] Resolving trustee '{raw_trustee}' ({id_type})...", file=sys.stderr)
+
+        resolved = await client.resolve_identity(session, identifier, id_type)
+
+        if resolved and resolved.get('auth_id'):
+            auth_id = str(resolved['auth_id'])
+            pattern['resolved_auth_id'] = auth_id
+            # Always show resolution result
+            print(f"[INFO] Resolved '{raw_trustee}' -> auth_id {auth_id}", file=sys.stderr)
+
+            # Cache the resolved identity for future use
+            if auth_id not in client.persistent_identity_cache:
+                client.persistent_identity_cache[auth_id] = resolved
+        else:
+            print(f"[WARN] Could not resolve trustee '{raw_trustee}' - matching may fail", file=sys.stderr)
+
+
+def normalize_acl_for_put(acl: dict) -> dict:
+    """
+    Normalize ACL for PUT request to Qumulo API v2.
+
+    The v2 API accepts trustee as either:
+    - Full object: {"auth_id": "123", "name": "...", ...}
+    - Simple string: "123" (auth_id only)
+
+    This function removes internal marker fields and read-only fields,
+    but preserves trustee format from the source.
+
+    Args:
+        acl: ACL dict (possibly with nested 'acl' key)
+
+    Returns:
+        Normalized ACL ready for PUT request
+    """
+    import copy
+    result = copy.deepcopy(acl)
+
+    # Handle nested structure
+    if 'acl' in result and 'aces' not in result:
+        inner = result['acl']
+    else:
+        inner = result
+
+    # Clean each ACE - remove internal marker fields but keep trustee format
+    for ace in inner.get('aces', []):
+        # Remove internal marker fields
+        ace.pop('_needs_resolution', None)
+        ace.pop('trustee_details', None)
+
+    # Remove 'generated' field if present (read-only field from GET response)
+    result.pop('generated', None)
+    if 'acl' in result:
+        result['acl'].pop('generated', None)
+
+    return result
 
 
 def sort_aces_canonical(aces: List[dict]) -> List[dict]:
@@ -905,7 +1097,9 @@ def apply_ace_modifications(
     remove_patterns: List[dict],
     add_aces: List[dict],
     add_rights_patterns: List[dict],
-    remove_rights_patterns: List[dict]
+    remove_rights_patterns: List[dict],
+    replace_aces: List[dict] = None,
+    verbose: bool = False
 ) -> Tuple[dict, dict]:
     """
     Apply all ACE modifications to an ACL in memory.
@@ -915,15 +1109,17 @@ def apply_ace_modifications(
     2. Remove matching ACEs
     3. Remove rights from matching ACEs (delete if empty)
     4. Add rights to matching ACEs (merge)
-    5. Add new ACEs (merge if same type+trustee exists)
-    6. Re-sort into canonical order
+    5. Replace ACEs (full replacement of flags and rights)
+    6. Add new ACEs (merge if same type+trustee exists)
+    7. Re-sort into canonical order
 
     Args:
         acl: ACL dict to modify
         remove_patterns: Patterns for ACEs to remove
-        add_aces: Patterns for ACEs to add
+        add_aces: Patterns for ACEs to add (merge rights if exists)
         add_rights_patterns: Patterns for rights to add
         remove_rights_patterns: Patterns for rights to remove
+        replace_aces: Patterns for ACEs to replace (full replacement)
 
     Returns:
         Tuple of (modified_acl, stats_dict)
@@ -932,10 +1128,14 @@ def apply_ace_modifications(
     import copy
     result = copy.deepcopy(acl)
 
+    if replace_aces is None:
+        replace_aces = []
+
     stats = {
         'removed': 0,
         'added': 0,
         'modified': 0,
+        'replaced': 0,
         'inheritance_broken': False,
     }
 
@@ -948,7 +1148,7 @@ def apply_ace_modifications(
     aces = inner.get('aces', [])
 
     # Collect all patterns that might affect inherited ACEs
-    all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns
+    all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + replace_aces
     if needs_inheritance_break(acl, all_patterns):
         result = break_acl_inheritance(result)
         stats['inheritance_broken'] = True
@@ -964,9 +1164,23 @@ def apply_ace_modifications(
     for ace in aces:
         should_remove = False
         for pattern in remove_patterns:
+            ace_type = ace.get('type')
+            ace_trustee = ace.get('trustee')
+            # Extract auth_id from trustee (may be dict or string)
+            if isinstance(ace_trustee, dict):
+                ace_auth_id = str(ace_trustee.get('auth_id', ''))
+            else:
+                ace_auth_id = str(ace_trustee) if ace_trustee else ''
+            pat_type = pattern.get('type')
+            pat_auth_id = pattern.get('resolved_auth_id')
+            if verbose:
+                print(f"[DEBUG] ACE type='{ace_type}' auth_id='{ace_auth_id}' "
+                      f"vs pattern type='{pat_type}' auth_id='{pat_auth_id}'", file=sys.stderr)
             if match_ace(ace, pattern):
                 should_remove = True
                 stats['removed'] += 1
+                if verbose:
+                    print(f"[DEBUG]   -> MATCH - will remove", file=sys.stderr)
                 break
         if not should_remove:
             new_aces.append(ace)
@@ -1001,7 +1215,35 @@ def apply_ace_modifications(
         if not matched:
             print(f"[WARN] No matching ACE found for --add-rights pattern", file=sys.stderr)
 
-    # 4. Add new ACEs (merge if same type+trustee exists)
+    # 4. Replace ACEs (full replacement of flags and rights)
+    for pattern in replace_aces:
+        replaced = False
+        for ace in aces:
+            if match_ace(ace, pattern):
+                # Full replacement - update flags and rights entirely
+                ace['flags'] = pattern.get('flags', [])
+                ace['rights'] = pattern.get('rights', [])
+                stats['replaced'] += 1
+                replaced = True
+                if verbose:
+                    print(f"[DEBUG] Replaced ACE for {pattern.get('raw_trustee')}", file=sys.stderr)
+                break
+
+        if not replaced:
+            # Create new ACE (same as add)
+            new_ace = {
+                'type': pattern['type'],
+                'flags': pattern.get('flags', []),
+                'trustee': pattern.get('raw_trustee'),
+                'rights': pattern.get('rights', []),
+                '_needs_resolution': True,
+            }
+            aces.append(new_ace)
+            stats['added'] += 1
+            if verbose:
+                print(f"[DEBUG] No existing ACE found, adding new ACE for {pattern.get('raw_trustee')}", file=sys.stderr)
+
+    # 6. Add new ACEs (merge if same type+trustee exists)
     for pattern in add_aces:
         merged = False
         for ace in aces:
@@ -1026,7 +1268,7 @@ def apply_ace_modifications(
             aces.append(new_ace)
             stats['added'] += 1
 
-    # 5. Re-sort into canonical order
+    # 7. Re-sort into canonical order
     aces = sort_aces_canonical(aces)
 
     inner['aces'] = aces
@@ -2461,7 +2703,7 @@ async def main_async(args):
     # ACE MANIPULATION MODE
     # Check if any ACE manipulation flags are specified
     ace_manipulation_mode = (
-        args.remove_aces or args.add_aces or
+        args.remove_aces or args.add_aces or args.replace_aces or
         args.add_rights or args.remove_rights
     )
 
@@ -2476,6 +2718,7 @@ async def main_async(args):
         # Parse all patterns
         remove_patterns = []
         add_patterns = []
+        replace_patterns = []
         add_rights_patterns = []
         remove_rights_patterns = []
 
@@ -2492,6 +2735,14 @@ async def main_async(args):
                 parsed = parse_ace_pattern(pattern, 'add')
                 if parsed:
                     add_patterns.append(parsed)
+                else:
+                    sys.exit(1)
+
+        if args.replace_aces:
+            for pattern in args.replace_aces:
+                parsed = parse_ace_pattern(pattern, 'add')  # Same format as add
+                if parsed:
+                    replace_patterns.append(parsed)
                 else:
                     sys.exit(1)
 
@@ -2516,19 +2767,27 @@ async def main_async(args):
             print(f"ACEs to remove:    {len(remove_patterns)}", file=sys.stderr)
         if add_patterns:
             print(f"ACEs to add:       {len(add_patterns)}", file=sys.stderr)
+        if replace_patterns:
+            print(f"ACEs to replace:   {len(replace_patterns)}", file=sys.stderr)
         if add_rights_patterns:
             print(f"Rights to add:     {len(add_rights_patterns)}", file=sys.stderr)
         if remove_rights_patterns:
             print(f"Rights to remove:  {len(remove_rights_patterns)}", file=sys.stderr)
         if args.propagate_ace_changes:
             print(f"Propagate:         Enabled", file=sys.stderr)
-        if args.ace_dry_run:
+        if args.dry_run:
             print(f"Dry run:           Enabled (no changes will be made)", file=sys.stderr)
         print("=" * 70, file=sys.stderr)
 
         async with client.create_session() as session:
-            # Step 1: Get current ACL from path
-            print(f"\n[INFO] Retrieving ACL from: {args.path}", file=sys.stderr)
+            # Step 1: Resolve all pattern trustees to auth_ids
+            all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + add_patterns + replace_patterns
+            if all_patterns:
+                print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
+                await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
+
+            # Step 2: Get current ACL from path
+            print(f"[INFO] Retrieving ACL from: {args.path}", file=sys.stderr)
             current_acl = await client.get_file_acl(session, args.path)
 
             if not current_acl:
@@ -2541,19 +2800,22 @@ async def main_async(args):
             inherited_count = sum(1 for ace in current_aces if 'INHERITED' in ace.get('flags', []))
             print(f"[INFO] Current ACL has {len(current_aces)} ACEs ({inherited_count} inherited)", file=sys.stderr)
 
-            # Step 2: Apply modifications in memory
+            # Step 3: Apply modifications in memory
             modified_acl, stats = apply_ace_modifications(
                 current_acl,
                 remove_patterns,
                 add_patterns,
                 add_rights_patterns,
-                remove_rights_patterns
+                remove_rights_patterns,
+                replace_aces=replace_patterns,
+                verbose=args.verbose
             )
 
             # Show modification summary
             print(f"\n[INFO] Modifications:", file=sys.stderr)
             print(f"  ACEs removed:         {stats['removed']}", file=sys.stderr)
             print(f"  ACEs added:           {stats['added']}", file=sys.stderr)
+            print(f"  ACEs replaced:        {stats['replaced']}", file=sys.stderr)
             print(f"  ACEs modified:        {stats['modified']}", file=sys.stderr)
             if stats['inheritance_broken']:
                 print(f"  Inheritance:          BROKEN (converted to explicit)", file=sys.stderr)
@@ -2564,7 +2826,7 @@ async def main_async(args):
             print(f"  Resulting ACE count:  {len(new_aces)}", file=sys.stderr)
 
             # Dry run: show what would happen and exit
-            if args.ace_dry_run:
+            if args.dry_run:
                 print("\n[DRY RUN] Would apply the following ACL:", file=sys.stderr)
                 print("-" * 60, file=sys.stderr)
 
@@ -2579,6 +2841,8 @@ async def main_async(args):
 
                 print("-" * 60, file=sys.stderr)
                 print("[DRY RUN] No changes were made.", file=sys.stderr)
+                # Save identity cache before exiting (trustees were resolved)
+                save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
                 return
 
             # Step 3: Save backup if requested
@@ -2624,17 +2888,26 @@ async def main_async(args):
                     resolved = await client.resolve_identity(session, identifier, id_type)
 
                     if resolved and resolved.get('auth_id'):
-                        ace['trustee'] = resolved['auth_id']
+                        # Build full trustee object for v2 API
+                        ace['trustee'] = {
+                            'auth_id': str(resolved['auth_id']),
+                            'domain': resolved.get('domain', 'UNKNOWN'),
+                            'name': resolved.get('name', raw_trustee),
+                            'sid': resolved.get('sid'),
+                            'uid': resolved.get('uid'),
+                            'gid': resolved.get('gid'),
+                        }
                         del ace['_needs_resolution']
-                        if args.verbose:
-                            print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
+                        print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
                     else:
                         print(f"[ERROR] Could not resolve trustee: {raw_trustee}", file=sys.stderr)
                         sys.exit(1)
 
             # Step 5: Apply modified ACL to target path
             print(f"\n[INFO] Applying modified ACL to: {args.path}", file=sys.stderr)
-            success, error = await client.set_file_acl(session, args.path, modified_acl, mark_inherited=False)
+            # Normalize ACL for PUT request (convert trustee objects to auth_id strings)
+            normalized_acl = normalize_acl_for_put(modified_acl)
+            success, error = await client.set_file_acl(session, args.path, normalized_acl, mark_inherited=False)
 
             if not success:
                 print(f"[ERROR] Failed to apply ACL: {error}", file=sys.stderr)
@@ -2658,7 +2931,7 @@ async def main_async(args):
                 propagate_stats = await apply_acl_to_tree(
                     client=client,
                     session=session,
-                    acl_data=modified_acl,
+                    acl_data=normalized_acl,
                     target_path=args.path,
                     propagate=True,
                     file_filter=file_filter,
@@ -2678,6 +2951,8 @@ async def main_async(args):
                     sys.exit(1)
 
         print("\n[INFO] ACE manipulation complete", file=sys.stderr)
+        # Save identity cache before exiting
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after ACE manipulation
 
     # PHASE 3: Directory statistics exploration mode
@@ -3931,6 +4206,11 @@ Examples:
         action="store_true",
         help="Enable performance profiling and timing metrics",
     )
+    output.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what changes would be made without applying them",
+    )
 
     # ============================================================================
     # FEATURE: OWNER REPORTS
@@ -4068,7 +4348,19 @@ Examples:
         action="append",
         dest="add_aces",
         metavar="PATTERN",
-        help="Add ACE with pattern 'Type:Flags:Trustee:Rights' (e.g., 'Allow:fd:jsmith:rwx'). Repeatable."
+        help="Add ACE with pattern 'Type:Flags:Trustee:Rights'. If ACE with same type+trustee exists, "
+             "merges rights. Rights can be NFSv4 (rwx) or Windows presets (Read, Write, Modify, FullControl). "
+             "Examples: 'Allow:fd:jsmith:Modify', 'Deny::Everyone:Write'. Repeatable."
+    )
+
+    ace_manipulation.add_argument(
+        "--replace-ace",
+        action="append",
+        dest="replace_aces",
+        metavar="PATTERN",
+        help="Replace ACE with pattern 'Type:Flags:Trustee:Rights'. If ACE with same type+trustee exists, "
+             "replaces it entirely (flags and rights). If not found, creates new ACE. "
+             "Examples: 'Allow:fd:jsmith:Modify', 'Deny::Everyone:Write'. Repeatable."
     )
 
     ace_manipulation.add_argument(
@@ -4076,7 +4368,8 @@ Examples:
         action="append",
         dest="add_rights",
         metavar="PATTERN",
-        help="Add rights to existing ACE 'Type:Trustee:Rights' (e.g., 'Allow:Everyone:rx'). Repeatable."
+        help="Add rights to existing ACE 'Type:Trustee:Rights'. Rights can be NFSv4 (rwx) or "
+             "Windows presets (Read, Write, Modify). Example: 'Allow:Everyone:Read'. Repeatable."
     )
 
     ace_manipulation.add_argument(
@@ -4084,19 +4377,14 @@ Examples:
         action="append",
         dest="remove_rights",
         metavar="PATTERN",
-        help="Remove rights from existing ACE 'Type:Trustee:Rights' (e.g., 'Allow:Everyone:w'). Repeatable."
+        help="Remove rights from existing ACE 'Type:Trustee:Rights'. Rights can be NFSv4 (rwx) or "
+             "Windows presets. Example: 'Allow:Everyone:Write'. Repeatable."
     )
 
     ace_manipulation.add_argument(
         "--propagate-ace-changes",
         action="store_true",
         help="Apply ACE changes to all children (establishes new inheritance from this path)"
-    )
-
-    ace_manipulation.add_argument(
-        "--ace-dry-run",
-        action="store_true",
-        help="Show what ACE changes would be made without applying them"
     )
 
     ace_manipulation.add_argument(
