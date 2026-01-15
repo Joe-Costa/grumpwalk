@@ -3951,6 +3951,15 @@ Examples:
 
   # Clone ACL to filtered files (e.g., only files older than 30 days)
   ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls --older-than 30 --type file --progress
+
+  # Remove an ACE from a directory and all children
+  ./grumpwalk.py --host cluster.example.com --path /data --remove-ace 'Allow:Group111' --propagate-ace-changes
+
+  # Add an ACE with Modify permission (inheritable to files and directories)
+  ./grumpwalk.py --host cluster.example.com --path /data --add-ace 'Allow:fd:Group111:Modify' --propagate-ace-changes
+
+  # Replace an existing ACE with different permissions
+  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:fd:Group111:Read' --propagate-ace-changes
         """,
     )
 
@@ -4333,14 +4342,16 @@ Examples:
     # FEATURE: ACE MANIPULATION
     # ============================================================================
     ace_manipulation = parser.add_argument_group('Feature: ACE Manipulation',
-        'Surgically add, remove, or modify individual ACEs within ACLs')
+        'Surgically add, remove, replace, or modify individual ACEs within ACLs. '
+        'Use --propagate-ace-changes to apply to all children.')
 
     ace_manipulation.add_argument(
         "--remove-ace",
         action="append",
         dest="remove_aces",
         metavar="PATTERN",
-        help="Remove ACE(s) matching pattern 'Type:Trustee' (e.g., 'Allow:Everyone'). Repeatable."
+        help="Remove ACE(s) matching 'Type:Trustee'. "
+             "Example: --remove-ace 'Allow:Group111'"
     )
 
     ace_manipulation.add_argument(
@@ -4348,9 +4359,9 @@ Examples:
         action="append",
         dest="add_aces",
         metavar="PATTERN",
-        help="Add ACE with pattern 'Type:Flags:Trustee:Rights'. If ACE with same type+trustee exists, "
-             "merges rights. Rights can be NFSv4 (rwx) or Windows presets (Read, Write, Modify, FullControl). "
-             "Examples: 'Allow:fd:jsmith:Modify', 'Deny::Everyone:Write'. Repeatable."
+        help="Add ACE with 'Type:Flags:Trustee:Rights'. Merges rights if ACE exists. "
+             "Flags: f=file-inherit, d=dir-inherit. Rights: Read, Write, Modify, FullControl or NFSv4 (rwx). "
+             "Example: --add-ace 'Allow:fd:Group111:Modify'"
     )
 
     ace_manipulation.add_argument(
@@ -4358,9 +4369,8 @@ Examples:
         action="append",
         dest="replace_aces",
         metavar="PATTERN",
-        help="Replace ACE with pattern 'Type:Flags:Trustee:Rights'. If ACE with same type+trustee exists, "
-             "replaces it entirely (flags and rights). If not found, creates new ACE. "
-             "Examples: 'Allow:fd:jsmith:Modify', 'Deny::Everyone:Write'. Repeatable."
+        help="Replace ACE with 'Type:Flags:Trustee:Rights'. Replaces flags AND rights entirely if ACE exists. "
+             "Example: --replace-ace 'Allow:fd:Group111:Read'"
     )
 
     ace_manipulation.add_argument(
@@ -4368,8 +4378,8 @@ Examples:
         action="append",
         dest="add_rights",
         metavar="PATTERN",
-        help="Add rights to existing ACE 'Type:Trustee:Rights'. Rights can be NFSv4 (rwx) or "
-             "Windows presets (Read, Write, Modify). Example: 'Allow:Everyone:Read'. Repeatable."
+        help="Add rights to existing ACE with 'Type:Trustee:Rights'. "
+             "Example: --add-rights 'Allow:Group111:Write'"
     )
 
     ace_manipulation.add_argument(
@@ -4377,8 +4387,8 @@ Examples:
         action="append",
         dest="remove_rights",
         metavar="PATTERN",
-        help="Remove rights from existing ACE 'Type:Trustee:Rights'. Rights can be NFSv4 (rwx) or "
-             "Windows presets. Example: 'Allow:Everyone:Write'. Repeatable."
+        help="Remove rights from existing ACE with 'Type:Trustee:Rights'. "
+             "Example: --remove-rights 'Allow:Group111:Write'"
     )
 
     ace_manipulation.add_argument(

@@ -26,6 +26,7 @@ will be.<br>Keep in mind that some operations will read contents of files, which
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
+- **ACE manipulation** - Surgically add, remove, or modify individual ACEs within ACLs
 - **Similarity detection** - Find similar files using adaptive sampling
 
 ## Requirements
@@ -239,6 +240,69 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 - `--owner-group-only` - Copy only owner/group, skip ACL
 - `--acl-concurrency N` - Concurrent ACL operations (default: 100, try 500 for faster throughput)
 
+### ACE Manipulation Options
+
+Surgically modify Access Control Entries (ACEs) within ACLs without replacing the entire ACL.
+
+**Core Operations:**
+- `--remove-ace 'Type:Trustee'` - Remove ACE(s) matching pattern (e.g., `'Allow:Everyone'`)
+- `--add-ace 'Type:Flags:Trustee:Rights'` - Add new ACE or merge rights if exists (e.g., `'Allow:fd:jsmith:Modify'`)
+- `--replace-ace 'Type:Flags:Trustee:Rights'` - Replace existing ACE entirely (flags AND rights)
+- `--add-rights 'Type:Trustee:Rights'` - Add rights to existing ACE (e.g., `'Allow:Everyone:rx'`)
+- `--remove-rights 'Type:Trustee:Rights'` - Remove rights from existing ACE
+
+**Supporting Flags:**
+- `--propagate-ace-changes` - Apply ACE changes to all children recursively
+- `--dry-run` - Preview changes without applying them
+- `--ace-backup FILE` - Save original ACLs to JSON before modification
+
+**Pattern Syntax:**
+
+Trustee formats (same as `--owner`):
+- `Everyone` - Well-known Everyone group
+- `uid:1001` - NFS UID
+- `gid:100` - NFS GID
+- `DOMAIN\\user` - AD user (NetBIOS)
+- `user@domain.com` - AD user (UPN)
+- `S-1-5-21-...` - SID directly
+- `jsmith` - Plain name (resolved via identity API)
+
+Rights can be specified as:
+- **Windows presets**: `Read`, `Write`, `Modify`, `FullControl`
+- **NFSv4 shorthand**: `r` (read), `w` (write), `a` (append), `x` (execute), `d` (delete), etc.
+- **Combined**: `rwx`, `rx`, `Read+w`
+
+Flags (inheritance):
+- `f` = OBJECT_INHERIT (files inherit)
+- `d` = CONTAINER_INHERIT (directories inherit)
+- `fd` = Both (typical for new permissions)
+
+**Behavior Notes:**
+
+- **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists. `--replace-ace` completely replaces the existing ACE's flags and rights with the new values.
+- **Canonical ordering**: ACEs are automatically sorted into Windows canonical order (Deny before Allow, Explicit before Inherited).
+- **Empty ACE removal**: If `--remove-rights` removes all rights from an ACE, the ACE is deleted entirely.
+
+**Inheritance Handling:**
+
+When modifying an inherited ACE (one that has the INHERITED flag), grumpwalk automatically:
+1. **Breaks inheritance** at the target path by adding DACL_PROTECTED to control flags
+2. **Converts inherited ACEs to explicit** by removing the INHERITED flag from all ACEs
+3. **Applies your modifications** to the now-explicit ACE
+
+This establishes the target path as a new inheritance root. When used with `--propagate-ace-changes`, the modified ACL propagates to all children with proper inheritance flags.
+
+**Restarting Inheritance:**
+
+To restart inheritance from a parent after breaking it, use the standard ACL cloning approach:
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /parent/path --acl-target /child/path \
+  --propagate-acls --progress
+```
+
+This copies the parent's ACL (with inherited flags set appropriately) to the child and its descendants.
+
 ### Similarity Detection Options
 - `--find-similar` - Find similar files using metadata + sample hashing
 - `--by-size` - Match by size+metadata only (fast, may have false positives)
@@ -385,6 +449,34 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 ./grumpwalk.py --host cluster.example.com \
   --source-acl /source/dir --acl-target /target/dir \
   --propagate-acls --older-than 30 --type file --progress
+```
+
+### ACE Manipulation Examples
+
+```bash
+# Remove an ACE (e.g., revoke Everyone access)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --remove-ace 'Allow:Everyone' --dry-run
+
+# Add a new ACE with file+directory inheritance
+./grumpwalk.py --host cluster.example.com --path /projects \
+  --add-ace 'Allow:fd:jsmith:Modify' --propagate-ace-changes --progress
+
+# Replace an existing ACE (change FullControl to Read)
+./grumpwalk.py --host cluster.example.com --path /data \
+  --replace-ace 'Allow:fd:contractors:Read' --propagate-ace-changes
+
+# Add execute permission to an existing ACE
+./grumpwalk.py --host cluster.example.com --path /scripts \
+  --add-rights 'Allow:developers:x'
+
+# Remove write permission while keeping other rights
+./grumpwalk.py --host cluster.example.com --path /archive \
+  --remove-rights 'Allow:Everyone:w' --propagate-ace-changes
+
+# Backup ACLs before making changes
+./grumpwalk.py --host cluster.example.com --path /important \
+  --remove-ace 'Allow:tempuser' --ace-backup acl-backup.json
 ```
 
 ### Find similar files with custom sampling
