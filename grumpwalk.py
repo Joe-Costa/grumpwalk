@@ -875,7 +875,9 @@ def match_ace(ace: dict, pattern: dict) -> bool:
             ace_auth_id = str(ace_trustee.get('auth_id', ''))
         else:
             ace_auth_id = str(ace_trustee) if ace_trustee else ''
-        return ace_auth_id == pattern['resolved_auth_id']
+        # Ensure both are strings for comparison
+        pattern_auth_id = str(pattern['resolved_auth_id'])
+        return ace_auth_id == pattern_auth_id
 
     # Fall back to normalized string comparison
     ace_trustee = normalize_trustee_for_match({
@@ -1098,7 +1100,7 @@ def apply_ace_modifications(
     add_aces: List[dict],
     add_rights_patterns: List[dict],
     remove_rights_patterns: List[dict],
-    replace_aces: List[dict] = None,
+    replace_aces: List[Tuple[dict, dict]] = None,
     verbose: bool = False
 ) -> Tuple[dict, dict]:
     """
@@ -1109,7 +1111,7 @@ def apply_ace_modifications(
     2. Remove matching ACEs
     3. Remove rights from matching ACEs (delete if empty)
     4. Add rights to matching ACEs (merge)
-    5. Replace ACEs (full replacement of flags and rights)
+    5. Replace ACEs (full replacement or type-changing replacement)
     6. Add new ACEs (merge if same type+trustee exists)
     7. Re-sort into canonical order
 
@@ -1119,7 +1121,9 @@ def apply_ace_modifications(
         add_aces: Patterns for ACEs to add (merge rights if exists)
         add_rights_patterns: Patterns for rights to add
         remove_rights_patterns: Patterns for rights to remove
-        replace_aces: Patterns for ACEs to replace (full replacement)
+        replace_aces: List of tuples (find_pattern, new_ace_pattern).
+                      If new_ace_pattern is None, in-place replacement.
+                      If new_ace_pattern is provided, full replacement (can change type).
 
     Returns:
         Tuple of (modified_acl, stats_dict)
@@ -1148,7 +1152,9 @@ def apply_ace_modifications(
     aces = inner.get('aces', [])
 
     # Collect all patterns that might affect inherited ACEs
-    all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + replace_aces
+    # Flatten replace_aces tuples - only need find_patterns for inheritance check
+    replace_find_patterns = [find_pat for find_pat, _ in replace_aces]
+    all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + replace_find_patterns
     if needs_inheritance_break(acl, all_patterns):
         result = break_acl_inheritance(result)
         stats['inheritance_broken'] = True
@@ -1215,33 +1221,84 @@ def apply_ace_modifications(
         if not matched:
             print(f"[WARN] No matching ACE found for --add-rights pattern", file=sys.stderr)
 
-    # 4. Replace ACEs (full replacement of flags and rights)
-    for pattern in replace_aces:
-        replaced = False
-        for ace in aces:
-            if match_ace(ace, pattern):
-                # Full replacement - update flags and rights entirely
-                ace['flags'] = pattern.get('flags', [])
-                ace['rights'] = pattern.get('rights', [])
-                stats['replaced'] += 1
-                replaced = True
-                if verbose:
-                    print(f"[DEBUG] Replaced ACE for {pattern.get('raw_trustee')}", file=sys.stderr)
-                break
+    # 4. Replace ACEs (full replacement or type-changing replacement)
+    for find_pattern, new_ace_pattern in replace_aces:
+        matching_indices = []
 
-        if not replaced:
-            # Create new ACE (same as add)
-            new_ace = {
-                'type': pattern['type'],
-                'flags': pattern.get('flags', []),
-                'trustee': pattern.get('raw_trustee'),
-                'rights': pattern.get('rights', []),
-                '_needs_resolution': True,
-            }
-            aces.append(new_ace)
-            stats['added'] += 1
+        if verbose:
+            print(f"[DEBUG] Looking for ACE: type={find_pattern.get('type')} "
+                  f"trustee={find_pattern.get('raw_trustee')} "
+                  f"resolved_auth_id={find_pattern.get('resolved_auth_id')}", file=sys.stderr)
+
+        # First pass: find ALL matching ACEs
+        for i, ace in enumerate(aces):
             if verbose:
-                print(f"[DEBUG] No existing ACE found, adding new ACE for {pattern.get('raw_trustee')}", file=sys.stderr)
+                ace_trustee = ace.get('trustee')
+                if isinstance(ace_trustee, dict):
+                    ace_auth_id = ace_trustee.get('auth_id', '')
+                else:
+                    ace_auth_id = ace_trustee
+                print(f"[DEBUG]   Checking ACE[{i}]: type={ace.get('type')} "
+                      f"auth_id={ace_auth_id}", file=sys.stderr)
+            if match_ace(ace, find_pattern):
+                matching_indices.append(i)
+                if verbose:
+                    print(f"[DEBUG]   -> MATCH at index {i}", file=sys.stderr)
+
+        if matching_indices:
+            # Replace first match, remove any duplicates
+            first_idx = matching_indices[0]
+            if new_ace_pattern is not None:
+                # Paired mode: replace with entirely new ACE (can change type)
+                new_ace = {
+                    'type': new_ace_pattern['type'],
+                    'flags': new_ace_pattern.get('flags', []),
+                    'trustee': new_ace_pattern.get('raw_trustee'),
+                    'rights': new_ace_pattern.get('rights', []),
+                    '_needs_resolution': True,
+                }
+                aces[first_idx] = new_ace
+                if verbose:
+                    print(f"[DEBUG] Replaced ACE[{first_idx}] {find_pattern.get('type')}:{find_pattern.get('raw_trustee')} "
+                          f"with {new_ace_pattern.get('type')}:{new_ace_pattern.get('raw_trustee')}", file=sys.stderr)
+            else:
+                # In-place mode: update flags and rights only (same type+trustee)
+                aces[first_idx]['flags'] = find_pattern.get('flags', [])
+                aces[first_idx]['rights'] = find_pattern.get('rights', [])
+                if verbose:
+                    print(f"[DEBUG] Replaced ACE[{first_idx}] in-place for {find_pattern.get('raw_trustee')}", file=sys.stderr)
+            stats['replaced'] += 1
+
+            # Remove duplicate matching ACEs (in reverse order to preserve indices)
+            if len(matching_indices) > 1:
+                for dup_idx in reversed(matching_indices[1:]):
+                    if verbose:
+                        print(f"[DEBUG] Removing duplicate ACE at index {dup_idx}", file=sys.stderr)
+                    del aces[dup_idx]
+                    stats['removed'] += 1
+
+        if not matching_indices:
+            # No matching ACE found
+            if new_ace_pattern is not None:
+                # Paired mode (--replace-ace X --new-ace Y): Don't create if X not found
+                # This is a transformation operation, not "ensure exists"
+                print(f"[WARN] No matching {find_pattern.get('type')} ACE found for trustee "
+                      f"'{find_pattern.get('raw_trustee')}' - skipping (nothing to replace)", file=sys.stderr)
+            else:
+                # Non-paired mode (--replace-ace only): Create new ACE if not found
+                print(f"[WARN] No matching {find_pattern.get('type')} ACE found for trustee "
+                      f"'{find_pattern.get('raw_trustee')}' - creating new ACE", file=sys.stderr)
+                new_ace = {
+                    'type': find_pattern['type'],
+                    'flags': find_pattern.get('flags', []),
+                    'trustee': find_pattern.get('raw_trustee'),
+                    'rights': find_pattern.get('rights', []),
+                    '_needs_resolution': True,
+                }
+                aces.append(new_ace)
+                stats['added'] += 1
+                if verbose:
+                    print(f"[DEBUG] Adding new ACE for {find_pattern.get('raw_trustee')}", file=sys.stderr)
 
     # 6. Add new ACEs (merge if same type+trustee exists)
     for pattern in add_aces:
@@ -2712,6 +2769,41 @@ async def main_async(args):
             print("[ERROR] --path is required for ACE manipulation", file=sys.stderr)
             sys.exit(1)
 
+        # Validate --replace-ace / --new-ace pairing
+        replace_count = len(args.replace_aces) if args.replace_aces else 0
+        new_ace_count = len(args.new_aces) if args.new_aces else 0
+
+        if new_ace_count > 0 and replace_count == 0:
+            print("[ERROR] --new-ace requires --replace-ace to specify which ACE to replace", file=sys.stderr)
+            sys.exit(1)
+
+        if new_ace_count > 0 and new_ace_count != replace_count:
+            print(f"[ERROR] --replace-ace and --new-ace must be paired 1:1", file=sys.stderr)
+            print(f"        Found {replace_count} --replace-ace and {new_ace_count} --new-ace", file=sys.stderr)
+            sys.exit(1)
+
+        # Validate positional pairing by checking sys.argv order
+        if new_ace_count > 0:
+            replace_positions = []
+            new_ace_positions = []
+            for i, arg in enumerate(sys.argv):
+                if arg == '--replace-ace':
+                    replace_positions.append(i)
+                elif arg == '--new-ace':
+                    new_ace_positions.append(i)
+
+            # Each --new-ace should immediately follow a --replace-ace (with its value in between)
+            for j, new_pos in enumerate(new_ace_positions):
+                if j >= len(replace_positions):
+                    print(f"[ERROR] --new-ace at position {new_pos} has no matching --replace-ace", file=sys.stderr)
+                    sys.exit(1)
+                replace_pos = replace_positions[j]
+                # --new-ace should be 2 positions after --replace-ace (--replace-ace VALUE --new-ace)
+                if new_pos != replace_pos + 2:
+                    print(f"[ERROR] --new-ace must immediately follow --replace-ace 'PATTERN'", file=sys.stderr)
+                    print(f"        Expected: --replace-ace 'FIND' --new-ace 'REPLACE'", file=sys.stderr)
+                    sys.exit(1)
+
         print("\n[INFO] ACE Manipulation Mode", file=sys.stderr)
         print("=" * 70, file=sys.stderr)
 
@@ -2739,12 +2831,30 @@ async def main_async(args):
                     sys.exit(1)
 
         if args.replace_aces:
-            for pattern in args.replace_aces:
-                parsed = parse_ace_pattern(pattern, 'add')  # Same format as add
-                if parsed:
-                    replace_patterns.append(parsed)
+            # Check if we have paired --new-ace arguments
+            has_new_aces = args.new_aces and len(args.new_aces) == len(args.replace_aces)
+
+            for i, pattern in enumerate(args.replace_aces):
+                if has_new_aces:
+                    # Paired mode: --replace-ace is the search pattern, --new-ace is replacement
+                    # Parse search pattern (can be Type:Trustee or full format)
+                    find_parsed = parse_ace_pattern(pattern, 'remove')  # Flexible matching
+                    if not find_parsed:
+                        sys.exit(1)
+                    # Parse replacement pattern (must be full format)
+                    replace_parsed = parse_ace_pattern(args.new_aces[i], 'add')
+                    if not replace_parsed:
+                        sys.exit(1)
+                    # Store as tuple (find_pattern, new_ace_pattern)
+                    replace_patterns.append((find_parsed, replace_parsed))
                 else:
-                    sys.exit(1)
+                    # Non-paired mode: in-place replacement (same type+trustee)
+                    parsed = parse_ace_pattern(pattern, 'add')  # Same format as add
+                    if parsed:
+                        # Store as tuple with None for new_ace (in-place replacement)
+                        replace_patterns.append((parsed, None))
+                    else:
+                        sys.exit(1)
 
         if args.add_rights:
             for pattern in args.add_rights:
@@ -2768,7 +2878,13 @@ async def main_async(args):
         if add_patterns:
             print(f"ACEs to add:       {len(add_patterns)}", file=sys.stderr)
         if replace_patterns:
-            print(f"ACEs to replace:   {len(replace_patterns)}", file=sys.stderr)
+            # Check if paired or in-place replacements
+            paired_count = sum(1 for _, new_pat in replace_patterns if new_pat is not None)
+            inplace_count = len(replace_patterns) - paired_count
+            if paired_count > 0:
+                print(f"ACEs to replace:   {paired_count} (with --new-ace)", file=sys.stderr)
+            if inplace_count > 0:
+                print(f"ACEs to replace:   {inplace_count} (in-place)", file=sys.stderr)
         if add_rights_patterns:
             print(f"Rights to add:     {len(add_rights_patterns)}", file=sys.stderr)
         if remove_rights_patterns:
@@ -2781,7 +2897,13 @@ async def main_async(args):
 
         async with client.create_session() as session:
             # Step 1: Resolve all pattern trustees to auth_ids
-            all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + add_patterns + replace_patterns
+            # Flatten replace_patterns tuples for resolution
+            replace_flat = []
+            for find_pat, new_pat in replace_patterns:
+                replace_flat.append(find_pat)
+                if new_pat is not None:
+                    replace_flat.append(new_pat)
+            all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + add_patterns + replace_flat
             if all_patterns:
                 print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
                 await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
@@ -3958,8 +4080,11 @@ Examples:
   # Add an ACE with Modify permission (inheritable to files and directories)
   ./grumpwalk.py --host cluster.example.com --path /data --add-ace 'Allow:fd:Group111:Modify' --propagate-ace-changes
 
-  # Replace an existing ACE with different permissions
+  # Replace an existing ACE with different permissions (in-place, same type)
   ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:fd:Group111:Read' --propagate-ace-changes
+
+  # Change ACE type from Allow to Deny (using --new-ace for full replacement)
+  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:rw' --propagate-ace-changes
         """,
     )
 
@@ -4369,8 +4494,20 @@ Examples:
         action="append",
         dest="replace_aces",
         metavar="PATTERN",
-        help="Replace ACE with 'Type:Flags:Trustee:Rights'. Replaces flags AND rights entirely if ACE exists. "
-             "Example: --replace-ace 'Allow:fd:Group111:Read'"
+        help="Find ACE matching 'Type:Trustee' or 'Type:Flags:Trustee:Rights'. "
+             "Use with --new-ace to specify replacement (allows type change). "
+             "Without --new-ace, replaces flags/rights in-place. "
+             "Example: --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:Read'"
+    )
+
+    ace_manipulation.add_argument(
+        "--new-ace",
+        action="append",
+        dest="new_aces",
+        metavar="PATTERN",
+        help="Replacement ACE for preceding --replace-ace. Format: 'Type:Flags:Trustee:Rights'. "
+             "Allows changing ACE type (Allow<->Deny). Must pair 1:1 with --replace-ace. "
+             "Example: --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:rw'"
     )
 
     ace_manipulation.add_argument(

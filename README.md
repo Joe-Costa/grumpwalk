@@ -247,7 +247,8 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 **Core Operations:**
 - `--remove-ace 'Type:Trustee'` - Remove ACE(s) matching pattern (e.g., `'Allow:Everyone'`)
 - `--add-ace 'Type:Flags:Trustee:Rights'` - Add new ACE or merge rights if exists (e.g., `'Allow:fd:jsmith:Modify'`)
-- `--replace-ace 'Type:Flags:Trustee:Rights'` - Replace existing ACE entirely (flags AND rights)
+- `--replace-ace 'Type:Flags:Trustee:Rights'` - Replace existing ACE (in-place, same type)
+- `--replace-ace 'Type:Trustee' --new-ace 'Type:Flags:Trustee:Rights'` - Replace with different ACE (can change type)
 - `--add-rights 'Type:Trustee:Rights'` - Add rights to existing ACE (e.g., `'Allow:Everyone:rx'`)
 - `--remove-rights 'Type:Trustee:Rights'` - Remove rights from existing ACE
 
@@ -280,6 +281,7 @@ Flags (inheritance):
 **Behavior Notes:**
 
 - **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists. `--replace-ace` completely replaces the existing ACE's flags and rights with the new values.
+- **--replace-ace with --new-ace**: When paired with `--new-ace`, you can change the ACE type (Allow to Deny or vice versa). The `--replace-ace` pattern specifies which ACE to find, and `--new-ace` specifies the full replacement. These must be positionally adjacent and paired 1:1.
 - **Canonical ordering**: ACEs are automatically sorted into Windows canonical order (Deny before Allow, Explicit before Inherited).
 - **Empty ACE removal**: If `--remove-rights` removes all rights from an ACE, the ACE is deleted entirely.
 
@@ -462,9 +464,13 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 ./grumpwalk.py --host cluster.example.com --path /projects \
   --add-ace 'Allow:fd:jsmith:Modify' --propagate-ace-changes --progress
 
-# Replace an existing ACE (change FullControl to Read)
+# Replace an existing ACE (change FullControl to Read, same type)
 ./grumpwalk.py --host cluster.example.com --path /data \
   --replace-ace 'Allow:fd:contractors:Read' --propagate-ace-changes
+
+# Change ACE type from Allow to Deny (using --new-ace)
+./grumpwalk.py --host cluster.example.com --path /restricted \
+  --replace-ace 'Allow:contractors' --new-ace 'Deny:fd:contractors:rw'
 
 # Add execute permission to an existing ACE
 ./grumpwalk.py --host cluster.example.com --path /scripts \
