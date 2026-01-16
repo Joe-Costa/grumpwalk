@@ -11,6 +11,9 @@ High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 I've observed performance as high as 12k objects per second processed against an old QC24 Qumulo cluster.<br>The lower the latency you have between where this code is running and the Qumulo cluster the better your performance
 will be.<br>Keep in mind that some operations will read contents of files, which might be slower over low bandwidth public internet & VPN connections.
 
+Don't forget to check out the [Grumwalk User's Guide](grumpwalk_users_guide.md) for many real world usage examples.
+
+
 ## Features
 
 - **Fast async operations** - Direct REST API calls with concurrent requests
@@ -731,7 +734,7 @@ MIT License
 
 ## Author
 
-Joe Costa
+Joe Costa `joe at qumulo.com`
 
 ## Contributing
 
