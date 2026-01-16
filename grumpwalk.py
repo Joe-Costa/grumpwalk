@@ -2899,6 +2899,10 @@ async def generate_owner_report(
 
 async def main_async(args):
     """Main async function."""
+    # Backward compatibility: consolidate old propagation flags into unified flag
+    if getattr(args, 'propagate_ace_changes', False) or getattr(args, 'propagate_owner_changes', False):
+        args.propagate_changes = True
+
     # Determine if we're in ACL cloning mode
     acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
 
@@ -3325,7 +3329,7 @@ async def main_async(args):
             print(f"Trustees to migrate: {len(migrate_patterns)}", file=sys.stderr)
             for mp in migrate_patterns:
                 print(f"                   {mp['source_trustee']} -> {mp['target_trustee']}", file=sys.stderr)
-        if args.propagate_ace_changes:
+        if args.propagate_changes:
             print(f"Propagate:         Enabled", file=sys.stderr)
         if args.dry_run:
             print(f"Dry run:           Enabled (no changes will be made)", file=sys.stderr)
@@ -3611,7 +3615,7 @@ async def main_async(args):
             print("[INFO] ACL applied successfully", file=sys.stderr)
 
             # Step 6: Propagate to children if requested
-            if args.propagate_ace_changes:
+            if args.propagate_changes:
                 print(f"\n[INFO] Propagating ACL to children of: {args.path}", file=sys.stderr)
 
                 # Resolve owner filters if any
@@ -3895,10 +3899,10 @@ async def main_async(args):
         )
 
         if args.verbose:
-            if args.propagate_owner_changes:
+            if args.propagate_changes:
                 print(f"\n[INFO] Processing {args.path} and all children...", file=sys.stderr)
             else:
-                print(f"\n[INFO] Processing {args.path} only (use --propagate-owner-changes for children)...", file=sys.stderr)
+                print(f"\n[INFO] Processing {args.path} only (use --propagate-changes for children)...", file=sys.stderr)
         start_time = time.time()
 
         # Helper function to process a single file/directory for ownership change
@@ -3971,7 +3975,7 @@ async def main_async(args):
                     print(f"[ERROR] Failed to change ownership: {file_path}: {error_msg}", file=sys.stderr)
 
         async with client.create_session() as session:
-            if args.propagate_owner_changes:
+            if args.propagate_changes:
                 # Walk the tree and change ownership for all matching files
                 async def tree_walk_callback(entry):
                     await process_file_for_ownership_change(session, entry)
@@ -5051,16 +5055,16 @@ Examples:
   ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --propagate-acls --older-than 30 --type file --progress
 
   # Remove an ACE from a directory and all children
-  ./grumpwalk.py --host cluster.example.com --path /data --remove-ace 'Allow:Group111' --propagate-ace-changes
+  ./grumpwalk.py --host cluster.example.com --path /data --remove-ace 'Allow:Group111' --propagate-changes
 
   # Add an ACE with Modify permission (inheritable to files and directories)
-  ./grumpwalk.py --host cluster.example.com --path /data --add-ace 'Allow:fd:Group111:Modify' --propagate-ace-changes
+  ./grumpwalk.py --host cluster.example.com --path /data --add-ace 'Allow:fd:Group111:Modify' --propagate-changes
 
   # Replace an existing ACE with different permissions (in-place, same type)
-  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:fd:Group111:Read' --propagate-ace-changes
+  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:fd:Group111:Read' --propagate-changes
 
   # Change ACE type from Allow to Deny (using --new-ace for full replacement)
-  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:rw' --propagate-ace-changes
+  ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:rw' --propagate-changes
         """,
     )
 
@@ -5440,6 +5444,14 @@ Examples:
     )
 
     acl_management.add_argument(
+        "--propagate-changes",
+        action="store_true",
+        help="Apply changes to all children recursively. "
+             "Without this flag, only the target path itself is changed. "
+             "Works with ACE manipulation, owner/group changes, and ACL cloning."
+    )
+
+    acl_management.add_argument(
         "--change-owner",
         action="append",
         metavar="SOURCE:TARGET",
@@ -5475,11 +5487,11 @@ Examples:
              "Same format as --migrate-trustees CSV."
     )
 
+    # Hidden alias for backward compatibility (use --propagate-changes instead)
     acl_management.add_argument(
         "--propagate-owner-changes",
         action="store_true",
-        help="Apply owner/group changes to all children recursively. "
-             "Without this flag, only the target path itself is changed."
+        help=argparse.SUPPRESS
     )
 
     # ============================================================================
@@ -5487,7 +5499,7 @@ Examples:
     # ============================================================================
     ace_manipulation = parser.add_argument_group('Feature: ACE Manipulation',
         'Surgically add, remove, replace, or modify individual ACEs within ACLs. '
-        'Use --propagate-ace-changes to apply to all children.')
+        'Use --propagate-changes to apply to all children.')
 
     ace_manipulation.add_argument(
         "--remove-ace",
@@ -5593,10 +5605,11 @@ Examples:
              "CSV format: source,target (header row optional)."
     )
 
+    # Hidden alias for backward compatibility (use --propagate-changes instead)
     ace_manipulation.add_argument(
         "--propagate-ace-changes",
         action="store_true",
-        help="Apply ACE changes to all children (establishes new inheritance from this path)"
+        help=argparse.SUPPRESS
     )
 
     ace_manipulation.add_argument(

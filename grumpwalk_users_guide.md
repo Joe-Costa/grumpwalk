@@ -1,0 +1,1389 @@
+# Grumpwalk Users Guide
+
+A practical guide with recipes for common storage administration tasks using grumpwalk.
+
+---
+
+## Table of Contents
+
+1. [Getting Started](#getting-started)
+2. [Finding Files](#finding-files)
+3. [Storage Capacity Planning](#storage-capacity-planning)
+4. [Data Lifecycle Management](#data-lifecycle-management)
+5. [User and Access Management](#user-and-access-management)
+6. [Domain Migration](#domain-migration)
+7. [Compliance and Auditing](#compliance-and-auditing)
+8. [Security and Incident Response](#security-and-incident-response)
+9. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
+10. [Media and Creative Workflows](#media-and-creative-workflows)
+11. [Reporting and Analytics](#reporting-and-analytics)
+12. [Performance Optimization](#performance-optimization)
+13. [Scripting and Automation](#scripting-and-automation)
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+1. **Authentication**: Generate a Qumulo bearer token:
+   ```bash
+   qq login -h your-cluster.example.com
+   ```
+
+2. **Dependencies**: Install required packages:
+   ```bash
+   pip install aiohttp
+
+   # Optional for better performance:
+   pip install ujson xxhash
+   ```
+
+### Basic Usage Pattern
+
+```bash
+./grumpwalk.py --host CLUSTER --path /starting/path [FILTERS] [OPTIONS]
+```
+
+### Your First Crawl
+
+```bash
+# Basic crawl with progress
+./grumpwalk.py --host cluster.example.com --path /data --progress > inventory.ndjson
+
+# Quick file count
+./grumpwalk.py --host cluster.example.com --path /data --progress 2>&1 | tail -1
+```
+
+---
+
+## Finding Files
+
+### How do I find files by name?
+
+**Find all log files:**
+```bash
+./grumpwalk.py --host cluster --path /var --name '*.log' --type file
+```
+
+**Find files matching multiple patterns (OR logic):**
+```bash
+./grumpwalk.py --host cluster --path /data --name '*.tmp' --name '*.bak' --name '*.old'
+```
+
+**Find files matching ALL patterns (AND logic):**
+```bash
+./grumpwalk.py --host cluster --path /backups --name-and '*backup*' --name-and '*2024*'
+```
+
+**Case-sensitive search:**
+```bash
+./grumpwalk.py --host cluster --path /docs --name 'README' --name-case-sensitive
+```
+
+**Find using regex:**
+```bash
+# Find files starting with numbers
+./grumpwalk.py --host cluster --path /data --name '^[0-9].*'
+
+# Find files with version numbers (v1, v2, etc.)
+./grumpwalk.py --host cluster --path /releases --name '.*_v[0-9]+\.'
+```
+
+### How do I find files by size?
+
+**Find large files (over 1GB):**
+```bash
+./grumpwalk.py --host cluster --path /data --larger-than 1GB --type file --progress
+```
+
+**Find small files (under 1KB) - potential stub files:**
+```bash
+./grumpwalk.py --host cluster --path /data --smaller-than 1KB --type file
+```
+
+**Find files in a size range:**
+```bash
+./grumpwalk.py --host cluster --path /media \
+  --larger-than 100MB --smaller-than 1GB --type file
+```
+
+**Find the largest files in a directory:**
+```bash
+./grumpwalk.py --host cluster --path /home --type file --progress | \
+  jq -s 'sort_by(.size) | reverse | .[0:20]'
+```
+
+### How do I find files by age?
+
+**Find files older than 90 days (by creation time):**
+```bash
+./grumpwalk.py --host cluster --path /data --older-than 90 --type file
+```
+
+**Find files modified in the last 7 days:**
+```bash
+./grumpwalk.py --host cluster --path /projects --modified --newer-than 7
+```
+
+**Find files not accessed in over a year:**
+```bash
+./grumpwalk.py --host cluster --path /archive --accessed --older-than 365
+```
+
+**Find files created recently but not modified (potential placeholders):**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --created --newer-than 30 \
+  --modified-older-than 30
+```
+
+### How do I find files by owner?
+
+**Find all files owned by a specific user:**
+```bash
+./grumpwalk.py --host cluster --path /home --owner jsmith --progress
+```
+
+**Find files owned by a UID:**
+```bash
+./grumpwalk.py --host cluster --path /nfs-data --owner 1001 --uid
+```
+
+**Find files owned by an AD user:**
+```bash
+./grumpwalk.py --host cluster --path /shared --owner "DOMAIN\\jsmith" --ad
+```
+
+**Find files owned by multiple users (OR logic):**
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --owner alice --owner bob --owner charlie
+```
+
+### How do I find specific file types?
+
+**Find only directories:**
+```bash
+./grumpwalk.py --host cluster --path /data --type directory
+```
+
+**Find only symlinks:**
+```bash
+./grumpwalk.py --host cluster --path /opt --type symlink --resolve-links
+```
+
+**Find empty directories:**
+```bash
+./grumpwalk.py --host cluster --path /data --type directory --progress | \
+  jq 'select(.child_count == 0)'
+```
+
+### How do I search within specific directories?
+
+**Limit search depth:**
+```bash
+./grumpwalk.py --host cluster --path /home --max-depth 2 --type file
+```
+
+**Skip certain directories:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --omit-subdirs '.snapshot' \
+  --omit-subdirs 'node_modules' \
+  --omit-subdirs '.git'
+```
+
+**Skip specific paths:**
+```bash
+./grumpwalk.py --host cluster --path / \
+  --omit-path /var/log \
+  --omit-path /tmp \
+  --omit-path /proc
+```
+
+---
+
+## Storage Capacity Planning
+
+### How do I generate a storage report by owner?
+
+```bash
+./grumpwalk.py --host cluster --path /home --owner-report --progress
+```
+
+**Sample output:**
+```
+================================================================================
+OWNER REPORT
+================================================================================
+Owner                          Domain               Files       Dirs      Total Size
+------------------------------------------------------------------------------------------
+alice@corp.com                 AD_USER              125,432    2,341     1.23 TB
+bob@corp.com                   AD_USER               98,234    1,892     987.45 GB
+UID 1001                       POSIX_USER            45,123      234     456.78 GB
+------------------------------------------------------------------------------------------
+TOTAL                                               268,789    4,467     2.67 TB
+```
+
+### How do I find who is using the most storage?
+
+```bash
+# Top 10 storage consumers
+./grumpwalk.py --host cluster --path /shared --owner-report --progress 2>&1 | \
+  grep -A 20 "OWNER REPORT"
+```
+
+### How do I identify cold data for tiering?
+
+**Find data not accessed in 90+ days:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --accessed --older-than 90 \
+  --type file --progress \
+  --json-out cold_data_90days.json
+```
+
+**Summarize cold data by directory:**
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --accessed --older-than 180 \
+  --type file | \
+  jq -r '.path | split("/")[1:4] | join("/")' | sort | uniq -c | sort -rn | head -20
+```
+
+**Find large cold files (candidates for archival):**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --accessed --older-than 365 \
+  --larger-than 100MB \
+  --type file --progress
+```
+
+### How do I estimate storage growth?
+
+**Compare file counts by creation date:**
+```bash
+# Files created in the last 30 days
+./grumpwalk.py --host cluster --path /data --created --newer-than 30 --type file | wc -l
+
+# Files created 30-60 days ago
+./grumpwalk.py --host cluster --path /data \
+  --created --newer-than 60 --created-older-than 30 --type file | wc -l
+```
+
+**Analyze recent growth by owner:**
+```bash
+./grumpwalk.py --host cluster --path /home \
+  --created --newer-than 30 \
+  --owner-report --progress
+```
+
+### How do I find directories consuming the most space?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --show-dir-stats --max-depth 2 --progress
+```
+
+---
+
+## Data Lifecycle Management
+
+### How do I find stale data for cleanup?
+
+**Find files untouched for 2+ years:**
+```bash
+./grumpwalk.py --host cluster --path /archive \
+  --accessed --older-than 730 \
+  --modified --older-than 730 \
+  --type file --progress \
+  --csv-out stale_files.csv
+```
+
+**Find old temporary files:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --name '*.tmp' --name '*.temp' --name '*.bak' --name '~*' \
+  --older-than 30 \
+  --type file
+```
+
+**Find orphaned snapshot directories:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --name '.snapshot' --name 'snapshot_*' \
+  --type directory \
+  --older-than 90
+```
+
+### How do I implement a retention policy?
+
+**Find files exceeding 7-year retention:**
+```bash
+./grumpwalk.py --host cluster --path /legal/documents \
+  --created --older-than 2555 \
+  --type file --progress \
+  --json-out retention_exceeded.json
+```
+
+**Generate deletion candidate list by category:**
+```bash
+# Log files older than 90 days
+./grumpwalk.py --host cluster --path /var/log \
+  --name '*.log' --name '*.log.*' \
+  --older-than 90 --type file \
+  --csv-out logs_to_delete.csv
+
+# Core dumps older than 30 days
+./grumpwalk.py --host cluster --path /var \
+  --name 'core.*' --name '*.core' \
+  --older-than 30 --type file \
+  --csv-out cores_to_delete.csv
+```
+
+### How do I find files that should be compressed?
+
+```bash
+# Large text/log files that could benefit from compression
+./grumpwalk.py --host cluster --path /logs \
+  --name '*.log' --name '*.txt' --name '*.csv' --name '*.json' \
+  --larger-than 100MB \
+  --type file
+```
+
+---
+
+## User and Access Management
+
+### How do I audit permissions for a user?
+
+**Generate ACL report showing user's access:**
+```bash
+./grumpwalk.py --host cluster --path /shared \
+  --acl-report --acl-resolve-names --progress
+```
+
+**Find all files a user owns:**
+```bash
+./grumpwalk.py --host cluster --path / \
+  --owner "DOMAIN\\jsmith" --ad \
+  --expand-identity \
+  --progress \
+  --json-out jsmith_files.json
+```
+
+### How do I handle employee offboarding?
+
+**Step 1: Find all files owned by departing employee:**
+```bash
+./grumpwalk.py --host cluster --path /home/jsmith \
+  --owner "DOMAIN\\jsmith" --ad \
+  --type file --progress \
+  --json-out departing_user_files.json
+```
+
+**Step 2: Clone their permissions to manager:**
+```bash
+./grumpwalk.py --host cluster --path /home/jsmith \
+  --clone-ace-source "DOMAIN\\jsmith" \
+  --clone-ace-target "DOMAIN\\manager" \
+  --propagate-changes --progress
+```
+
+**Step 3: Remove departing user's ACEs:**
+```bash
+./grumpwalk.py --host cluster --path /home/jsmith \
+  --remove-ace "Allow:DOMAIN\\jsmith" \
+  --propagate-changes --progress
+```
+
+**Step 4: Transfer file ownership to manager:**
+```bash
+# Preview ownership changes first
+./grumpwalk.py --host cluster --path /home/jsmith \
+  --change-owner "DOMAIN\\jsmith:DOMAIN\\manager" \
+  --propagate-changes --dry-run
+
+# Execute the ownership transfer
+./grumpwalk.py --host cluster --path /home/jsmith \
+  --change-owner "DOMAIN\\jsmith:DOMAIN\\manager" \
+  --propagate-changes --progress
+```
+
+### How do I transfer file ownership between users?
+
+**Transfer ownership of a single directory:**
+```bash
+./grumpwalk.py --host cluster --path /projects/projectA \
+  --change-owner "olduser:newuser"
+```
+
+**Transfer ownership recursively (all children):**
+```bash
+./grumpwalk.py --host cluster --path /shared/team-data \
+  --change-owner "olduser:newuser" \
+  --propagate-changes --progress
+```
+
+**Transfer ownership using UIDs (NFS environments):**
+```bash
+./grumpwalk.py --host cluster --path /nfs-exports/home \
+  --change-owner "uid:1001:uid:2001" \
+  --propagate-changes --progress
+```
+
+**Transfer both owner and group simultaneously:**
+```bash
+./grumpwalk.py --host cluster --path /projects/legacy \
+  --change-owner "departed_user:new_owner" \
+  --change-group "old_team:new_team" \
+  --propagate-changes --progress
+```
+
+### How do I change ownership based on filters?
+
+**Change ownership only for files (not directories):**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owner "olduser:newuser" \
+  --type file \
+  --propagate-changes --progress
+```
+
+**Change ownership only for old files:**
+```bash
+./grumpwalk.py --host cluster --path /archive \
+  --change-owner "departed_user:archive_admin" \
+  --older-than 365 \
+  --propagate-changes --progress
+```
+
+**Change ownership only for large files:**
+```bash
+./grumpwalk.py --host cluster --path /media \
+  --change-owner "contractor:media_team" \
+  --larger-than 1GB \
+  --type file \
+  --propagate-changes --progress
+```
+
+**Change ownership for specific file types:**
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --change-owner "developer1:developer2" \
+  --name "*.py" --name "*.js" \
+  --type file \
+  --propagate-changes --progress
+```
+
+### How do I perform bulk ownership changes?
+
+**Create a CSV file with ownership mappings:**
+```csv
+source,target
+olduser1,newuser1
+olduser2,newuser2
+uid:1001,newuser3
+OLDDOMAIN\jsmith,NEWDOMAIN\jsmith
+```
+
+**Preview bulk ownership changes:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owners-file ownership_migration.csv \
+  --propagate-changes --dry-run
+```
+
+**Execute bulk ownership changes:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owners-file ownership_migration.csv \
+  --propagate-changes --progress
+```
+
+**Bulk group changes from CSV:**
+```bash
+./grumpwalk.py --host cluster --path /shared \
+  --change-groups-file group_migration.csv \
+  --propagate-changes --progress
+```
+
+### How do I change group ownership?
+
+**Change group for a directory tree:**
+```bash
+./grumpwalk.py --host cluster --path /projects/teamA \
+  --change-group "old_team:new_team" \
+  --propagate-changes --progress
+```
+
+**Change group using GIDs:**
+```bash
+./grumpwalk.py --host cluster --path /nfs-data \
+  --change-group "gid:100:gid:200" \
+  --propagate-changes --progress
+```
+
+**Combine owner and group changes:**
+```bash
+./grumpwalk.py --host cluster --path /shared/department \
+  --change-owner "manager1:manager2" \
+  --change-group "dept_old:dept_new" \
+  --propagate-changes --progress
+```
+
+### How do I add a new team member to existing shares?
+
+**Clone permissions from existing team member:**
+```bash
+./grumpwalk.py --host cluster --path /projects/teamA \
+  --clone-ace-source "existing_member" \
+  --clone-ace-target "new_member" \
+  --propagate-changes --progress
+```
+
+**Or add explicit permissions:**
+```bash
+./grumpwalk.py --host cluster --path /projects/teamA \
+  --add-ace "Allow:fd:new_member:Modify" \
+  --propagate-changes --progress
+```
+
+### How do I implement least privilege access?
+
+Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-permissions-management-best-practices/):
+
+**Remove overly broad permissions:**
+```bash
+# Remove Everyone access
+./grumpwalk.py --host cluster --path /sensitive \
+  --remove-ace "Allow:Everyone" \
+  --propagate-changes --dry-run
+
+# If satisfied, run without --dry-run
+```
+
+**Downgrade from FullControl to Modify:**
+```bash
+./grumpwalk.py --host cluster --path /shared \
+  --replace-ace "Allow:fd:Domain Users:FullControl" \
+  --new-ace "Allow:fd:Domain Users:Modify" \
+  --propagate-changes --progress
+```
+
+### How do I grant read-only access?
+
+```bash
+./grumpwalk.py --host cluster --path /published \
+  --add-ace "Allow:fd:Readers_Group:Read" \
+  --propagate-changes --progress
+```
+
+### How do I revoke write access while keeping read?
+
+```bash
+./grumpwalk.py --host cluster --path /archive \
+  --remove-rights "Allow:Domain Users:w" \
+  --propagate-changes --progress
+```
+
+---
+
+## Domain Migration
+
+### How do I migrate permissions during an AD domain migration?
+
+**Step 1: Create migration CSV file:**
+```csv
+source,target
+OLDDOMAIN\user1,NEWDOMAIN\user1
+OLDDOMAIN\user2,NEWDOMAIN\user2
+OLDDOMAIN\GroupA,NEWDOMAIN\GroupA
+OLDDOMAIN\Domain Users,NEWDOMAIN\Domain Users
+OLDDOMAIN\Domain Admins,NEWDOMAIN\Domain Admins
+```
+
+**Step 2: Dry-run the migration:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --migrate-trustees domain_migration.csv \
+  --dry-run
+```
+
+**Step 3: Execute the migration:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --migrate-trustees domain_migration.csv \
+  --propagate-changes \
+  --ace-backup pre_migration_acls.json \
+  --progress
+```
+
+### How do I migrate from NFS UIDs to AD accounts?
+
+**Create UID to AD mapping:**
+```csv
+source,target
+uid:1001,NEWDOMAIN\alice
+uid:1002,NEWDOMAIN\bob
+uid:1003,NEWDOMAIN\charlie
+gid:100,NEWDOMAIN\Engineering
+gid:200,NEWDOMAIN\Sales
+```
+
+**Execute migration:**
+```bash
+./grumpwalk.py --host cluster --path /nfs-data \
+  --migrate-trustees uid_to_ad.csv \
+  --propagate-changes --progress
+```
+
+### How do I clone permissions for a new parallel structure?
+
+```bash
+# Create mapping for team restructuring
+cat > team_restructure.csv << EOF
+source,target
+TeamA_Leads,NewTeam_Leads
+TeamA_Members,NewTeam_Members
+TeamB_Leads,NewTeam_Leads
+TeamB_Members,NewTeam_Members
+EOF
+
+./grumpwalk.py --host cluster --path /projects \
+  --clone-ace-map team_restructure.csv \
+  --propagate-changes --progress
+```
+
+### How do I migrate file ownership during domain migration?
+
+File ownership migration is separate from ACL/ACE migration. Use `--change-owner` and `--change-group` for ownership:
+
+**Step 1: Create ownership migration CSV:**
+```csv
+source,target
+OLDDOMAIN\user1,NEWDOMAIN\user1
+OLDDOMAIN\user2,NEWDOMAIN\user2
+OLDDOMAIN\service_account,NEWDOMAIN\service_account
+```
+
+**Step 2: Preview ownership changes:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owners-file owner_migration.csv \
+  --propagate-changes --dry-run
+```
+
+**Step 3: Execute ownership migration:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owners-file owner_migration.csv \
+  --propagate-changes --progress
+```
+
+### How do I migrate both ACLs and ownership together?
+
+For a complete domain migration, you typically need to migrate both ACEs and file ownership:
+
+**Complete domain migration script:**
+```bash
+#!/bin/bash
+CLUSTER="cluster.example.com"
+PATH="/data"
+ACE_CSV="ace_migration.csv"
+OWNER_CSV="owner_migration.csv"
+GROUP_CSV="group_migration.csv"
+
+# Step 1: Backup current ACLs
+./grumpwalk.py --host $CLUSTER --path $PATH \
+  --acl-report --acl-resolve-names \
+  --json-out pre_migration_acls.json
+
+# Step 2: Migrate ACE trustees (permissions)
+./grumpwalk.py --host $CLUSTER --path $PATH \
+  --migrate-trustees $ACE_CSV \
+  --propagate-changes --progress
+
+# Step 3: Migrate file owners
+./grumpwalk.py --host $CLUSTER --path $PATH \
+  --change-owners-file $OWNER_CSV \
+  --propagate-changes --progress
+
+# Step 4: Migrate file groups
+./grumpwalk.py --host $CLUSTER --path $PATH \
+  --change-groups-file $GROUP_CSV \
+  --propagate-changes --progress
+```
+
+### How do I migrate NFS UID/GID ownership to AD accounts?
+
+**Create ownership mapping CSV:**
+```csv
+source,target
+uid:1001,NEWDOMAIN\alice
+uid:1002,NEWDOMAIN\bob
+uid:1003,NEWDOMAIN\charlie
+```
+
+**Create group ownership mapping CSV:**
+```csv
+source,target
+gid:100,NEWDOMAIN\Engineering
+gid:200,NEWDOMAIN\Sales
+gid:300,NEWDOMAIN\Marketing
+```
+
+**Execute NFS to AD ownership migration:**
+```bash
+# Migrate owners
+./grumpwalk.py --host cluster --path /nfs-data \
+  --change-owners-file uid_to_ad_owners.csv \
+  --propagate-changes --progress
+
+# Migrate groups
+./grumpwalk.py --host cluster --path /nfs-data \
+  --change-groups-file gid_to_ad_groups.csv \
+  --propagate-changes --progress
+```
+
+### How do I consolidate ownership after an acquisition?
+
+When merging companies, you may need to consolidate file ownership:
+
+**Create consolidation mapping:**
+```csv
+source,target
+ACQUIRED_DOMAIN\user1,PARENT_DOMAIN\user1
+ACQUIRED_DOMAIN\user2,PARENT_DOMAIN\user2
+ACQUIRED_DOMAIN\admin,PARENT_DOMAIN\admin
+```
+
+**Migrate in phases by department:**
+```bash
+# Phase 1: Engineering
+./grumpwalk.py --host cluster --path /acquired/engineering \
+  --change-owners-file consolidation.csv \
+  --propagate-changes --progress
+
+# Phase 2: Sales
+./grumpwalk.py --host cluster --path /acquired/sales \
+  --change-owners-file consolidation.csv \
+  --propagate-changes --progress
+
+# Phase 3: Remaining
+./grumpwalk.py --host cluster --path /acquired \
+  --change-owners-file consolidation.csv \
+  --propagate-changes --progress
+```
+
+### How do I handle mixed identity environments?
+
+When migrating environments with both AD and NFS identities:
+
+**Create comprehensive mapping:**
+```csv
+source,target
+# AD users
+OLDDOMAIN\alice,NEWDOMAIN\alice
+OLDDOMAIN\bob,NEWDOMAIN\bob
+# NFS UIDs that map to AD
+uid:1001,NEWDOMAIN\alice
+uid:1002,NEWDOMAIN\bob
+# Service accounts
+OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
+```
+
+**Execute with combined CSV:**
+```bash
+./grumpwalk.py --host cluster --path /mixed-data \
+  --change-owners-file comprehensive_migration.csv \
+  --propagate-changes --progress
+```
+
+---
+
+## Compliance and Auditing
+
+### How do I generate a permissions audit report?
+
+```bash
+./grumpwalk.py --host cluster --path /sensitive \
+  --acl-report \
+  --acl-resolve-names \
+  --acl-csv permissions_audit.csv \
+  --progress
+```
+
+### How do I find files with specific permissions?
+
+**Find files accessible by Everyone:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --acl-report --progress | \
+  grep -i "everyone"
+```
+
+### How do I identify GDPR data retention violations?
+
+**Find personal data older than retention period:**
+```bash
+./grumpwalk.py --host cluster --path /customer-data \
+  --older-than 1095 \
+  --type file \
+  --csv-out gdpr_retention_review.csv
+```
+
+**Find files in regulated directories not accessed in required period:**
+```bash
+./grumpwalk.py --host cluster --path /financial-records \
+  --accessed --older-than 2555 \
+  --type file --progress
+```
+
+### How do I audit who has access to sensitive directories?
+
+```bash
+./grumpwalk.py --host cluster --path /hr/confidential \
+  --acl-report --acl-resolve-names --max-depth 1
+```
+
+### How do I find files with broken inheritance?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --acl-report --progress | \
+  jq 'select(.acl.control | contains(["DACL_PROTECTED"]))'
+```
+
+---
+
+## Security and Incident Response
+
+### How do I identify files modified during a suspected breach?
+
+**Find files modified in the last 24 hours:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --modified --newer-than 1 \
+  --type file --progress \
+  --json-out modified_24h.json
+```
+
+**Find files modified during specific attack window (combined with timestamps):**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --modified --newer-than 3 \
+  --type file | \
+  jq 'select(.modification_time > "2024-01-15T00:00:00" and .modification_time < "2024-01-15T12:00:00")'
+```
+
+### How do I find potentially encrypted files (ransomware)?
+
+**Find files with suspicious extensions:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --name '*.encrypted' --name '*.locked' --name '*.crypto' \
+  --name '*.crypt' --name '*.enc' --name '*.crypted' \
+  --type file --progress
+```
+
+**Find ransom note files:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --name '*README*' --name '*DECRYPT*' --name '*RECOVER*' \
+  --name '*INSTRUCTION*' --name '*HOW_TO*' \
+  --modified --newer-than 7 \
+  --type file
+```
+
+### How do I identify unusual file permission changes?
+
+**Find files where Everyone has write access:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --acl-report | \
+  jq 'select(.aces[] | select(.trustee_readable == "EVERYONE@" and (.rights | contains(["MODIFY"]))))'
+```
+
+### How do I find recently created executable content?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --name '*.exe' --name '*.dll' --name '*.bat' --name '*.ps1' \
+  --name '*.sh' --name '*.py' --name '*.js' \
+  --created --newer-than 7 \
+  --type file
+```
+
+### How do I audit access after a security incident?
+
+```bash
+# Generate comprehensive ACL report
+./grumpwalk.py --host cluster --path /compromised-share \
+  --acl-report \
+  --acl-resolve-names \
+  --show-owner \
+  --show-group \
+  --acl-csv incident_acl_audit.csv \
+  --progress
+```
+
+### How do I lock down a directory during investigation?
+
+**Backup current ACLs:**
+```bash
+./grumpwalk.py --host cluster --path /investigation \
+  --add-ace "Deny::Everyone:w" \
+  --ace-backup investigation_original_acls.json \
+  --propagate-changes --progress
+```
+
+---
+
+## Duplicate and Similar File Detection
+
+### How do I find duplicate files?
+
+**Find similar files using content sampling:**
+```bash
+./grumpwalk.py --host cluster --path /backups \
+  --find-similar \
+  --progress \
+  --csv-out potential_duplicates.csv
+```
+
+**Estimate data transfer before scanning:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --find-similar --estimate-size
+```
+
+### How do I find duplicates quickly (less accurate)?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --find-similar --by-size \
+  --progress
+```
+
+### How do I tune similarity detection for accuracy?
+
+**Higher accuracy (more data transfer):**
+```bash
+./grumpwalk.py --host cluster --path /important \
+  --find-similar \
+  --sample-size 256KB \
+  --sample-points 11 \
+  --progress
+```
+
+**Lower accuracy, faster (less data transfer):**
+```bash
+./grumpwalk.py --host cluster --path /archives \
+  --find-similar \
+  --sample-size 32KB \
+  --sample-points 5 \
+  --progress
+```
+
+### How do I find duplicate large files specifically?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --larger-than 100MB \
+  --type file \
+  --find-similar \
+  --progress \
+  --csv-out large_duplicates.csv
+```
+
+---
+
+## Media and Creative Workflows
+
+### How do I find large media files?
+
+```bash
+./grumpwalk.py --host cluster --path /media \
+  --name '*.mov' --name '*.mp4' --name '*.mxf' --name '*.r3d' \
+  --name '*.ari' --name '*.braw' --name '*.prores' \
+  --larger-than 1GB \
+  --type file --progress
+```
+
+### How do I find old project files for archival?
+
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --accessed --older-than 180 \
+  --modified --older-than 180 \
+  --larger-than 100MB \
+  --type file \
+  --csv-out archive_candidates.csv
+```
+
+### How do I identify render cache files for cleanup?
+
+```bash
+./grumpwalk.py --host cluster --path /renders \
+  --name '*.tmp' --name '*cache*' --name '*preview*' \
+  --name '*.peak' --name '*.pek' --name '*.pkf' \
+  --older-than 30 \
+  --type file
+```
+
+### How do I find proxy files vs original media?
+
+```bash
+# Find proxy files
+./grumpwalk.py --host cluster --path /media \
+  --name '*proxy*' --name '*_lowres*' --name '*_small*' \
+  --type file \
+  --json-out proxies.json
+
+# Find original high-res
+./grumpwalk.py --host cluster --path /media \
+  --name '*.r3d' --name '*.braw' --name '*.ari' \
+  --larger-than 1GB \
+  --type file \
+  --json-out originals.json
+```
+
+### How do I audit project folder structures?
+
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --show-dir-stats --max-depth 3 --progress
+```
+
+---
+
+## Reporting and Analytics
+
+### How do I generate a full inventory?
+
+```bash
+./grumpwalk.py --host cluster --path / \
+  --all-attributes \
+  --progress \
+  > full_inventory.ndjson
+```
+
+### How do I export to CSV for Excel analysis?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --older-than 365 \
+  --type file \
+  --csv-out old_files.csv
+```
+
+### How do I analyze results with jq?
+
+**Count files by extension:**
+```bash
+cat inventory.ndjson | \
+  jq -r '.name | split(".") | .[-1] | ascii_downcase' | \
+  sort | uniq -c | sort -rn | head -20
+```
+
+**Sum total size:**
+```bash
+cat inventory.ndjson | jq -s 'map(.size) | add'
+```
+
+**Group by owner:**
+```bash
+cat inventory.ndjson | \
+  jq -r '.owner' | sort | uniq -c | sort -rn
+```
+
+**Find paths with most files:**
+```bash
+cat inventory.ndjson | \
+  jq -r '.path | split("/")[1:3] | join("/")' | \
+  sort | uniq -c | sort -rn | head -20
+```
+
+### How do I analyze with DuckDB?
+
+```sql
+-- Create table from NDJSON
+CREATE TABLE files AS SELECT * FROM read_ndjson_auto('inventory.ndjson');
+
+-- Storage by owner (top 20)
+SELECT owner,
+       COUNT(*) as file_count,
+       SUM(size) / (1024*1024*1024) as total_gb
+FROM files
+GROUP BY owner
+ORDER BY total_gb DESC
+LIMIT 20;
+
+-- Files by age bucket
+SELECT
+  CASE
+    WHEN creation_time > CURRENT_DATE - INTERVAL 30 DAY THEN '0-30 days'
+    WHEN creation_time > CURRENT_DATE - INTERVAL 90 DAY THEN '30-90 days'
+    WHEN creation_time > CURRENT_DATE - INTERVAL 365 DAY THEN '90-365 days'
+    ELSE '1+ years'
+  END as age_bucket,
+  COUNT(*) as file_count,
+  SUM(size) / (1024*1024*1024) as total_gb
+FROM files
+GROUP BY age_bucket;
+```
+
+### How do I analyze with Python?
+
+```python
+import json
+
+total_size = 0
+file_count = 0
+owners = {}
+
+with open('inventory.ndjson') as f:
+    for line in f:
+        file = json.loads(line)
+        total_size += file.get('size', 0)
+        file_count += 1
+
+        owner = file.get('owner', 'unknown')
+        if owner not in owners:
+            owners[owner] = {'count': 0, 'size': 0}
+        owners[owner]['count'] += 1
+        owners[owner]['size'] += file.get('size', 0)
+
+print(f"Total files: {file_count:,}")
+print(f"Total size: {total_size / (1024**4):.2f} TB")
+
+# Top 10 owners by size
+for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=True)[:10]:
+    print(f"{owner}: {stats['count']:,} files, {stats['size'] / (1024**3):.2f} GB")
+```
+
+---
+
+## Performance Optimization
+
+### How do I maximize crawl speed?
+
+**For large clusters (>10M files):**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --max-concurrent 500 \
+  --connector-limit 500 \
+  --progress
+```
+
+**For local network with low latency:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --max-concurrent 1000 \
+  --connector-limit 1000 \
+  --progress
+```
+
+### How do I profile performance bottlenecks?
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --profile --progress \
+  --limit 10000
+```
+
+### How do I reduce memory usage?
+
+**Process output in streaming fashion:**
+```bash
+./grumpwalk.py --host cluster --path /data --progress | \
+  gzip > inventory.ndjson.gz
+```
+
+**Limit results for quick checks:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --older-than 365 \
+  --limit 1000
+```
+
+### How do I handle very large directories?
+
+**Skip directories with too many entries:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --max-entries-per-dir 100000 \
+  --progress
+```
+
+---
+
+## Scripting and Automation
+
+### How do I run grumpwalk in a scheduled job?
+
+```bash
+#!/bin/bash
+# daily_inventory.sh
+
+DATE=$(date +%Y%m%d)
+CLUSTER="cluster.example.com"
+OUTPUT_DIR="/reports"
+
+# Generate daily inventory
+./grumpwalk.py --host $CLUSTER --path /data \
+  --progress \
+  > "${OUTPUT_DIR}/inventory_${DATE}.ndjson" 2> "${OUTPUT_DIR}/inventory_${DATE}.log"
+
+# Compress older inventories
+find ${OUTPUT_DIR} -name "inventory_*.ndjson" -mtime +7 -exec gzip {} \;
+
+# Clean up inventories older than 30 days
+find ${OUTPUT_DIR} -name "inventory_*.ndjson.gz" -mtime +30 -delete
+```
+
+### How do I create an alerting script for stale data?
+
+```bash
+#!/bin/bash
+# stale_data_alert.sh
+
+THRESHOLD_GB=1000
+CLUSTER="cluster.example.com"
+
+# Find stale data (not accessed in 365 days)
+STALE_SIZE=$(./grumpwalk.py --host $CLUSTER --path /data \
+  --accessed --older-than 365 \
+  --type file 2>/dev/null | \
+  jq -s 'map(.size) | add // 0' | \
+  awk '{print int($1/1024/1024/1024)}')
+
+if [ "$STALE_SIZE" -gt "$THRESHOLD_GB" ]; then
+  echo "ALERT: ${STALE_SIZE}GB of stale data found (threshold: ${THRESHOLD_GB}GB)"
+  # Send email/Slack notification here
+fi
+```
+
+### How do I automate permission reports?
+
+```bash
+#!/bin/bash
+# weekly_permission_audit.sh
+
+DATE=$(date +%Y%m%d)
+CLUSTER="cluster.example.com"
+SENSITIVE_PATHS="/hr/confidential /finance/restricted /legal/privileged"
+
+for PATH in $SENSITIVE_PATHS; do
+  SAFE_NAME=$(echo $PATH | tr '/' '_')
+  ./grumpwalk.py --host $CLUSTER --path $PATH \
+    --acl-report \
+    --acl-resolve-names \
+    --acl-csv "acl_audit${SAFE_NAME}_${DATE}.csv" \
+    --progress 2>&1 | tee "acl_audit${SAFE_NAME}_${DATE}.log"
+done
+```
+
+### How do I pipe grumpwalk output to other tools?
+
+**To jq for filtering:**
+```bash
+./grumpwalk.py --host cluster --path /data | \
+  jq 'select(.size > 1073741824)' > large_files.json
+```
+
+**To gzip for compression:**
+```bash
+./grumpwalk.py --host cluster --path / --progress | \
+  gzip > full_inventory.ndjson.gz
+```
+
+**To xargs for further processing:**
+```bash
+./grumpwalk.py --host cluster --path /tmp \
+  --name '*.tmp' --older-than 7 --type file | \
+  jq -r '.path' | \
+  xargs -I {} echo "Would delete: {}"
+```
+
+---
+
+## Quick Reference Card
+
+### Most Common Commands
+
+| Task | Command |
+|------|---------|
+| Full inventory | `--path / --progress > inventory.ndjson` |
+| Find large files | `--larger-than 1GB --type file` |
+| Find old files | `--older-than 365 --type file` |
+| Find by name | `--name '*.log'` |
+| Owner report | `--owner-report --progress` |
+| ACL audit | `--acl-report --acl-resolve-names` |
+| Add permission | `--add-ace 'Allow:fd:Group:Modify' --propagate-changes` |
+| Remove permission | `--remove-ace 'Allow:Everyone' --propagate-changes` |
+| Change owner | `--change-owner 'old:new' --propagate-changes` |
+| Change group | `--change-group 'old:new' --propagate-changes` |
+| Bulk owner migration | `--change-owners-file migration.csv --propagate-changes` |
+| Find duplicates | `--find-similar --progress` |
+| Dry run | `--dry-run` (add to any modification command) |
+
+### Size Suffixes
+
+| Suffix | Meaning |
+|--------|---------|
+| `KB` | Kilobytes (1000) |
+| `KiB` | Kibibytes (1024) |
+| `MB` | Megabytes |
+| `MiB` | Mebibytes |
+| `GB` | Gigabytes |
+| `GiB` | Gibibytes |
+| `TB` | Terabytes |
+| `TiB` | Tebibytes |
+
+### Time Field Shortcuts
+
+| Flag | Time Field |
+|------|------------|
+| `--created` | creation_time |
+| `--modified` | modification_time |
+| `--accessed` | access_time |
+| `--changed` | change_time |
+
+### ACE Pattern Quick Reference
+
+| Pattern | Meaning |
+|---------|---------|
+| `Allow:fd:User:Modify` | Allow, file+dir inherit, Modify rights |
+| `Deny::Everyone:w` | Deny, no inheritance, write only |
+| `Allow:fd:Group:Read` | Allow, file+dir inherit, Read rights |
+| `Allow:fd:User:FullControl` | Allow, file+dir inherit, all rights |
+
+### Owner/Group Change Pattern Quick Reference
+
+| Pattern | Meaning |
+|---------|---------|
+| `olduser:newuser` | Simple username change |
+| `uid:1001:uid:2001` | UID to UID (NFS) |
+| `gid:100:gid:200` | GID to GID (NFS) |
+| `DOMAIN\old:DOMAIN\new` | AD user/group change |
+| `uid:1001:DOMAIN\user` | UID to AD user |
+| `OLDDOMAIN\user:NEWDOMAIN\user` | Cross-domain migration |
+
+### Propagation Flag
+
+The `--propagate-changes` flag applies modifications recursively to all children:
+
+| Without flag | Only the target path is modified |
+|--------------|----------------------------------|
+| With flag | Target path and all descendants are modified |
+
+Works with:
+- ACE operations (`--add-ace`, `--remove-ace`, `--replace-ace`, etc.)
+- Owner/group changes (`--change-owner`, `--change-group`)
+- Trustee migration (`--migrate-trustees`)
+- ACE cloning (`--clone-ace-source/--clone-ace-target`)
+
+

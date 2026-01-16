@@ -248,7 +248,7 @@ Selective ownership changes - find files by current owner/group and change to a 
 - `--change-group 'SOURCE:TARGET'` - Change group from SOURCE to TARGET (e.g., `'oldgroup:newgroup'`, `'gid:100:gid:200'`)
 - `--change-owners-file FILE.csv` - Load owner mappings from CSV file
 - `--change-groups-file FILE.csv` - Load group mappings from CSV file
-- `--propagate-owner-changes` - Apply changes to all children recursively (without this, only the target path is changed)
+- `--propagate-changes` - Apply changes to all children recursively (without this, only the target path is changed)
 
 **CSV Format** (same as `--migrate-trustees`):
 ```csv
@@ -313,7 +313,7 @@ Supported trustee formats in CSV (same as command-line):
 | `--clone-ace-map` | `mappings.csv` | Bulk clone ACEs from CSV file |
 
 **Supporting Flags:**
-- `--propagate-ace-changes` - Apply ACE changes to all children recursively
+- `--propagate-changes` - Apply changes to all children recursively (works with ACE and owner/group operations)
 - `--sync-cloned-aces` - When cloning, update existing target ACEs to match source rights
 - `--dry-run` - Preview changes without applying them
 - `--ace-backup FILE` - Save original ACLs to JSON before modification
@@ -356,7 +356,7 @@ When modifying an inherited ACE (one that has the INHERITED flag), grumpwalk aut
 2. **Converts inherited ACEs to explicit** by removing the INHERITED flag from all ACEs
 3. **Applies your modifications** to the now-explicit ACE
 
-This establishes the target path as a new inheritance root. When used with `--propagate-ace-changes`, the modified ACL propagates to all children with proper inheritance flags.
+This establishes the target path as a new inheritance root. When used with `--propagate-changes`, the modified ACL propagates to all children with proper inheritance flags.
 
 **Restarting Inheritance:**
 
@@ -528,39 +528,39 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 # Preview recursive owner changes (ALWAYS do this first!)
 ./grumpwalk.py --host cluster.example.com --path /data \
   --change-owner 'departed_user:manager' \
-  --propagate-owner-changes --dry-run
+  --propagate-changes --dry-run
 
 # Change owner recursively for all matching files
 ./grumpwalk.py --host cluster.example.com --path /home/olduser \
   --change-owner 'olduser:newuser' \
-  --propagate-owner-changes --progress
+  --propagate-changes --progress
 
 # Change owner using UIDs (NFS environments)
 ./grumpwalk.py --host cluster.example.com --path /nfs-data \
   --change-owner 'uid:1001:uid:2001' \
-  --propagate-owner-changes --progress
+  --propagate-changes --progress
 
 # Change both owner and group recursively
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --change-owner 'olduser:newuser' \
   --change-group 'oldgroup:newgroup' \
-  --propagate-owner-changes --progress
+  --propagate-changes --progress
 
 # Change ownership with filters (only old files)
 ./grumpwalk.py --host cluster.example.com --path /archive \
   --change-owner 'departed_user:manager' \
-  --propagate-owner-changes --older-than 30 --type file --progress
+  --propagate-changes --older-than 30 --type file --progress
 
 # Bulk ownership changes from CSV (preview first)
 ./grumpwalk.py --host cluster.example.com --path /data \
   --change-owners-file owner_migration.csv \
-  --propagate-owner-changes --dry-run
+  --propagate-changes --dry-run
 
 # Domain migration (AD to AD)
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --change-owner 'OLDDOMAIN\jsmith:NEWDOMAIN\jsmith' \
   --change-group 'OLDDOMAIN\Engineering:NEWDOMAIN\Engineering' \
-  --propagate-owner-changes --progress
+  --propagate-changes --progress
 ```
 
 ### ACE Manipulation Examples
@@ -572,11 +572,11 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 # Add a new ACE with file+directory inheritance
 ./grumpwalk.py --host cluster.example.com --path /projects \
-  --add-ace 'Allow:fd:jsmith:Modify' --propagate-ace-changes --progress
+  --add-ace 'Allow:fd:jsmith:Modify' --propagate-changes --progress
 
 # Replace an existing ACE (change FullControl to Read, same type)
 ./grumpwalk.py --host cluster.example.com --path /data \
-  --replace-ace 'Allow:fd:contractors:Read' --propagate-ace-changes
+  --replace-ace 'Allow:fd:contractors:Read' --propagate-changes
 
 # Change ACE type from Allow to Deny (using --new-ace)
 ./grumpwalk.py --host cluster.example.com --path /restricted \
@@ -588,7 +588,7 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 # Remove write permission while keeping other rights
 ./grumpwalk.py --host cluster.example.com --path /archive \
-  --remove-rights 'Allow:Everyone:w' --propagate-ace-changes
+  --remove-rights 'Allow:Everyone:w' --propagate-changes
 
 # Backup ACLs before making changes
 ./grumpwalk.py --host cluster.example.com --path /important \
@@ -596,7 +596,7 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 # Clone ACEs from one user to another (copies all Allow and Deny ACEs)
 ./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-source 'bob' --clone-ace-target 'joe' --propagate-ace-changes
+  --clone-ace-source 'bob' --clone-ace-target 'joe' --propagate-changes
 
 # Clone ACEs using UID numbers
 ./grumpwalk.py --host cluster.example.com --path /data \
@@ -608,11 +608,11 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 # Sync target ACEs to match source rights (updates existing target ACEs)
 ./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-source 'bob' --clone-ace-target 'joe' --sync-cloned-aces --propagate-ace-changes
+  --clone-ace-source 'bob' --clone-ace-target 'joe' --sync-cloned-aces --propagate-changes
 
 # Domain migration - replace all OLDDOMAIN trustees with NEWDOMAIN (from CSV)
 ./grumpwalk.py --host cluster.example.com --path /data \
-  --migrate-trustees domain_migration.csv --propagate-ace-changes --progress
+  --migrate-trustees domain_migration.csv --propagate-changes --progress
 
 # Dry run domain migration first
 ./grumpwalk.py --host cluster.example.com --path /data \
@@ -620,11 +620,11 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 # Bulk clone from CSV file (multiple source:target pairs)
 ./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-map team_permissions.csv --propagate-ace-changes
+  --clone-ace-map team_permissions.csv --propagate-changes
 
 # Bulk clone with sync (updates existing target ACEs to match source)
 ./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-map team_permissions.csv --sync-cloned-aces --propagate-ace-changes
+  --clone-ace-map team_permissions.csv --sync-cloned-aces --propagate-changes
 ```
 
 ### Find similar files with custom sampling
