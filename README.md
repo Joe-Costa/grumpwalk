@@ -251,6 +251,7 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 - `--replace-ace 'Type:Trustee' --new-ace 'Type:Flags:Trustee:Rights'` - Replace with different ACE (can change type)
 - `--add-rights 'Type:Trustee:Rights'` - Add rights to existing ACE (e.g., `'Allow:Everyone:rx'`)
 - `--remove-rights 'Type:Trustee:Rights'` - Remove specific rights from existing ACE (keeps other rights)
+- `--clone-ace-source 'Trustee' --clone-ace-target 'Trustee'` - Clone all ACEs from source to target trustee
 
 **Quick Reference:**
 
@@ -262,9 +263,12 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 | `--add-ace` | `'Allow:fd:Everyone:rx'` | Create new ACE (or merge if exists) |
 | `--replace-ace` | `'Allow:fd:Everyone:rx'` | Replace ACE's flags and rights entirely |
 | `--replace-ace` + `--new-ace` | `'Allow:User' 'Deny:fd:User:w'` | Change ACE type (Allow to Deny) |
+| `--clone-ace-source` + `--clone-ace-target` | `'bob' 'joe'` | Copy all of bob's ACEs to joe |
+| `--sync-cloned-aces` | (with clone flags) | Update existing target ACEs to match source |
 
 **Supporting Flags:**
 - `--propagate-ace-changes` - Apply ACE changes to all children recursively
+- `--sync-cloned-aces` - When cloning, update existing target ACEs to match source rights
 - `--dry-run` - Preview changes without applying them
 - `--ace-backup FILE` - Save original ACLs to JSON before modification
 
@@ -293,6 +297,7 @@ Flags (inheritance):
 
 - **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists. `--replace-ace` completely replaces the existing ACE's flags and rights with the new values.
 - **--replace-ace with --new-ace**: When paired with `--new-ace`, you can change the ACE type (Allow to Deny or vice versa). The `--replace-ace` pattern specifies which ACE to find, and `--new-ace` specifies the full replacement. These must be positionally adjacent and paired 1:1.
+- **--clone-ace-source/--clone-ace-target**: Clones ALL ACEs (both Allow and Deny) from source trustee to target trustee, preserving flags and rights. By default, skips if target already has an ACE of the same type. Use `--sync-cloned-aces` to update existing target ACEs to match source rights. Supports uid:N, gid:N, DOMAIN\\user, and plain name formats.
 - **Canonical ordering**: ACEs are automatically sorted into Windows canonical order (Deny before Allow, Explicit before Inherited).
 - **Empty ACE removal**: If `--remove-rights` removes all rights from an ACE, the ACE is deleted entirely.
 
@@ -494,6 +499,22 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 # Backup ACLs before making changes
 ./grumpwalk.py --host cluster.example.com --path /important \
   --remove-ace 'Allow:tempuser' --ace-backup acl-backup.json
+
+# Clone ACEs from one user to another (copies all Allow and Deny ACEs)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --clone-ace-source 'bob' --clone-ace-target 'joe' --propagate-ace-changes
+
+# Clone ACEs using UID numbers
+./grumpwalk.py --host cluster.example.com --path /data \
+  --clone-ace-source 'uid:1001' --clone-ace-target 'uid:1002'
+
+# Clone ACEs from AD user to another
+./grumpwalk.py --host cluster.example.com --path /projects \
+  --clone-ace-source 'DOMAIN\\olduser' --clone-ace-target 'DOMAIN\\newuser' --dry-run
+
+# Sync target ACEs to match source rights (updates existing target ACEs)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --clone-ace-source 'bob' --clone-ace-target 'joe' --sync-cloned-aces --propagate-ace-changes
 ```
 
 ### Find similar files with custom sampling

@@ -1101,6 +1101,8 @@ def apply_ace_modifications(
     add_rights_patterns: List[dict],
     remove_rights_patterns: List[dict],
     replace_aces: List[Tuple[dict, dict]] = None,
+    clone_patterns: List[dict] = None,
+    sync_cloned_aces: bool = False,
     verbose: bool = False
 ) -> Tuple[dict, dict]:
     """
@@ -1113,7 +1115,8 @@ def apply_ace_modifications(
     4. Add rights to matching ACEs (merge)
     5. Replace ACEs (full replacement or type-changing replacement)
     6. Add new ACEs (merge if same type+trustee exists)
-    7. Re-sort into canonical order
+    7. Clone ACEs from source trustee to target trustee (or sync if exists)
+    8. Re-sort into canonical order
 
     Args:
         acl: ACL dict to modify
@@ -1124,22 +1127,30 @@ def apply_ace_modifications(
         replace_aces: List of tuples (find_pattern, new_ace_pattern).
                       If new_ace_pattern is None, in-place replacement.
                       If new_ace_pattern is provided, full replacement (can change type).
+        clone_patterns: List of dicts with source_auth_id, target_auth_id, target_identity
+                       for cloning ACEs from one trustee to another.
+        sync_cloned_aces: If True, update existing target ACEs to match source rights.
+                         If False (default), skip if target ACE already exists.
 
     Returns:
         Tuple of (modified_acl, stats_dict)
-        stats_dict has keys: removed, added, modified, inheritance_broken
+        stats_dict has keys: removed, added, modified, cloned, synced, inheritance_broken
     """
     import copy
     result = copy.deepcopy(acl)
 
     if replace_aces is None:
         replace_aces = []
+    if clone_patterns is None:
+        clone_patterns = []
 
     stats = {
         'removed': 0,
         'added': 0,
         'modified': 0,
         'replaced': 0,
+        'cloned': 0,
+        'synced': 0,
         'inheritance_broken': False,
     }
 
@@ -1325,7 +1336,87 @@ def apply_ace_modifications(
             aces.append(new_ace)
             stats['added'] += 1
 
-    # 7. Re-sort into canonical order
+    # 7. Clone ACEs from source trustee to target trustee (or sync if exists)
+    for cp in clone_patterns:
+        source_auth_id = cp.get('source_auth_id')
+        target_auth_id = cp.get('target_auth_id')
+
+        if not source_auth_id or not target_auth_id:
+            if verbose:
+                print(f"[DEBUG] Skipping clone pattern - missing auth_id: "
+                      f"source={source_auth_id}, target={target_auth_id}", file=sys.stderr)
+            continue
+
+        # Find all ACEs matching the source trustee (any type)
+        cloned_count = 0
+        synced_count = 0
+        for ace in aces[:]:  # Iterate over copy since we're appending
+            # Get the auth_id from the ACE trustee
+            ace_trustee = ace.get('trustee')
+            if isinstance(ace_trustee, dict):
+                ace_auth_id = str(ace_trustee.get('auth_id', ''))
+            else:
+                ace_auth_id = str(ace_trustee) if ace_trustee else ''
+
+            # Match by source auth_id
+            if ace_auth_id == str(source_auth_id):
+                # Check if a target ACE already exists (same type)
+                target_ace = None
+                for existing_ace in aces:
+                    existing_trustee = existing_ace.get('trustee')
+                    if isinstance(existing_trustee, dict):
+                        existing_auth_id = str(existing_trustee.get('auth_id', ''))
+                    else:
+                        existing_auth_id = str(existing_trustee) if existing_trustee else ''
+
+                    if (existing_auth_id == str(target_auth_id) and
+                            existing_ace.get('type') == ace.get('type')):
+                        target_ace = existing_ace
+                        break
+
+                if target_ace is not None:
+                    # Target ACE exists
+                    if sync_cloned_aces:
+                        # Sync mode: update existing target ACE with source rights and flags
+                        target_ace['rights'] = list(ace.get('rights', []))
+                        target_ace['flags'] = list(ace.get('flags', []))
+                        synced_count += 1
+                        if verbose:
+                            print(f"[DEBUG] Synced {ace.get('type')} ACE for {target_auth_id} "
+                                  f"with rights from {source_auth_id}", file=sys.stderr)
+                    else:
+                        # Default: skip if target already exists
+                        if verbose:
+                            print(f"[DEBUG] Clone skipped - {ace.get('type')} ACE already exists "
+                                  f"for target trustee {target_auth_id}", file=sys.stderr)
+                else:
+                    # Target ACE does not exist - create a clone
+                    # Use raw trustee name and _needs_resolution marker
+                    # so it gets resolved like other new ACEs
+                    cloned_ace = {
+                        'type': ace.get('type'),
+                        'flags': list(ace.get('flags', [])),  # Copy flags
+                        'trustee': cp.get('target_trustee'),  # Raw trustee name
+                        'rights': list(ace.get('rights', [])),  # Copy rights
+                        '_needs_resolution': True,  # Will be resolved before PUT
+                    }
+                    aces.append(cloned_ace)
+                    cloned_count += 1
+                    if verbose:
+                        print(f"[DEBUG] Cloned {ace.get('type')} ACE from {source_auth_id} "
+                              f"to {cp.get('target_trustee')}", file=sys.stderr)
+
+        stats['cloned'] += cloned_count
+        stats['synced'] += synced_count
+        if verbose:
+            if cloned_count > 0:
+                print(f"[DEBUG] Cloned {cloned_count} ACE(s) from {cp.get('source_trustee')} "
+                      f"to {cp.get('target_trustee')}", file=sys.stderr)
+            if synced_count > 0:
+                print(f"[DEBUG] Synced {synced_count} ACE(s) for {cp.get('target_trustee')} "
+                      f"from {cp.get('source_trustee')}", file=sys.stderr)
+
+    # 8. Re-sort into canonical order
     aces = sort_aces_canonical(aces)
 
     inner['aces'] = aces
@@ -2761,14 +2852,14 @@ async def main_async(args):
     # Check if any ACE manipulation flags are specified
     ace_manipulation_mode = (
         args.remove_aces or args.add_aces or args.replace_aces or
-        args.add_rights or args.remove_rights
+        args.add_rights or args.remove_rights or args.clone_ace_sources
     )
 
     # Check for mutually exclusive flags: ACL cloning vs ACE manipulation
     acl_cloning_mode = args.source_acl or args.source_acl_file
     if ace_manipulation_mode and acl_cloning_mode:
         print("[ERROR] ACL cloning (--source-acl, --source-acl-file, --acl-target) cannot be combined with", file=sys.stderr)
-        print("        ACE manipulation (--add-ace, --remove-ace, --replace-ace, --add-rights, --remove-rights)", file=sys.stderr)
+        print("        ACE manipulation (--add-ace, --remove-ace, --replace-ace, --add-rights, --remove-rights, --clone-ace-*)", file=sys.stderr)
         print("", file=sys.stderr)
         print("        Use ACL cloning to copy an entire ACL from one path to another.", file=sys.stderr)
         print("        Use ACE manipulation to surgically modify individual ACEs.", file=sys.stderr)
@@ -2814,6 +2905,23 @@ async def main_async(args):
                     print(f"        Expected: --replace-ace 'FIND' --new-ace 'REPLACE'", file=sys.stderr)
                     sys.exit(1)
 
+        # Validate --clone-ace-source / --clone-ace-target pairing
+        clone_source_count = len(args.clone_ace_sources) if args.clone_ace_sources else 0
+        clone_target_count = len(args.clone_ace_targets) if args.clone_ace_targets else 0
+
+        if clone_source_count > 0 and clone_target_count == 0:
+            print("[ERROR] --clone-ace-source requires --clone-ace-target", file=sys.stderr)
+            sys.exit(1)
+
+        if clone_target_count > 0 and clone_source_count == 0:
+            print("[ERROR] --clone-ace-target requires --clone-ace-source", file=sys.stderr)
+            sys.exit(1)
+
+        if clone_source_count != clone_target_count:
+            print(f"[ERROR] --clone-ace-source and --clone-ace-target must be paired 1:1", file=sys.stderr)
+            print(f"        Found {clone_source_count} --clone-ace-source and {clone_target_count} --clone-ace-target", file=sys.stderr)
+            sys.exit(1)
+
         print("\n[INFO] ACE Manipulation Mode", file=sys.stderr)
         print("=" * 70, file=sys.stderr)
 
@@ -2823,6 +2931,7 @@ async def main_async(args):
         replace_patterns = []
         add_rights_patterns = []
         remove_rights_patterns = []
+        clone_patterns = []  # List of (source_trustee, target_trustee) tuples
 
         if args.remove_aces:
             for pattern in args.remove_aces:
@@ -2882,6 +2991,15 @@ async def main_async(args):
                 else:
                     sys.exit(1)
 
+        if args.clone_ace_sources:
+            for i, source in enumerate(args.clone_ace_sources):
+                target = args.clone_ace_targets[i]
+                # Store as dict with source and target trustees (will be resolved later)
+                clone_patterns.append({
+                    'source_trustee': source,
+                    'target_trustee': target,
+                })
+
         # Show what will be done
         if remove_patterns:
             print(f"ACEs to remove:    {len(remove_patterns)}", file=sys.stderr)
@@ -2899,6 +3017,12 @@ async def main_async(args):
             print(f"Rights to add:     {len(add_rights_patterns)}", file=sys.stderr)
         if remove_rights_patterns:
             print(f"Rights to remove:  {len(remove_rights_patterns)}", file=sys.stderr)
+        if clone_patterns:
+            print(f"ACEs to clone:     {len(clone_patterns)}", file=sys.stderr)
+            for cp in clone_patterns:
+                print(f"                   {cp['source_trustee']} -> {cp['target_trustee']}", file=sys.stderr)
+            if args.sync_cloned_aces:
+                print(f"Sync mode:         Enabled (existing target ACEs will be updated)", file=sys.stderr)
         if args.propagate_ace_changes:
             print(f"Propagate:         Enabled", file=sys.stderr)
         if args.dry_run:
@@ -2914,6 +3038,70 @@ async def main_async(args):
                 if new_pat is not None:
                     replace_flat.append(new_pat)
             all_patterns = remove_patterns + add_rights_patterns + remove_rights_patterns + add_patterns + replace_flat
+
+            # Resolve clone pattern trustees (both source and target)
+            if clone_patterns:
+                print(f"\n[INFO] Resolving clone trustee identities...", file=sys.stderr)
+                for cp in clone_patterns:
+                    # Resolve source trustee
+                    source = cp['source_trustee']
+                    print(f"[INFO] Resolving source trustee '{source}'...", file=sys.stderr)
+
+                    # Use parse_trustee to get the right format for identity resolution
+                    source_spec = parse_trustee(source)
+                    source_payload = source_spec['payload']
+                    source_id_type = source_spec['type']
+
+                    # Extract identifier from payload
+                    if source_id_type == 'uid':
+                        source_identifier = source_payload.get('uid')
+                    elif source_id_type == 'gid':
+                        source_identifier = source_payload.get('gid')
+                    elif source_id_type == 'sid':
+                        source_identifier = source_payload.get('sid')
+                    elif source_id_type == 'auth_id':
+                        source_identifier = source_payload.get('auth_id')
+                    else:  # name
+                        source_identifier = source_payload.get('name')
+
+                    result = await client.resolve_identity(session, source_identifier, source_id_type)
+                    if result and result.get('auth_id'):
+                        cp['source_auth_id'] = str(result['auth_id'])
+                        print(f"[INFO] Resolved source '{source}' -> auth_id {cp['source_auth_id']}", file=sys.stderr)
+                    else:
+                        print(f"[ERROR] Could not resolve source trustee: {source}", file=sys.stderr)
+                        sys.exit(1)
+
+                    # Resolve target trustee
+                    target = cp['target_trustee']
+                    print(f"[INFO] Resolving target trustee '{target}'...", file=sys.stderr)
+
+                    # Use parse_trustee to get the right format for identity resolution
+                    target_spec = parse_trustee(target)
+                    target_payload = target_spec['payload']
+                    target_id_type = target_spec['type']
+
+                    # Extract identifier from payload
+                    if target_id_type == 'uid':
+                        target_identifier = target_payload.get('uid')
+                    elif target_id_type == 'gid':
+                        target_identifier = target_payload.get('gid')
+                    elif target_id_type == 'sid':
+                        target_identifier = target_payload.get('sid')
+                    elif target_id_type == 'auth_id':
+                        target_identifier = target_payload.get('auth_id')
+                    else:  # name
+                        target_identifier = target_payload.get('name')
+
+                    result = await client.resolve_identity(session, target_identifier, target_id_type)
+                    if result and result.get('auth_id'):
+                        cp['target_auth_id'] = str(result['auth_id'])
+                        cp['target_identity'] = result  # Store full identity for ACE creation
+                        print(f"[INFO] Resolved target '{target}' -> auth_id {cp['target_auth_id']}", file=sys.stderr)
+                    else:
+                        print(f"[ERROR] Could not resolve target trustee: {target}", file=sys.stderr)
+                        sys.exit(1)
+
             if all_patterns:
                 print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
                 await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
@@ -2940,6 +3128,8 @@ async def main_async(args):
                 add_rights_patterns,
                 remove_rights_patterns,
                 replace_aces=replace_patterns,
+                clone_patterns=clone_patterns,
+                sync_cloned_aces=args.sync_cloned_aces,
                 verbose=args.verbose
             )
 
@@ -2949,6 +3139,8 @@ async def main_async(args):
             print(f"  ACEs added:           {stats['added']}", file=sys.stderr)
             print(f"  ACEs replaced:        {stats['replaced']}", file=sys.stderr)
             print(f"  ACEs modified:        {stats['modified']}", file=sys.stderr)
+            print(f"  ACEs cloned:          {stats['cloned']}", file=sys.stderr)
+            print(f"  ACEs synced:          {stats['synced']}", file=sys.stderr)
             if stats['inheritance_broken']:
                 print(f"  Inheritance:          BROKEN (converted to explicit)", file=sys.stderr)
 
@@ -4536,6 +4728,34 @@ Examples:
         metavar="PATTERN",
         help="Remove rights from existing ACE with 'Type:Trustee:Rights'. "
              "Example: --remove-rights 'Allow:Group111:Write'"
+    )
+
+    ace_manipulation.add_argument(
+        "--clone-ace-source",
+        action="append",
+        dest="clone_ace_sources",
+        metavar="TRUSTEE",
+        help="Source trustee for ACE cloning. Must be paired with --clone-ace-target. "
+             "Clones all ACEs (Allow and Deny) from source to target trustee. "
+             "Supports names, uid:N, gid:N, DOMAIN\\\\user formats. "
+             "Example: --clone-ace-source 'Bob' --clone-ace-target 'Joe'"
+    )
+
+    ace_manipulation.add_argument(
+        "--clone-ace-target",
+        action="append",
+        dest="clone_ace_targets",
+        metavar="TRUSTEE",
+        help="Target trustee for ACE cloning. Must be paired with --clone-ace-source. "
+             "Example: --clone-ace-source 'uid:1001' --clone-ace-target 'uid:1002'"
+    )
+
+    ace_manipulation.add_argument(
+        "--sync-cloned-aces",
+        action="store_true",
+        help="When used with --clone-ace-source/--clone-ace-target, update existing "
+             "target ACEs to match source ACE rights. Without this flag, existing "
+             "target ACEs are left unchanged."
     )
 
     ace_manipulation.add_argument(
