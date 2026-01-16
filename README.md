@@ -250,7 +250,18 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 - `--replace-ace 'Type:Flags:Trustee:Rights'` - Replace existing ACE (in-place, same type)
 - `--replace-ace 'Type:Trustee' --new-ace 'Type:Flags:Trustee:Rights'` - Replace with different ACE (can change type)
 - `--add-rights 'Type:Trustee:Rights'` - Add rights to existing ACE (e.g., `'Allow:Everyone:rx'`)
-- `--remove-rights 'Type:Trustee:Rights'` - Remove rights from existing ACE
+- `--remove-rights 'Type:Trustee:Rights'` - Remove specific rights from existing ACE (keeps other rights)
+
+**Quick Reference:**
+
+| Operation | Example | Use Case |
+|-----------|---------|----------|
+| `--remove-ace` | `'Allow:Everyone'` | Revoke all access for a trustee |
+| `--remove-rights` | `'Allow:Everyone:w'` | Remove write but keep read/execute |
+| `--add-rights` | `'Allow:Everyone:x'` | Add execute to existing ACE |
+| `--add-ace` | `'Allow:fd:Everyone:rx'` | Create new ACE (or merge if exists) |
+| `--replace-ace` | `'Allow:fd:Everyone:rx'` | Replace ACE's flags and rights entirely |
+| `--replace-ace` + `--new-ace` | `'Allow:User' 'Deny:fd:User:w'` | Change ACE type (Allow to Deny) |
 
 **Supporting Flags:**
 - `--propagate-ace-changes` - Apply ACE changes to all children recursively
