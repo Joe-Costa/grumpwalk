@@ -924,12 +924,51 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
 
 ### How do I lock down a directory during investigation?
 
-**Backup current ACLs:**
+**Backup current ACLs and add deny:**
 ```bash
 ./grumpwalk.py --host cluster --path /investigation \
   --add-ace "Deny::Everyone:w" \
   --ace-backup investigation_original_acls.json \
   --propagate-changes --progress
+```
+
+### How do I restore ACLs after investigation is complete?
+
+**Preview the restore (dry run):**
+```bash
+./grumpwalk.py --host cluster \
+  --ace-restore investigation_original_acls.json --dry-run
+```
+
+**Restore ACLs to the original path:**
+```bash
+./grumpwalk.py --host cluster \
+  --ace-restore investigation_original_acls.json
+```
+
+**Restore and propagate to all children:**
+```bash
+./grumpwalk.py --host cluster \
+  --ace-restore investigation_original_acls.json \
+  --propagate-changes --progress
+```
+
+**If the file/directory was renamed, use --force-restore:**
+```bash
+# The backup contains the original file_id for safety verification
+# If the current path has a different file_id (e.g., path was reused),
+# grumpwalk will refuse to restore unless --force-restore is used
+./grumpwalk.py --host cluster \
+  --ace-restore investigation_original_acls.json \
+  --force-restore
+```
+
+**Restore to a different path:**
+```bash
+# Use --path to override the original path stored in the backup
+./grumpwalk.py --host cluster --path /new/location \
+  --ace-restore investigation_original_acls.json \
+  --force-restore --propagate-changes
 ```
 
 ---
@@ -1320,6 +1359,8 @@ done
 | Change owner | `--change-owner 'old:new' --propagate-changes` |
 | Change group | `--change-group 'old:new' --propagate-changes` |
 | Bulk owner migration | `--change-owners-file migration.csv --propagate-changes` |
+| Backup ACL | `--ace-backup backup.json` (with any ACE operation) |
+| Restore ACL | `--ace-restore backup.json` |
 | Find duplicates | `--find-similar --progress` |
 | Dry run | `--dry-run` (add to any modification command) |
 
@@ -1378,6 +1419,22 @@ Works with:
 - Owner/group changes (`--change-owner`, `--change-group`)
 - Trustee migration (`--migrate-trustees`)
 - ACE cloning (`--clone-ace-source/--clone-ace-target`)
+- ACL restore (`--ace-restore`)
+
+### ACL Backup and Restore
+
+| Operation | Command |
+|-----------|---------|
+| Backup ACL | `--ace-backup backup.json` (with any ACE operation) |
+| Restore ACL | `--ace-restore backup.json` |
+| Preview restore | `--ace-restore backup.json --dry-run` |
+| Force restore | `--ace-restore backup.json --force-restore` |
+
+The backup file includes:
+- Original path
+- File ID (for safety verification)
+- Complete ACL with all ACEs
+- Timestamp
 
 ---
 

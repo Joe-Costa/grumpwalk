@@ -3110,6 +3110,139 @@ async def main_async(args):
 
         return  # Exit after ACL operation
 
+    # ACE RESTORE MODE
+    # Restore ACLs from a backup file created by --ace-backup
+    if args.ace_restore:
+        import json
+
+        print("\n[INFO] ACE Restore Mode", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(f"Backup file:       {args.ace_restore}", file=sys.stderr)
+
+        # Load the backup file
+        try:
+            with open(args.ace_restore, 'r') as f:
+                backup_data = json.load(f)
+        except FileNotFoundError:
+            print(f"[ERROR] Backup file not found: {args.ace_restore}", file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Invalid JSON in backup file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Extract backup data
+        backup_path = backup_data.get('path')
+        backup_file_id = backup_data.get('file_id')
+        backup_acl = backup_data.get('original_acl')
+        backup_timestamp = backup_data.get('timestamp')
+
+        if not backup_path or not backup_acl:
+            print("[ERROR] Backup file is missing required fields (path, original_acl)", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Original path:     {backup_path}", file=sys.stderr)
+        if backup_file_id:
+            print(f"File ID:           {backup_file_id}", file=sys.stderr)
+        if backup_timestamp:
+            print(f"Backup timestamp:  {backup_timestamp}", file=sys.stderr)
+
+        # Determine target path (use --path if provided, otherwise use backup path)
+        target_path = args.path if args.path else backup_path
+        print(f"Target path:       {target_path}", file=sys.stderr)
+
+        # Count ACEs in backup
+        acl_inner = backup_acl.get('acl', backup_acl)
+        backup_aces = acl_inner.get('aces', [])
+        print(f"ACEs to restore:   {len(backup_aces)}", file=sys.stderr)
+
+        if args.dry_run:
+            print(f"Dry run:           Enabled (no changes will be made)", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+
+        async with client.create_session() as session:
+            # Get current file attributes to verify file_id
+            current_attr = await client.get_file_attr(session, target_path)
+
+            if not current_attr:
+                print(f"[ERROR] Could not retrieve attributes from {target_path}", file=sys.stderr)
+                print("        The path may not exist or you may not have permission to access it.", file=sys.stderr)
+                sys.exit(1)
+
+            current_file_id = current_attr.get('id')
+
+            # Verify file_id matches (safety check)
+            if backup_file_id and current_file_id:
+                if str(backup_file_id) != str(current_file_id):
+                    print(f"\n[WARNING] File ID mismatch detected!", file=sys.stderr)
+                    print(f"          Backup file ID:  {backup_file_id}", file=sys.stderr)
+                    print(f"          Current file ID: {current_file_id}", file=sys.stderr)
+                    print(f"          This may indicate the path now refers to a different file.", file=sys.stderr)
+
+                    if not args.force_restore:
+                        print(f"\n[ERROR] Refusing to restore due to file ID mismatch.", file=sys.stderr)
+                        print(f"        Use --force-restore to override this safety check.", file=sys.stderr)
+                        sys.exit(1)
+                    else:
+                        print(f"\n[WARNING] Proceeding with restore due to --force-restore flag.", file=sys.stderr)
+                else:
+                    print(f"[INFO] File ID verified: {current_file_id}", file=sys.stderr)
+            elif backup_file_id and not current_file_id:
+                print(f"[WARNING] Could not verify file ID (current file has no ID)", file=sys.stderr)
+            elif not backup_file_id:
+                print(f"[WARNING] Backup does not contain file_id (older backup format)", file=sys.stderr)
+
+            # Dry run: show what would be restored
+            if args.dry_run:
+                print("\n[DRY RUN] Would restore the following ACL:", file=sys.stderr)
+                print("-" * 60, file=sys.stderr)
+                for i, ace in enumerate(backup_aces):
+                    ace_str = qacl_ace_to_readable(ace, is_dir=True)
+                    print(f"  {i+1}. {ace_str}", file=sys.stderr)
+                print("-" * 60, file=sys.stderr)
+                print("[DRY RUN] No changes were made.", file=sys.stderr)
+                return
+
+            # Apply the backed-up ACL
+            print(f"\n[INFO] Restoring ACL to: {target_path}", file=sys.stderr)
+            success, error = await client.set_file_acl(session, target_path, backup_acl, mark_inherited=False)
+
+            if not success:
+                print(f"[ERROR] Failed to restore ACL: {error}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"[INFO] ACL restored successfully ({len(backup_aces)} ACEs)", file=sys.stderr)
+
+            # Propagate if requested
+            if args.propagate_changes:
+                print(f"\n[INFO] Propagating restored ACL to children of: {target_path}", file=sys.stderr)
+
+                # Resolve owner filters if any
+                owner_auth_ids = None
+                if args.owners:
+                    owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+
+                file_filter = create_file_filter(args, owner_auth_ids)
+
+                propagate_stats = await apply_acl_to_tree(
+                    client=client,
+                    session=session,
+                    acl_data=backup_acl,
+                    target_path=target_path,
+                    propagate=True,
+                    file_filter=file_filter,
+                    progress=args.progress,
+                    continue_on_error=args.continue_on_error,
+                    args=args,
+                    acl_concurrency=args.acl_concurrency
+                )
+
+                print(f"\n[INFO] Propagation complete:", file=sys.stderr)
+                print(f"  Objects changed:  {propagate_stats['objects_changed']:,}", file=sys.stderr)
+                print(f"  Objects failed:   {propagate_stats['objects_failed']:,}", file=sys.stderr)
+
+        print("\n[INFO] ACE restore complete", file=sys.stderr)
+        return  # Exit after ACE restore
+
     # ACE MANIPULATION MODE
     # Check if any ACE manipulation flags are specified
     ace_manipulation_mode = (
@@ -3477,13 +3610,17 @@ async def main_async(args):
                 print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
                 await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
 
-            # Step 2: Get current ACL from path
+            # Step 2: Get current ACL and file attributes from path
             print(f"[INFO] Retrieving ACL from: {args.path}", file=sys.stderr)
             current_acl = await client.get_file_acl(session, args.path)
+            file_attr = await client.get_file_attr(session, args.path)
 
             if not current_acl:
                 print(f"[ERROR] Could not retrieve ACL from {args.path}", file=sys.stderr)
                 sys.exit(1)
+
+            # Extract file_id for backup safety (allows restore even if path is renamed)
+            file_id = file_attr.get('id') if file_attr else None
 
             # Show current ACL summary
             acl_inner = current_acl.get('acl', current_acl)
@@ -3547,6 +3684,7 @@ async def main_async(args):
                 import json
                 backup_data = {
                     'path': args.path,
+                    'file_id': file_id,
                     'original_acl': current_acl,
                     'timestamp': datetime.now(timezone.utc).isoformat()
                 }
@@ -3554,6 +3692,8 @@ async def main_async(args):
                     with open(args.ace_backup, 'w') as f:
                         json.dump(backup_data, f, indent=2)
                     print(f"[INFO] Backup saved to: {args.ace_backup}", file=sys.stderr)
+                    if file_id:
+                        print(f"[INFO] File ID {file_id} recorded for safety verification", file=sys.stderr)
                 except Exception as e:
                     print(f"[ERROR] Failed to save backup: {e}", file=sys.stderr)
                     sys.exit(1)
@@ -5616,6 +5756,19 @@ Examples:
         "--ace-backup",
         metavar="FILE",
         help="Save original ACLs to JSON file before making changes"
+    )
+
+    ace_manipulation.add_argument(
+        "--ace-restore",
+        metavar="FILE",
+        help="Restore ACLs from a backup file created by --ace-backup. "
+             "Verifies file_id matches to prevent accidental overwrites if path was renamed."
+    )
+
+    ace_manipulation.add_argument(
+        "--force-restore",
+        action="store_true",
+        help="Force ACL restore even if file_id does not match (use with caution)"
     )
 
     # ============================================================================
