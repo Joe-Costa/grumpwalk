@@ -19,6 +19,7 @@ A practical guide with recipes for common storage administration tasks using gru
 11. [Reporting and Analytics](#reporting-and-analytics)
 12. [Performance Optimization](#performance-optimization)
 13. [Scripting and Automation](#scripting-and-automation)
+14. [Combining Filters with Actions](#combining-filters-with-actions)
 
 ---
 
@@ -1377,5 +1378,230 @@ Works with:
 - Owner/group changes (`--change-owner`, `--change-group`)
 - Trustee migration (`--migrate-trustees`)
 - ACE cloning (`--clone-ace-source/--clone-ace-target`)
+
+---
+
+## Combining Filters with Actions
+
+One of grumpwalk's most powerful capabilities is combining multiple filters with modification actions. This allows surgical precision when making changes across large file systems.
+
+### Complex Ownership Migration with Exclusions
+
+**Scenario:** Change owners from multiple sources, but only for large cold files, excluding archive directories:
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --change-owner "DOMAIN\\joe:DOMAIN\\bob" \
+  --change-owner "uid:1000:uid:3000" \
+  --larger-than 100GB \
+  --accessed --older-than 30 \
+  --omit-path /data/deep_archive \
+  --type file \
+  --propagate-changes --progress
+```
+
+This command:
+- Changes owner from `DOMAIN\joe` to `DOMAIN\bob`
+- Also changes owner from `uid:1000` to `uid:3000`
+- Only affects files larger than 100GB
+- Only affects files not accessed in 30+ days
+- Excludes everything under `/data/deep_archive`
+- Only processes files (not directories)
+
+### Targeted Permission Cleanup by File Age and Type
+
+**Scenario:** Remove "Everyone" access from old documents, but keep it on recent files and exclude temp directories:
+
+```bash
+./grumpwalk.py --host cluster --path /shared \
+  --remove-ace "Allow:Everyone" \
+  --name "*.docx" --name "*.xlsx" --name "*.pdf" \
+  --modified --older-than 90 \
+  --omit-subdirs "temp" --omit-subdirs ".tmp" \
+  --type file \
+  --propagate-changes --dry-run
+```
+
+### Contractor Offboarding with Scope Limits
+
+**Scenario:** Remove contractor access and transfer ownership, but only in project directories and only 3 levels deep:
+
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --remove-ace "Allow:DOMAIN\\contractor_group" \
+  --change-owner "DOMAIN\\contractor1:DOMAIN\\project_lead" \
+  --max-depth 3 \
+  --omit-subdirs ".git" --omit-subdirs "node_modules" \
+  --propagate-changes --progress
+```
+
+### Size-Based Permission Tiering
+
+**Scenario:** Large media files should only be accessible by the media team, not general users:
+
+```bash
+./grumpwalk.py --host cluster --path /media \
+  --remove-ace "Allow:Domain Users" \
+  --add-ace "Allow:fd:Media_Team:Modify" \
+  --larger-than 1GB \
+  --name "*.mov" --name "*.mp4" --name "*.mxf" --name "*.r3d" \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Stale Data Ownership Consolidation
+
+**Scenario:** Transfer ownership of all files not accessed in 2 years to an archive administrator, but only in specific departments:
+
+```bash
+./grumpwalk.py --host cluster --path /home \
+  --change-owner "DOMAIN\\departed_user1:DOMAIN\\archive_admin" \
+  --change-owner "DOMAIN\\departed_user2:DOMAIN\\archive_admin" \
+  --change-owner "DOMAIN\\departed_user3:DOMAIN\\archive_admin" \
+  --accessed --older-than 730 \
+  --omit-path /home/executives \
+  --omit-path /home/legal \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Compliance-Driven Permission Lockdown
+
+**Scenario:** Make financial documents read-only for everyone except finance team after fiscal year close:
+
+```bash
+./grumpwalk.py --host cluster --path /finance/FY2024 \
+  --remove-rights "Allow:Domain Users:w" \
+  --add-ace "Allow:fd:Finance_Team:Modify" \
+  --name "*.xlsx" --name "*.pdf" --name "*.csv" \
+  --created --older-than 365 \
+  --type file \
+  --propagate-changes --ace-backup fy2024_acl_backup.json \
+  --progress
+```
+
+### Multi-Domain Migration with File Type Filtering
+
+**Scenario:** Migrate ACEs and ownership from old domain to new, but only for source code files:
+
+```bash
+./grumpwalk.py --host cluster --path /development \
+  --migrate-trustees domain_migration.csv \
+  --change-owners-file owner_migration.csv \
+  --name "*.py" --name "*.js" --name "*.java" --name "*.go" --name "*.rs" \
+  --omit-subdirs "vendor" --omit-subdirs "node_modules" --omit-subdirs ".venv" \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Ransomware Recovery Permission Reset
+
+**Scenario:** After a security incident, reset permissions on recently modified files while excluding known-good directories:
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --remove-ace "Allow:Everyone" \
+  --remove-ace "Allow:Authenticated Users" \
+  --add-ace "Allow:fd:IT_Admins:FullControl" \
+  --modified --newer-than 7 \
+  --omit-path /data/system \
+  --omit-path /data/backups \
+  --type file \
+  --propagate-changes --ace-backup incident_recovery_backup.json \
+  --progress
+```
+
+### Selective Group Migration for NFS to AD Transition
+
+**Scenario:** Migrate group ownership from NFS GIDs to AD groups, but only for files owned by specific UIDs:
+
+```bash
+./grumpwalk.py --host cluster --path /nfs-share \
+  --change-group "gid:100:DOMAIN\\Engineering" \
+  --change-group "gid:200:DOMAIN\\Sales" \
+  --owner 1001 --owner 1002 --owner 1003 --uid \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Project Handoff with Comprehensive Filters
+
+**Scenario:** Transfer a project from one team to another - change owners, groups, and permissions, but only for active project files:
+
+```bash
+./grumpwalk.py --host cluster --path /projects/legacy_app \
+  --change-owner "DOMAIN\\old_lead:DOMAIN\\new_lead" \
+  --change-group "Old_Team:New_Team" \
+  --clone-ace-source "Old_Team" \
+  --clone-ace-target "New_Team" \
+  --remove-ace "Allow:Old_Team" \
+  --modified --newer-than 365 \
+  --omit-subdirs ".git" --omit-subdirs "archive" \
+  --max-depth 5 \
+  --propagate-changes --dry-run
+```
+
+### Quota Enforcement Preparation
+
+**Scenario:** Before implementing quotas, transfer ownership of oversized user directories to a shared service account:
+
+```bash
+./grumpwalk.py --host cluster --path /home \
+  --change-owner "uid:1001:DOMAIN\\storage_service" \
+  --change-owner "uid:1002:DOMAIN\\storage_service" \
+  --larger-than 500GB \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Combining CSV Mappings with Runtime Filters
+
+**Scenario:** Use CSV files for bulk mappings while applying runtime filters:
+
+```bash
+# Create mapping files
+cat > owners.csv << EOF
+source,target
+OLDDOMAIN\user1,NEWDOMAIN\user1
+OLDDOMAIN\user2,NEWDOMAIN\user2
+OLDDOMAIN\service,NEWDOMAIN\service
+EOF
+
+cat > groups.csv << EOF
+source,target
+OLDDOMAIN\Team_A,NEWDOMAIN\Team_A
+OLDDOMAIN\Team_B,NEWDOMAIN\Team_B
+EOF
+
+# Apply with filters
+./grumpwalk.py --host cluster --path /shared \
+  --change-owners-file owners.csv \
+  --change-groups-file groups.csv \
+  --accessed --newer-than 365 \
+  --omit-subdirs ".snapshot" \
+  --type file \
+  --propagate-changes --progress
+```
+
+### Filter Combination Quick Reference
+
+| Filter Type | Flag | Combines With |
+|-------------|------|---------------|
+| Size | `--larger-than`, `--smaller-than` | All actions |
+| Time | `--older-than`, `--newer-than` with `--accessed`, `--modified`, `--created` | All actions |
+| Name | `--name` (OR), `--name-and` (AND) | All actions |
+| Type | `--type file/directory/symlink` | All actions |
+| Owner | `--owner` with `--ad`, `--uid`, `--local` | All actions |
+| Exclusion | `--omit-subdirs`, `--omit-path` | All actions |
+| Depth | `--max-depth` | All propagating actions |
+
+### Best Practices for Complex Operations
+
+1. **Always use `--dry-run` first** - Preview what will change before executing
+2. **Use `--ace-backup`** - Save original ACLs before permission changes
+3. **Start narrow, expand** - Test on a subdirectory before running on entire tree
+4. **Combine `--progress` with `--verbose`** - Monitor what's happening in real-time
+5. **Use `--max-depth` for testing** - Limit scope during validation
+6. **Chain operations carefully** - Some filters may interact unexpectedly; verify with dry-run
 
 
