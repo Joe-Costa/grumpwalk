@@ -543,6 +543,51 @@ OLDDOMAIN\jsmith,NEWDOMAIN\jsmith
   --propagate-changes --progress
 ```
 
+### How do I keep two users' permissions in sync?
+
+Use `--sync-cloned-aces` to update existing ACEs to match the source user's rights.
+
+**Default behavior (without --sync-cloned-aces):**
+```bash
+# If joe already has an Allow ACE, it's skipped (no change)
+./grumpwalk.py --host cluster --path /shared \
+  --clone-ace-source bob --clone-ace-target joe \
+  --propagate-changes
+```
+
+**With --sync-cloned-aces (updates existing ACEs):**
+```bash
+# Joe's existing Allow ACE is updated to match Bob's rights
+./grumpwalk.py --host cluster --path /shared \
+  --clone-ace-source bob --clone-ace-target joe \
+  --sync-cloned-aces \
+  --propagate-changes --progress
+```
+
+**Team member replacement workflow:**
+```bash
+# Alice (leaving) has carefully tuned permissions
+# Bob (replacement) should have identical access
+
+# Step 1: Initial clone - creates ACEs where Bob has none
+./grumpwalk.py --host cluster --path /projects \
+  --clone-ace-source alice --clone-ace-target bob \
+  --propagate-changes --progress
+
+# Step 2: Later, if Alice's permissions changed, sync Bob to match
+./grumpwalk.py --host cluster --path /projects \
+  --clone-ace-source alice --clone-ace-target bob \
+  --sync-cloned-aces \
+  --propagate-changes --progress
+```
+
+**Behavior summary:**
+
+| Scenario | Without --sync-cloned-aces | With --sync-cloned-aces |
+|----------|---------------------------|------------------------|
+| Target has no ACE | Create new ACE | Create new ACE |
+| Target has existing ACE | Skip (no change) | Update rights to match source |
+
 ### How do I implement least privilege access?
 
 Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-permissions-management-best-practices/):
