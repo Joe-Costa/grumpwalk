@@ -2240,6 +2240,95 @@ def load_trustee_mappings(filepath: str, verbose: bool = False) -> List[dict]:
         raise ValueError(f"CSV parsing error in {filepath}: {e}")
 
 
+def parse_owner_change_pattern(pattern: str) -> dict:
+    """
+    Parse 'SOURCE:TARGET' pattern for owner/group changes.
+
+    Handles trustees that contain colons (uid:N, gid:N) by smart splitting.
+
+    Handles:
+    - DOMAIN\\user:DOMAIN\\other
+    - uid:1001:uid:2001
+    - gid:100:gid:200
+    - olduser:newuser
+
+    Args:
+        pattern: The owner/group change pattern
+
+    Returns:
+        {'source': str, 'target': str}
+
+    Raises:
+        ValueError if pattern is invalid
+    """
+    if ':' not in pattern:
+        raise ValueError(
+            f"Invalid owner change pattern '{pattern}'. "
+            f"Expected format: 'SOURCE:TARGET' (e.g., 'olduser:newuser', 'uid:1001:uid:2001')"
+        )
+
+    # Handle special prefixed formats that contain colons
+    # uid:N:uid:M -> split after first uid:N
+    # gid:N:gid:M -> split after first gid:N
+    # auth_id:N:auth_id:M -> split after first auth_id:N
+
+    lower_pattern = pattern.lower()
+
+    # Check for uid:N:target
+    if lower_pattern.startswith('uid:'):
+        rest = pattern[4:]  # after 'uid:'
+        if ':' in rest:
+            colon_pos = rest.index(':')
+            uid_part = rest[:colon_pos]
+            if uid_part.isdigit():
+                source = pattern[:4 + colon_pos]  # uid:N
+                target = rest[colon_pos + 1:]     # everything after
+                if target:
+                    return {'source': source, 'target': target}
+
+    # Check for gid:N:target
+    if lower_pattern.startswith('gid:'):
+        rest = pattern[4:]  # after 'gid:'
+        if ':' in rest:
+            colon_pos = rest.index(':')
+            gid_part = rest[:colon_pos]
+            if gid_part.isdigit():
+                source = pattern[:4 + colon_pos]  # gid:N
+                target = rest[colon_pos + 1:]     # everything after
+                if target:
+                    return {'source': source, 'target': target}
+
+    # Check for auth_id:N:target
+    if lower_pattern.startswith('auth_id:'):
+        rest = pattern[8:]  # after 'auth_id:'
+        if ':' in rest:
+            colon_pos = rest.index(':')
+            auth_part = rest[:colon_pos]
+            if auth_part.isdigit():
+                source = pattern[:8 + colon_pos]  # auth_id:N
+                target = rest[colon_pos + 1:]     # everything after
+                if target:
+                    return {'source': source, 'target': target}
+
+    # Default: split on the last colon (handles DOMAIN\user:DOMAIN\other, simple:names)
+    last_colon = pattern.rfind(':')
+    if last_colon <= 0 or last_colon >= len(pattern) - 1:
+        raise ValueError(
+            f"Invalid owner change pattern '{pattern}'. "
+            f"Expected format: 'SOURCE:TARGET' (e.g., 'olduser:newuser')"
+        )
+
+    source = pattern[:last_colon].strip()
+    target = pattern[last_colon + 1:].strip()
+
+    if not source:
+        raise ValueError(f"Invalid pattern '{pattern}': source cannot be empty")
+    if not target:
+        raise ValueError(f"Invalid pattern '{pattern}': target cannot be empty")
+
+    return {'source': source, 'target': target}
+
+
 def parse_trustee(trustee_input: str) -> Dict:
     """
     Parse various trustee formats into an API payload.
@@ -3560,6 +3649,409 @@ async def main_async(args):
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after ACE manipulation
+
+    # OWNER/GROUP CHANGE MODE
+    # Selective ownership change - find files by current owner/group and change to new owner/group
+    change_owner_mode = (args.change_owner or args.change_group or
+                         args.change_owners_file or args.change_groups_file)
+
+    if change_owner_mode:
+        if args.verbose:
+            print("\n[INFO] Owner/Group Change Mode", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+
+        # Parse all owner change patterns from CLI and CSV
+        owner_change_patterns = []
+        group_change_patterns = []
+
+        # Parse --change-owner patterns
+        if args.change_owner:
+            for pattern in args.change_owner:
+                try:
+                    parsed = parse_owner_change_pattern(pattern)
+                    owner_change_patterns.append({
+                        'source': parsed['source'],
+                        'target': parsed['target'],
+                        'source_trustee': parse_trustee(parsed['source']),
+                        'target_trustee': parse_trustee(parsed['target']),
+                    })
+                except ValueError as e:
+                    print(f"[ERROR] {e}", file=sys.stderr)
+                    sys.exit(1)
+
+        # Parse --change-group patterns
+        if args.change_group:
+            for pattern in args.change_group:
+                try:
+                    parsed = parse_owner_change_pattern(pattern)
+                    group_change_patterns.append({
+                        'source': parsed['source'],
+                        'target': parsed['target'],
+                        'source_trustee': parse_trustee(parsed['source']),
+                        'target_trustee': parse_trustee(parsed['target']),
+                    })
+                except ValueError as e:
+                    print(f"[ERROR] {e}", file=sys.stderr)
+                    sys.exit(1)
+
+        # Load CSV files
+        if args.change_owners_file:
+            try:
+                csv_mappings = load_trustee_mappings(args.change_owners_file, verbose=args.verbose)
+                for mapping in csv_mappings:
+                    owner_change_patterns.append({
+                        'source': mapping['source'],
+                        'target': mapping['target'],
+                        'source_trustee': parse_trustee(mapping['source']),
+                        'target_trustee': parse_trustee(mapping['target']),
+                        'line': mapping.get('line'),
+                    })
+            except (FileNotFoundError, ValueError) as e:
+                print(f"[ERROR] Failed to load owner mappings file: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        if args.change_groups_file:
+            try:
+                csv_mappings = load_trustee_mappings(args.change_groups_file, verbose=args.verbose)
+                for mapping in csv_mappings:
+                    group_change_patterns.append({
+                        'source': mapping['source'],
+                        'target': mapping['target'],
+                        'source_trustee': parse_trustee(mapping['source']),
+                        'target_trustee': parse_trustee(mapping['target']),
+                        'line': mapping.get('line'),
+                    })
+            except (FileNotFoundError, ValueError) as e:
+                print(f"[ERROR] Failed to load group mappings file: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Display summary of mappings
+        if args.verbose:
+            if owner_change_patterns:
+                print(f"Owner changes:    {len(owner_change_patterns)} mapping(s)", file=sys.stderr)
+                for p in owner_change_patterns:
+                    print(f"                  {p['source']} -> {p['target']}", file=sys.stderr)
+
+            if group_change_patterns:
+                print(f"Group changes:    {len(group_change_patterns)} mapping(s)", file=sys.stderr)
+                for p in group_change_patterns:
+                    print(f"                  {p['source']} -> {p['target']}", file=sys.stderr)
+
+        if args.dry_run:
+            print(f"[DRY RUN] Preview mode - no changes will be made", file=sys.stderr)
+
+        if args.verbose:
+            print("=" * 70, file=sys.stderr)
+            print("\n[INFO] Resolving identities...", file=sys.stderr)
+
+        # Helper to extract identifier and type from parsed trustee
+        def get_identifier_and_type(trustee_spec):
+            payload = trustee_spec['payload']
+            id_type = trustee_spec['type']
+            if id_type == 'uid':
+                return payload.get('uid'), id_type
+            elif id_type == 'gid':
+                return payload.get('gid'), id_type
+            elif id_type == 'sid':
+                return payload.get('sid'), id_type
+            elif id_type == 'auth_id':
+                return payload.get('auth_id'), id_type
+            else:  # name
+                return payload.get('name'), 'name'
+
+        async with client.create_session() as session:
+            # Resolve owner change patterns
+            for p in owner_change_patterns:
+                # Resolve source
+                source_name = p['source']
+                if args.verbose:
+                    print(f"[INFO] Resolving source owner '{source_name}'...", file=sys.stderr)
+                source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
+                result = await client.resolve_identity(session, source_identifier, source_id_type)
+                if result and result.get('auth_id'):
+                    p['source_auth_id'] = str(result['auth_id'])
+                    if args.verbose:
+                        print(f"[INFO] Resolved source '{source_name}' -> auth_id {p['source_auth_id']}", file=sys.stderr)
+                else:
+                    print(f"[WARN] Could not resolve source owner '{source_name}' - may not exist", file=sys.stderr)
+                    p['source_auth_id'] = None
+
+                # Resolve target - MUST succeed
+                target_name = p['target']
+                if args.verbose:
+                    print(f"[INFO] Resolving target owner '{target_name}'...", file=sys.stderr)
+                target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
+                result = await client.resolve_identity(session, target_identifier, target_id_type)
+                if result and result.get('auth_id'):
+                    p['target_auth_id'] = str(result['auth_id'])
+                    if args.verbose:
+                        print(f"[INFO] Resolved target '{target_name}' -> auth_id {p['target_auth_id']}", file=sys.stderr)
+                else:
+                    print(f"[ERROR] Could not resolve target owner '{target_name}'", file=sys.stderr)
+                    print(f"[ERROR] Target must exist before changing ownership", file=sys.stderr)
+                    sys.exit(1)
+
+            # Resolve group change patterns
+            for p in group_change_patterns:
+                # Resolve source
+                source_name = p['source']
+                if args.verbose:
+                    print(f"[INFO] Resolving source group '{source_name}'...", file=sys.stderr)
+                source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
+                result = await client.resolve_identity(session, source_identifier, source_id_type)
+                if result and result.get('auth_id'):
+                    p['source_auth_id'] = str(result['auth_id'])
+                    if args.verbose:
+                        print(f"[INFO] Resolved source '{source_name}' -> auth_id {p['source_auth_id']}", file=sys.stderr)
+                else:
+                    print(f"[WARN] Could not resolve source group '{source_name}' - may not exist", file=sys.stderr)
+                    p['source_auth_id'] = None
+
+                # Resolve target - MUST succeed
+                target_name = p['target']
+                if args.verbose:
+                    print(f"[INFO] Resolving target group '{target_name}'...", file=sys.stderr)
+                target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
+                result = await client.resolve_identity(session, target_identifier, target_id_type)
+                if result and result.get('auth_id'):
+                    p['target_auth_id'] = str(result['auth_id'])
+                    if args.verbose:
+                        print(f"[INFO] Resolved target '{target_name}' -> auth_id {p['target_auth_id']}", file=sys.stderr)
+                else:
+                    print(f"[ERROR] Could not resolve target group '{target_name}'", file=sys.stderr)
+                    print(f"[ERROR] Target must exist before changing group", file=sys.stderr)
+                    sys.exit(1)
+
+        # Build lookup dicts for fast matching
+        owner_source_to_target = {}
+        for p in owner_change_patterns:
+            if p.get('source_auth_id'):
+                owner_source_to_target[p['source_auth_id']] = {
+                    'target_auth_id': p['target_auth_id'],
+                    'source_name': p['source'],
+                    'target_name': p['target'],
+                }
+
+        group_source_to_target = {}
+        for p in group_change_patterns:
+            if p.get('source_auth_id'):
+                group_source_to_target[p['source_auth_id']] = {
+                    'target_auth_id': p['target_auth_id'],
+                    'source_name': p['source'],
+                    'target_name': p['target'],
+                }
+
+        if not owner_source_to_target and not group_source_to_target:
+            print("\n[WARN] No valid source identities could be resolved. No files will be changed.", file=sys.stderr)
+            return
+
+        # Initialize statistics
+        change_stats = {
+            'files_scanned': 0,
+            'owners_changed': 0,
+            'groups_changed': 0,
+            'owner_change_failed': 0,
+            'group_change_failed': 0,
+            'files_skipped': 0,
+            'errors': [],
+        }
+
+        # Resolve any owner filters for the file filter
+        owner_auth_ids = None
+        async with client.create_session() as session:
+            if args.owners:
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+
+        # Create file filter
+        file_filter = create_file_filter(args, owner_auth_ids)
+
+        # Build filter info for smart directory skipping
+        time_filter_info = None
+        if args.older_than or args.newer_than:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            time_filter_info = {
+                "time_field": args.time_field,
+                "older_than": (
+                    now_utc - timedelta(days=args.older_than) if args.older_than else None
+                ),
+                "newer_than": (
+                    now_utc - timedelta(days=args.newer_than) if args.newer_than else None
+                ),
+            }
+
+        size_filter_info = None
+        if args.larger_than:
+            size_filter_info = {"min_size": parse_size_to_bytes(args.larger_than)}
+
+        owner_filter_info = None
+        if owner_auth_ids:
+            owner_filter_info = {"auth_ids": owner_auth_ids}
+
+        # Create progress tracker
+        progress = (
+            ProgressTracker(verbose=args.progress)
+            if args.progress
+            else None
+        )
+
+        if args.verbose:
+            if args.propagate_owner_changes:
+                print(f"\n[INFO] Processing {args.path} and all children...", file=sys.stderr)
+            else:
+                print(f"\n[INFO] Processing {args.path} only (use --propagate-owner-changes for children)...", file=sys.stderr)
+        start_time = time.time()
+
+        # Helper function to process a single file/directory for ownership change
+        async def process_file_for_ownership_change(session, entry):
+            change_stats['files_scanned'] += 1
+            file_path = entry.get('path')
+            file_owner = entry.get('owner')
+            file_group = entry.get('group')
+
+            new_owner = None
+            new_group = None
+            owner_change_info = None
+            group_change_info = None
+
+            # Check if owner matches any source
+            if file_owner and file_owner in owner_source_to_target:
+                owner_change_info = owner_source_to_target[file_owner]
+                new_owner = owner_change_info['target_auth_id']
+
+            # Check if group matches any source
+            if file_group and file_group in group_source_to_target:
+                group_change_info = group_source_to_target[file_group]
+                new_group = group_change_info['target_auth_id']
+
+            # If no changes needed, skip
+            if not new_owner and not new_group:
+                return
+
+            # Dry run - just log what would change
+            if args.dry_run:
+                if new_owner:
+                    print(f"[DRY RUN] Would change owner: {file_path}", file=sys.stderr)
+                    print(f"          {owner_change_info['source_name']} (auth_id: {file_owner}) -> "
+                          f"{owner_change_info['target_name']} (auth_id: {new_owner})", file=sys.stderr)
+                    change_stats['owners_changed'] += 1
+                if new_group:
+                    print(f"[DRY RUN] Would change group: {file_path}", file=sys.stderr)
+                    print(f"          {group_change_info['source_name']} (auth_id: {file_group}) -> "
+                          f"{group_change_info['target_name']} (auth_id: {new_group})", file=sys.stderr)
+                    change_stats['groups_changed'] += 1
+                return
+
+            # Apply the change
+            success, error_msg = await client.set_file_owner_group(
+                session,
+                file_path,
+                owner=new_owner,
+                group=new_group
+            )
+
+            if success:
+                if new_owner:
+                    change_stats['owners_changed'] += 1
+                    if args.verbose:
+                        print(f"[INFO] Changed owner: {file_path}", file=sys.stderr)
+                if new_group:
+                    change_stats['groups_changed'] += 1
+                    if args.verbose:
+                        print(f"[INFO] Changed group: {file_path}", file=sys.stderr)
+            else:
+                if new_owner:
+                    change_stats['owner_change_failed'] += 1
+                if new_group:
+                    change_stats['group_change_failed'] += 1
+                change_stats['errors'].append({
+                    'path': file_path,
+                    'error': error_msg
+                })
+                if args.verbose:
+                    print(f"[ERROR] Failed to change ownership: {file_path}: {error_msg}", file=sys.stderr)
+
+        async with client.create_session() as session:
+            if args.propagate_owner_changes:
+                # Walk the tree and change ownership for all matching files
+                async def tree_walk_callback(entry):
+                    await process_file_for_ownership_change(session, entry)
+
+                await client.walk_tree_async(
+                    session,
+                    args.path,
+                    args.max_depth,
+                    progress=progress,
+                    file_filter=file_filter,
+                    omit_subdirs=args.omit_subdirs,
+                    omit_paths=args.omit_path,
+                    collect_results=False,
+                    verbose=args.verbose,
+                    max_entries_per_dir=args.max_entries_per_dir,
+                    time_filter_info=time_filter_info,
+                    size_filter_info=size_filter_info,
+                    owner_filter_info=owner_filter_info,
+                    output_callback=tree_walk_callback,
+                )
+            else:
+                # Only process the target path itself
+                owner_group_info = await client.get_file_owner_group(session, args.path)
+                if owner_group_info:
+                    # Build an entry dict compatible with the processing function
+                    entry = {
+                        'path': args.path,
+                        'owner': owner_group_info.get('owner'),
+                        'group': owner_group_info.get('group'),
+                        'owner_details': owner_group_info.get('owner_details'),
+                        'group_details': owner_group_info.get('group_details'),
+                    }
+                    await process_file_for_ownership_change(session, entry)
+                else:
+                    print(f"[ERROR] Could not get attributes for: {args.path}", file=sys.stderr)
+                    change_stats['errors'].append({
+                        'path': args.path,
+                        'error': 'Could not get file attributes'
+                    })
+
+        elapsed = time.time() - start_time
+
+        # Final progress report
+        if progress:
+            progress.final_report()
+
+        # Display summary
+        print("\n" + "=" * 70, file=sys.stderr)
+        if args.dry_run:
+            print("OWNER/GROUP CHANGE PREVIEW (DRY RUN)", file=sys.stderr)
+        else:
+            print("OWNER/GROUP CHANGE SUMMARY", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(f"Path:               {args.path}", file=sys.stderr)
+        print(f"Files scanned:      {change_stats['files_scanned']:,}", file=sys.stderr)
+        print(f"Owners changed:     {change_stats['owners_changed']:,}", file=sys.stderr)
+        print(f"Groups changed:     {change_stats['groups_changed']:,}", file=sys.stderr)
+        if change_stats['owner_change_failed'] > 0 or change_stats['group_change_failed'] > 0:
+            print(f"Owner changes failed: {change_stats['owner_change_failed']:,}", file=sys.stderr)
+            print(f"Group changes failed: {change_stats['group_change_failed']:,}", file=sys.stderr)
+        print(f"Elapsed time:       {elapsed:.2f}s", file=sys.stderr)
+        if change_stats['files_scanned'] > 0:
+            rate = change_stats['files_scanned'] / elapsed if elapsed > 0 else 0
+            print(f"Processing rate:    {rate:.0f} files/sec", file=sys.stderr)
+
+        if change_stats['errors']:
+            print("\nErrors encountered:", file=sys.stderr)
+            for error in change_stats['errors'][:10]:
+                print(f"  {error['path']}: {error['error']}", file=sys.stderr)
+            if len(change_stats['errors']) > 10:
+                print(f"  ... and {len(change_stats['errors']) - 10} more", file=sys.stderr)
+
+        # Save identity cache
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+
+        # Exit with error code if any failures
+        if change_stats['owner_change_failed'] > 0 or change_stats['group_change_failed'] > 0:
+            sys.exit(1)
+
+        return  # Exit after owner/group change mode
 
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
@@ -4947,6 +5439,49 @@ Examples:
         help="Concurrent ACL operations during propagation (default: 100, try 500 for faster throughput)"
     )
 
+    acl_management.add_argument(
+        "--change-owner",
+        action="append",
+        metavar="SOURCE:TARGET",
+        help="Change file owner from SOURCE to TARGET. "
+             "Finds files owned by SOURCE and changes owner to TARGET. "
+             "Format: 'olduser:newuser', 'uid:1001:uid:2001', 'DOMAIN\\\\user:DOMAIN\\\\other'. "
+             "Repeatable for multiple mappings. Use with --dry-run to preview changes."
+    )
+
+    acl_management.add_argument(
+        "--change-group",
+        action="append",
+        metavar="SOURCE:TARGET",
+        help="Change file group from SOURCE to TARGET. "
+             "Finds files with group SOURCE and changes group to TARGET. "
+             "Format: 'oldgroup:newgroup', 'gid:100:gid:200'. "
+             "Repeatable for multiple mappings. Use with --dry-run to preview changes."
+    )
+
+    acl_management.add_argument(
+        "--change-owners-file",
+        metavar="FILE",
+        help="CSV file with owner mappings (source,target format). "
+             "Each row maps a source owner to target owner. "
+             "Same format as --migrate-trustees CSV."
+    )
+
+    acl_management.add_argument(
+        "--change-groups-file",
+        metavar="FILE",
+        help="CSV file with group mappings (source,target format). "
+             "Each row maps a source group to target group. "
+             "Same format as --migrate-trustees CSV."
+    )
+
+    acl_management.add_argument(
+        "--propagate-owner-changes",
+        action="store_true",
+        help="Apply owner/group changes to all children recursively. "
+             "Without this flag, only the target path itself is changed."
+    )
+
     # ============================================================================
     # FEATURE: ACE MANIPULATION
     # ============================================================================
@@ -5195,6 +5730,29 @@ Examples:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Validate --change-owner/--change-group flags
+    change_owner_mode = (args.change_owner or args.change_group or
+                         args.change_owners_file or args.change_groups_file)
+
+    if change_owner_mode:
+        # Cannot combine with --copy-owner or --copy-group (different paradigms)
+        if args.copy_owner or args.copy_group:
+            print(
+                "Error: --change-owner/--change-group cannot be combined with --copy-owner/--copy-group",
+                file=sys.stderr,
+            )
+            print("  --copy-owner/--copy-group copy from a source path", file=sys.stderr)
+            print("  --change-owner/--change-group find files by current owner and change to a new owner", file=sys.stderr)
+            sys.exit(1)
+
+        # Requires --path (operates on tree walk)
+        if not args.path:
+            print(
+                "Error: --change-owner/--change-group requires --path",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.older_than and args.newer_than and args.newer_than >= args.older_than:
         print(

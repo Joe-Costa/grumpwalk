@@ -240,6 +240,26 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 - `--owner-group-only` - Copy only owner/group, skip ACL
 - `--acl-concurrency N` - Concurrent ACL operations (default: 100, try 500 for faster throughput)
 
+### Owner/Group Change Options
+
+Selective ownership changes - find files by current owner/group and change to a new owner/group.
+
+- `--change-owner 'SOURCE:TARGET'` - Change owner from SOURCE to TARGET (e.g., `'olduser:newuser'`, `'uid:1001:uid:2001'`)
+- `--change-group 'SOURCE:TARGET'` - Change group from SOURCE to TARGET (e.g., `'oldgroup:newgroup'`, `'gid:100:gid:200'`)
+- `--change-owners-file FILE.csv` - Load owner mappings from CSV file
+- `--change-groups-file FILE.csv` - Load group mappings from CSV file
+- `--propagate-owner-changes` - Apply changes to all children recursively (without this, only the target path is changed)
+
+**CSV Format** (same as `--migrate-trustees`):
+```csv
+source,target
+olduser1,newuser1
+uid:1001,uid:2001
+OLDDOMAIN\user,NEWDOMAIN\user
+```
+
+**Important:** Always use `--dry-run` first to preview changes before applying.
+
 ### ACE Manipulation Options
 
 Surgically modify Access Control Entries (ACEs) within ACLs without replacing the entire ACL.
@@ -496,6 +516,51 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 ./grumpwalk.py --host cluster.example.com \
   --source-acl /source/dir --acl-target /target/dir \
   --propagate-acls --older-than 30 --type file --progress
+```
+
+### Owner/Group Change Examples
+
+```bash
+# Change owner of a single file/directory
+./grumpwalk.py --host cluster.example.com --path /data/file.txt \
+  --change-owner 'olduser:newuser'
+
+# Preview recursive owner changes (ALWAYS do this first!)
+./grumpwalk.py --host cluster.example.com --path /data \
+  --change-owner 'departed_user:manager' \
+  --propagate-owner-changes --dry-run
+
+# Change owner recursively for all matching files
+./grumpwalk.py --host cluster.example.com --path /home/olduser \
+  --change-owner 'olduser:newuser' \
+  --propagate-owner-changes --progress
+
+# Change owner using UIDs (NFS environments)
+./grumpwalk.py --host cluster.example.com --path /nfs-data \
+  --change-owner 'uid:1001:uid:2001' \
+  --propagate-owner-changes --progress
+
+# Change both owner and group recursively
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --change-owner 'olduser:newuser' \
+  --change-group 'oldgroup:newgroup' \
+  --propagate-owner-changes --progress
+
+# Change ownership with filters (only old files)
+./grumpwalk.py --host cluster.example.com --path /archive \
+  --change-owner 'departed_user:manager' \
+  --propagate-owner-changes --older-than 30 --type file --progress
+
+# Bulk ownership changes from CSV (preview first)
+./grumpwalk.py --host cluster.example.com --path /data \
+  --change-owners-file owner_migration.csv \
+  --propagate-owner-changes --dry-run
+
+# Domain migration (AD to AD)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --change-owner 'OLDDOMAIN\jsmith:NEWDOMAIN\jsmith' \
+  --change-group 'OLDDOMAIN\Engineering:NEWDOMAIN\Engineering' \
+  --propagate-owner-changes --progress
 ```
 
 ### ACE Manipulation Examples
