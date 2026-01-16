@@ -1102,6 +1102,7 @@ def apply_ace_modifications(
     remove_rights_patterns: List[dict],
     replace_aces: List[Tuple[dict, dict]] = None,
     clone_patterns: List[dict] = None,
+    migrate_patterns: List[dict] = None,
     sync_cloned_aces: bool = False,
     verbose: bool = False
 ) -> Tuple[dict, dict]:
@@ -1115,8 +1116,9 @@ def apply_ace_modifications(
     4. Add rights to matching ACEs (merge)
     5. Replace ACEs (full replacement or type-changing replacement)
     6. Add new ACEs (merge if same type+trustee exists)
-    7. Clone ACEs from source trustee to target trustee (or sync if exists)
-    8. Re-sort into canonical order
+    7. Migrate trustees (in-place replacement from source to target)
+    8. Clone ACEs from source trustee to target trustee (or sync if exists)
+    9. Re-sort into canonical order
 
     Args:
         acl: ACL dict to modify
@@ -1127,14 +1129,16 @@ def apply_ace_modifications(
         replace_aces: List of tuples (find_pattern, new_ace_pattern).
                       If new_ace_pattern is None, in-place replacement.
                       If new_ace_pattern is provided, full replacement (can change type).
-        clone_patterns: List of dicts with source_auth_id, target_auth_id, target_identity
+        clone_patterns: List of dicts with source_auth_id, target_auth_id, target_trustee
                        for cloning ACEs from one trustee to another.
+        migrate_patterns: List of dicts with source_auth_id, target_trustee for in-place
+                         trustee replacement (domain migration).
         sync_cloned_aces: If True, update existing target ACEs to match source rights.
                          If False (default), skip if target ACE already exists.
 
     Returns:
         Tuple of (modified_acl, stats_dict)
-        stats_dict has keys: removed, added, modified, cloned, synced, inheritance_broken
+        stats_dict has keys: removed, added, modified, cloned, synced, migrated, inheritance_broken
     """
     import copy
     result = copy.deepcopy(acl)
@@ -1143,6 +1147,8 @@ def apply_ace_modifications(
         replace_aces = []
     if clone_patterns is None:
         clone_patterns = []
+    if migrate_patterns is None:
+        migrate_patterns = []
 
     stats = {
         'removed': 0,
@@ -1151,6 +1157,7 @@ def apply_ace_modifications(
         'replaced': 0,
         'cloned': 0,
         'synced': 0,
+        'migrated': 0,
         'inheritance_broken': False,
     }
 
@@ -1336,7 +1343,75 @@ def apply_ace_modifications(
             aces.append(new_ace)
             stats['added'] += 1
 
-    # 7. Clone ACEs from source trustee to target trustee (or sync if exists)
+    # 7. Migrate trustees (in-place replacement from source to target)
+    for mp in migrate_patterns:
+        source_auth_id = mp.get('source_auth_id')
+        target_trustee = mp.get('target_trustee')
+        target_auth_id = mp.get('target_auth_id')
+
+        if not source_auth_id or not target_trustee:
+            if verbose:
+                print(f"[DEBUG] Skipping migrate pattern - missing auth_id or target: "
+                      f"source={source_auth_id}, target={target_trustee}", file=sys.stderr)
+            continue
+
+        # Find all ACEs matching the source trustee and migrate them
+        aces_to_remove = []
+        for ace in aces:
+            ace_trustee = ace.get('trustee')
+            if isinstance(ace_trustee, dict):
+                ace_auth_id = str(ace_trustee.get('auth_id', ''))
+            else:
+                ace_auth_id = str(ace_trustee) if ace_trustee else ''
+
+            if ace_auth_id == str(source_auth_id):
+                ace_type = ace.get('type')
+
+                # Check if target already has an ACE of the same type (by auth_id)
+                existing_target_ace = None
+                if target_auth_id:
+                    for other_ace in aces:
+                        if other_ace is ace:
+                            continue
+                        if other_ace in aces_to_remove:
+                            continue  # Skip ACEs we're already removing
+                        other_type = other_ace.get('type')
+                        if other_type != ace_type:
+                            continue
+                        other_trustee = other_ace.get('trustee')
+                        if isinstance(other_trustee, dict):
+                            other_auth_id = str(other_trustee.get('auth_id', ''))
+                        else:
+                            other_auth_id = str(other_trustee) if other_trustee else ''
+                        if other_auth_id == target_auth_id:
+                            existing_target_ace = other_ace
+                            break
+
+                if existing_target_ace:
+                    # Merge rights into existing target ACE
+                    existing_rights = set(existing_target_ace.get('rights', []))
+                    source_rights = set(ace.get('rights', []))
+                    merged_rights = existing_rights | source_rights
+                    existing_target_ace['rights'] = list(merged_rights)
+                    aces_to_remove.append(ace)
+                    stats['migrated'] += 1
+                    if verbose:
+                        print(f"[DEBUG] Merged {ace_type} ACE rights from {source_auth_id} "
+                              f"into existing {target_trustee} ACE", file=sys.stderr)
+                else:
+                    # No existing target - replace trustee in-place
+                    ace['trustee'] = target_trustee
+                    ace['_needs_resolution'] = True
+                    stats['migrated'] += 1
+                    if verbose:
+                        print(f"[DEBUG] Migrated {ace_type} ACE from {source_auth_id} "
+                              f"to {target_trustee}", file=sys.stderr)
+
+        # Remove ACEs that were merged into existing targets
+        for ace in aces_to_remove:
+            aces.remove(ace)
+
+    # 8. Clone ACEs from source trustee to target trustee (or sync if exists)
     for cp in clone_patterns:
         source_auth_id = cp.get('source_auth_id')
         target_auth_id = cp.get('target_auth_id')
@@ -1416,7 +1491,7 @@ def apply_ace_modifications(
                 print(f"[DEBUG] Synced {synced_count} ACE(s) for {cp.get('target_trustee')} "
                       f"from {cp.get('source_trustee')}", file=sys.stderr)
 
-    # 8. Re-sort into canonical order
+    # 9. Re-sort into canonical order
     aces = sort_aces_canonical(aces)
 
     inner['aces'] = aces
@@ -2071,6 +2146,100 @@ async def generate_acl_report(
     }
 
 
+def load_trustee_mappings(filepath: str, verbose: bool = False) -> List[dict]:
+    """
+    Load trustee mappings from a CSV file.
+
+    CSV format: source,target (header row optional)
+
+    Supports all trustee formats:
+    - DOMAIN\\username (NetBIOS)
+    - user@domain.com (UPN)
+    - uid:1001, gid:100 (NFS)
+    - S-1-5-21-... (SID)
+    - username (plain name)
+
+    Args:
+        filepath: Path to CSV file
+        verbose: Print debug info
+
+    Returns:
+        List of dicts: [{'source': '...', 'target': '...', 'line': N}, ...]
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If CSV format is invalid
+    """
+    import csv
+
+    mappings = []
+
+    try:
+        with open(filepath, 'r', newline='', encoding='utf-8') as f:
+            # Detect if first row is a header
+            first_line = f.readline().strip()
+            f.seek(0)
+
+            # Check if first row looks like a header (common header names)
+            has_header = False
+            if first_line:
+                first_parts = first_line.lower().split(',')
+                if len(first_parts) >= 2:
+                    header_keywords = ['source', 'target', 'from', 'to', 'old', 'new']
+                    if any(kw in first_parts[0] for kw in header_keywords) or \
+                       any(kw in first_parts[1] for kw in header_keywords):
+                        has_header = True
+
+            reader = csv.reader(f)
+            line_num = 0
+
+            for row in reader:
+                line_num += 1
+
+                # Skip header row
+                if line_num == 1 and has_header:
+                    if verbose:
+                        print(f"[DEBUG] Skipping header row: {row}", file=sys.stderr)
+                    continue
+
+                # Skip empty rows
+                if not row or all(cell.strip() == '' for cell in row):
+                    continue
+
+                # Validate row has at least 2 columns
+                if len(row) < 2:
+                    raise ValueError(
+                        f"Line {line_num}: Expected at least 2 columns (source,target), "
+                        f"got {len(row)}: {row}"
+                    )
+
+                source = row[0].strip()
+                target = row[1].strip()
+
+                # Validate non-empty values
+                if not source:
+                    raise ValueError(f"Line {line_num}: Empty source value")
+                if not target:
+                    raise ValueError(f"Line {line_num}: Empty target value")
+
+                mappings.append({
+                    'source': source,
+                    'target': target,
+                    'line': line_num,
+                })
+
+        if verbose:
+            print(f"[DEBUG] Loaded {len(mappings)} trustee mappings from {filepath}",
+                  file=sys.stderr)
+
+        return mappings
+
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Mapping file not found: {filepath}")
+    except csv.Error as e:
+        raise ValueError(f"CSV parsing error in {filepath}: {e}")
+
+
 def parse_trustee(trustee_input: str) -> Dict:
     """
     Parse various trustee formats into an API payload.
@@ -2115,9 +2284,9 @@ def parse_trustee(trustee_input: str) -> Dict:
 
     # NetBIOS domain format (DOMAIN\username)
     if "\\" in trustee:
-        # Need to escape the backslash for JSON
+        # Keep single backslash - aiohttp handles JSON encoding
         domain, username = trustee.split("\\", 1)
-        return {"payload": {"name": f"{domain}\\\\{username}"}, "type": "name"}
+        return {"payload": {"name": f"{domain}\\{username}"}, "type": "name"}
 
     # Email or LDAP DN format
     if "@" in trustee or trustee.startswith("CN="):
@@ -2852,7 +3021,8 @@ async def main_async(args):
     # Check if any ACE manipulation flags are specified
     ace_manipulation_mode = (
         args.remove_aces or args.add_aces or args.replace_aces or
-        args.add_rights or args.remove_rights or args.clone_ace_sources
+        args.add_rights or args.remove_rights or args.clone_ace_sources or
+        args.migrate_trustees or args.clone_ace_map
     )
 
     # Check for mutually exclusive flags: ACL cloning vs ACE manipulation
@@ -3000,6 +3170,45 @@ async def main_async(args):
                     'target_trustee': target,
                 })
 
+        # Load --clone-ace-map CSV and add to clone_patterns
+        if args.clone_ace_map:
+            try:
+                csv_mappings = load_trustee_mappings(args.clone_ace_map, verbose=args.verbose)
+                for mapping in csv_mappings:
+                    clone_patterns.append({
+                        'source_trustee': mapping['source'],
+                        'target_trustee': mapping['target'],
+                        'line': mapping['line'],  # For error reporting
+                    })
+                print(f"[INFO] Loaded {len(csv_mappings)} clone mappings from {args.clone_ace_map}",
+                      file=sys.stderr)
+            except FileNotFoundError as e:
+                print(f"[ERROR] {e}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as e:
+                print(f"[ERROR] {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Load --migrate-trustees CSV
+        migrate_patterns = []
+        if args.migrate_trustees:
+            try:
+                csv_mappings = load_trustee_mappings(args.migrate_trustees, verbose=args.verbose)
+                for mapping in csv_mappings:
+                    migrate_patterns.append({
+                        'source_trustee': mapping['source'],
+                        'target_trustee': mapping['target'],
+                        'line': mapping['line'],  # For error reporting
+                    })
+                print(f"[INFO] Loaded {len(csv_mappings)} migration mappings from {args.migrate_trustees}",
+                      file=sys.stderr)
+            except FileNotFoundError as e:
+                print(f"[ERROR] {e}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as e:
+                print(f"[ERROR] {e}", file=sys.stderr)
+                sys.exit(1)
+
         # Show what will be done
         if remove_patterns:
             print(f"ACEs to remove:    {len(remove_patterns)}", file=sys.stderr)
@@ -3023,6 +3232,10 @@ async def main_async(args):
                 print(f"                   {cp['source_trustee']} -> {cp['target_trustee']}", file=sys.stderr)
             if args.sync_cloned_aces:
                 print(f"Sync mode:         Enabled (existing target ACEs will be updated)", file=sys.stderr)
+        if migrate_patterns:
+            print(f"Trustees to migrate: {len(migrate_patterns)}", file=sys.stderr)
+            for mp in migrate_patterns:
+                print(f"                   {mp['source_trustee']} -> {mp['target_trustee']}", file=sys.stderr)
         if args.propagate_ace_changes:
             print(f"Propagate:         Enabled", file=sys.stderr)
         if args.dry_run:
@@ -3102,6 +3315,71 @@ async def main_async(args):
                         print(f"[ERROR] Could not resolve target trustee: {target}", file=sys.stderr)
                         sys.exit(1)
 
+            # Resolve migrate pattern trustees (both source and target need auth_id)
+            if migrate_patterns:
+                if args.verbose:
+                    print(f"\n[INFO] Resolving migrate trustee identities...", file=sys.stderr)
+                for mp in migrate_patterns:
+                    # Resolve source trustee to get auth_id for matching
+                    source = mp['source_trustee']
+                    if args.verbose:
+                        print(f"[INFO] Resolving source trustee '{source}'...", file=sys.stderr)
+
+                    # Use parse_trustee to get the right format for identity resolution
+                    source_spec = parse_trustee(source)
+                    source_payload = source_spec['payload']
+                    source_id_type = source_spec['type']
+
+                    # Extract identifier from payload
+                    if source_id_type == 'uid':
+                        source_identifier = source_payload.get('uid')
+                    elif source_id_type == 'gid':
+                        source_identifier = source_payload.get('gid')
+                    elif source_id_type == 'sid':
+                        source_identifier = source_payload.get('sid')
+                    elif source_id_type == 'auth_id':
+                        source_identifier = source_payload.get('auth_id')
+                    else:  # name
+                        source_identifier = source_payload.get('name')
+
+                    result = await client.resolve_identity(session, source_identifier, source_id_type)
+                    if result and result.get('auth_id'):
+                        mp['source_auth_id'] = str(result['auth_id'])
+                        if args.verbose:
+                            print(f"[INFO] Resolved source '{source}' -> auth_id {mp['source_auth_id']}", file=sys.stderr)
+                    else:
+                        print(f"[ERROR] Could not resolve source trustee: {source}", file=sys.stderr)
+                        sys.exit(1)
+
+                    # Resolve target trustee to get auth_id for duplicate detection
+                    target = mp['target_trustee']
+                    if args.verbose:
+                        print(f"[INFO] Resolving target trustee '{target}'...", file=sys.stderr)
+
+                    target_spec = parse_trustee(target)
+                    target_payload = target_spec['payload']
+                    target_id_type = target_spec['type']
+
+                    if target_id_type == 'uid':
+                        target_identifier = target_payload.get('uid')
+                    elif target_id_type == 'gid':
+                        target_identifier = target_payload.get('gid')
+                    elif target_id_type == 'sid':
+                        target_identifier = target_payload.get('sid')
+                    elif target_id_type == 'auth_id':
+                        target_identifier = target_payload.get('auth_id')
+                    else:  # name
+                        target_identifier = target_payload.get('name')
+
+                    result = await client.resolve_identity(session, target_identifier, target_id_type)
+                    if result and result.get('auth_id'):
+                        mp['target_auth_id'] = str(result['auth_id'])
+                        if args.verbose:
+                            print(f"[INFO] Resolved target '{target}' -> auth_id {mp['target_auth_id']}", file=sys.stderr)
+                    else:
+                        print(f"[ERROR] Could not resolve target trustee: {target}", file=sys.stderr)
+                        sys.exit(1)
+
             if all_patterns:
                 print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
                 await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
@@ -3129,6 +3407,7 @@ async def main_async(args):
                 remove_rights_patterns,
                 replace_aces=replace_patterns,
                 clone_patterns=clone_patterns,
+                migrate_patterns=migrate_patterns,
                 sync_cloned_aces=args.sync_cloned_aces,
                 verbose=args.verbose
             )
@@ -3141,6 +3420,7 @@ async def main_async(args):
             print(f"  ACEs modified:        {stats['modified']}", file=sys.stderr)
             print(f"  ACEs cloned:          {stats['cloned']}", file=sys.stderr)
             print(f"  ACEs synced:          {stats['synced']}", file=sys.stderr)
+            print(f"  ACEs migrated:        {stats['migrated']}", file=sys.stderr)
             if stats['inheritance_broken']:
                 print(f"  Inheritance:          BROKEN (converted to explicit)", file=sys.stderr)
 
@@ -3189,7 +3469,8 @@ async def main_async(args):
             for ace in new_aces:
                 if ace.get('_needs_resolution'):
                     raw_trustee = ace.get('trustee')
-                    print(f"[INFO] Resolving trustee: {raw_trustee}", file=sys.stderr)
+                    if args.verbose:
+                        print(f"[INFO] Resolving trustee: {raw_trustee}", file=sys.stderr)
 
                     # Use parse_trustee to get the right format for identity resolution
                     trustee_spec = parse_trustee(raw_trustee)
@@ -3222,7 +3503,8 @@ async def main_async(args):
                             'gid': resolved.get('gid'),
                         }
                         del ace['_needs_resolution']
-                        print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
+                        if args.verbose:
+                            print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
                     else:
                         print(f"[ERROR] Could not resolve trustee: {raw_trustee}", file=sys.stderr)
                         sys.exit(1)
@@ -4756,6 +5038,24 @@ Examples:
         help="When used with --clone-ace-source/--clone-ace-target, update existing "
              "target ACEs to match source ACE rights. Without this flag, existing "
              "target ACEs are left unchanged."
+    )
+
+    ace_manipulation.add_argument(
+        "--migrate-trustees",
+        metavar="FILE",
+        help="CSV file with source,target trustee mappings for in-place replacement. "
+             "All ACEs matching source trustees are updated to target trustees. "
+             "CSV format: source,target (header row optional). "
+             "Supports: DOMAIN\\\\user, uid:N, gid:N, SID, plain names."
+    )
+
+    ace_manipulation.add_argument(
+        "--clone-ace-map",
+        metavar="FILE",
+        help="CSV file with source,target trustee mappings for bulk cloning. "
+             "Clones all ACEs from source to target trustees. "
+             "Works with --sync-cloned-aces to update existing target ACEs. "
+             "CSV format: source,target (header row optional)."
     )
 
     ace_manipulation.add_argument(

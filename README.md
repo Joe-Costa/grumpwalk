@@ -253,6 +253,30 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 - `--remove-rights 'Type:Trustee:Rights'` - Remove specific rights from existing ACE (keeps other rights)
 - `--clone-ace-source 'Trustee' --clone-ace-target 'Trustee'` - Clone all ACEs from source to target trustee
 
+**Bulk Operations (CSV source files):**
+- `--migrate-trustees FILE.csv` - In-place trustee replacement from CSV (source ACE becomes target)
+- `--clone-ace-map FILE.csv` - Bulk clone ACEs from CSV mappings (works with `--sync-cloned-aces`)
+
+**CSV File Format (for --migrate-trustees and --clone-ace-map):**
+
+Simple two-column format with optional header row:
+```csv
+source,target
+OLDDOMAIN\user1,NEWDOMAIN\user1
+OLDDOMAIN\user2,NEWDOMAIN\user2
+uid:1001,uid:2001
+S-1-5-21-123456,S-1-5-21-789012
+gid:100,NEWDOMAIN\Domain Users
+```
+
+Supported trustee formats in CSV (same as command-line):
+- `DOMAIN\username` - NetBIOS format
+- `user@domain.com` - UPN format
+- `uid:1001` - NFS UID
+- `gid:100` - NFS GID
+- `S-1-5-21-...` - Direct SID
+- `username` - Plain name (resolved via identity API but might cause issues if duplicate names are found)
+
 **Quick Reference:**
 
 | Operation | Example | Use Case |
@@ -263,8 +287,10 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 | `--add-ace` | `'Allow:fd:Everyone:rx'` | Create new ACE (or merge if exists) |
 | `--replace-ace` | `'Allow:fd:Everyone:rx'` | Replace ACE's flags and rights entirely |
 | `--replace-ace` + `--new-ace` | `'Allow:User' 'Deny:fd:User:w'` | Change ACE type (Allow to Deny) |
-| `--clone-ace-source` + `--clone-ace-target` | `'bob' 'joe'` | Copy all of bob's ACEs to joe |
+| `--clone-ace-source` + `--clone-ace-target` | `'bob' 'joe'` | Copy all of bob's ACEs to joe in a new entry |
 | `--sync-cloned-aces` | (with clone flags) | Update existing target ACEs to match source |
+| `--migrate-trustees` | `migration.csv` | Domain migration (source trustees become target) |
+| `--clone-ace-map` | `mappings.csv` | Bulk clone ACEs from CSV file |
 
 **Supporting Flags:**
 - `--propagate-ace-changes` - Apply ACE changes to all children recursively
@@ -298,6 +324,8 @@ Flags (inheritance):
 - **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists. `--replace-ace` completely replaces the existing ACE's flags and rights with the new values.
 - **--replace-ace with --new-ace**: When paired with `--new-ace`, you can change the ACE type (Allow to Deny or vice versa). The `--replace-ace` pattern specifies which ACE to find, and `--new-ace` specifies the full replacement. These must be positionally adjacent and paired 1:1.
 - **--clone-ace-source/--clone-ace-target**: Clones ALL ACEs (both Allow and Deny) from source trustee to target trustee, preserving flags and rights. By default, skips if target already has an ACE of the same type. Use `--sync-cloned-aces` to update existing target ACEs to match source rights. Supports uid:N, gid:N, DOMAIN\\user, and plain name formats.
+- **--migrate-trustees**: In-place trustee replacement. The source ACE's trustee is changed to the target trustee (preserving type, flags, and rights). Use for domain migrations where you want to replace OLD_DOMAIN\\user with NEW_DOMAIN\\user.
+- **--clone-ace-map**: Bulk version of `--clone-ace-source/--clone-ace-target`. Reads mappings from CSV file. Each row creates cloned ACEs. Works with `--sync-cloned-aces`.
 - **Canonical ordering**: ACEs are automatically sorted into Windows canonical order (Deny before Allow, Explicit before Inherited).
 - **Empty ACE removal**: If `--remove-rights` removes all rights from an ACE, the ACE is deleted entirely.
 
@@ -320,6 +348,7 @@ To restart inheritance from a parent after breaking it, use the standard ACL clo
 ```
 
 This copies the parent's ACL (with inherited flags set appropriately) to the child and its descendants.
+
 
 ### Similarity Detection Options
 - `--find-similar` - Find similar files using metadata + sample hashing
@@ -515,6 +544,22 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 # Sync target ACEs to match source rights (updates existing target ACEs)
 ./grumpwalk.py --host cluster.example.com --path /shared \
   --clone-ace-source 'bob' --clone-ace-target 'joe' --sync-cloned-aces --propagate-ace-changes
+
+# Domain migration - replace all OLDDOMAIN trustees with NEWDOMAIN (from CSV)
+./grumpwalk.py --host cluster.example.com --path /data \
+  --migrate-trustees domain_migration.csv --propagate-ace-changes --progress
+
+# Dry run domain migration first
+./grumpwalk.py --host cluster.example.com --path /data \
+  --migrate-trustees domain_migration.csv --dry-run
+
+# Bulk clone from CSV file (multiple source:target pairs)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --clone-ace-map team_permissions.csv --propagate-ace-changes
+
+# Bulk clone with sync (updates existing target ACEs to match source)
+./grumpwalk.py --host cluster.example.com --path /shared \
+  --clone-ace-map team_permissions.csv --sync-cloned-aces --propagate-ace-changes
 ```
 
 ### Find similar files with custom sampling
