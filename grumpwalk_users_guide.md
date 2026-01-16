@@ -309,14 +309,6 @@ TOTAL                                               268,789    4,467     2.67 TB
   --type file
 ```
 
-**Find orphaned snapshot directories:**
-```bash
-./grumpwalk.py --host cluster --path /data \
-  --name '.snapshot' --name 'snapshot_*' \
-  --type directory \
-  --older-than 90
-```
-
 ### How do I implement a retention policy?
 
 **Find files exceeding 7-year retention:**
