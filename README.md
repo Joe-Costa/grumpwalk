@@ -187,6 +187,7 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 - `--older-than N` - Files older than N days
 - `--newer-than N` - Files newer than N days
 - `--time-field {creation_time,modification_time,access_time,change_time}` - Time field to use (default: modification_time)
+- `--created` / `--modified` / `--accessed` / `--changed` - Shortcuts for `--time-field`
 
 **Field-specific time filters (AND logic):**
 - `--accessed-older-than N` / `--accessed-newer-than N`
@@ -209,12 +210,15 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 - `--expand-identity` - Match equivalent identities (AD user + NFS UID)
 - `--show-owner` - Display owner information in output
 - `--owner-report` - Generate capacity report by owner
+- `--use-capacity` - Use capacity-based calculation (datablocks + metablocks) for owner report
+- `--report-logical-size` - Report logical file size instead of disk capacity
 
 ### Directory Options
 - `--max-depth N` - Maximum directory depth
 - `--omit-subdirs PATTERN` - Skip directories (supports glob and paths, repeatable)
 - `--omit-path PATH` - Skip specific absolute path (must start with `/`, repeatable)
 - `--max-entries-per-dir N` - Skip directories exceeding N entries
+- `--show-dir-stats` - Show directory statistics (file/dir counts, sizes)
 
 ### Symlink Options
 - `--resolve-links` - Show symlink targets as absolute paths
@@ -316,7 +320,9 @@ Supported trustee formats in CSV (same as command-line):
 - `--propagate-changes` - Apply changes to all children recursively (works with ACE and owner/group operations)
 - `--sync-cloned-aces` - When cloning, update existing target ACEs to match source rights
 - `--dry-run` - Preview changes without applying them
-- `--ace-backup FILE` - Save original ACLs to JSON before modification
+- `--ace-backup FILE` - Save original ACLs to JSON before modification (includes file_id for safety)
+- `--ace-restore FILE` - Restore ACLs from a backup file (verifies file_id matches)
+- `--force-restore` - Force restore even if file_id doesn't match (use with caution)
 
 **Pattern Syntax:**
 
@@ -593,6 +599,15 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 # Backup ACLs before making changes
 ./grumpwalk.py --host cluster.example.com --path /important \
   --remove-ace 'Allow:tempuser' --ace-backup acl-backup.json
+
+# Restore ACLs from backup (verifies file_id for safety)
+./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --dry-run
+
+# Restore and propagate to children
+./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --propagate-changes
+
+# Force restore even if file was renamed (file_id mismatch)
+./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --force-restore
 
 # Clone ACEs from one user to another (copies all Allow and Deny ACEs)
 ./grumpwalk.py --host cluster.example.com --path /shared \
