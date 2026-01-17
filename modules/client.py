@@ -382,6 +382,37 @@ class AsyncQumuloClient:
             except aiohttp.ClientError as e:
                 return (False, str(e))
 
+    async def get_file_attr(
+        self,
+        session: aiohttp.ClientSession,
+        path: str
+    ) -> Optional[dict]:
+        """
+        Get file attributes including file ID using v1 attributes API.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the file/directory
+
+        Returns:
+            Dictionary with file attributes including 'id', 'name', 'type', etc. or None if failed
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
+
+            try:
+                async with session.get(url, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        return None
+            except aiohttp.ClientError:
+                return None
+
     async def get_file_owner_group(
         self,
         session: aiohttp.ClientSession,
