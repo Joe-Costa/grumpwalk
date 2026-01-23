@@ -40,6 +40,7 @@ from modules import (
     format_owner_name,
     ProgressTracker,
     BatchedOutputHandler,
+    StreamingFileOutputHandler,
     Profiler,
     CREDENTIALS_FILENAME,
     CREDENTIALS_VERSION,
@@ -4322,19 +4323,68 @@ async def main_async(args):
     if profiler:
         tree_walk_start = time.time()
 
-    # Only collect results if we need post-processing or file output
-    # Don't collect when streaming to stdout (saves memory)
-    # Don't collect for owner reports (they track stats separately)
-    collect_results = args.resolve_links or args.acl_report or args.find_similar or args.csv_out or args.json_out
+    # Determine which features require collecting all results in memory
+    # - acl_report: needs to fetch ACLs after walk completes
+    # - find_similar: needs cross-file comparison
+    # - resolve_links combined with non-streaming output: needs post-walk resolution
+    #
+    # Features that CAN be streamed (memory-efficient):
+    # - csv_out: write rows as entries arrive
+    # - json_out: write NDJSON lines as entries arrive
+    # - stdout output: already streams
+    #
+    # This change fixes OOM crashes when using --csv-out with millions of files
+    features_requiring_collection = args.acl_report or args.find_similar
 
-    # Create output callback for streaming results to stdout (plain text mode only)
-    # Disable streaming if --resolve-links is enabled (need to resolve after collection)
-    # Disable streaming if --acl-report is enabled (generates its own report)
-    # Disable streaming if --find-similar is enabled (need to collect all files first)
+    # resolve_links with file output can be streamed (resolve per-entry)
+    # resolve_links with stdout still needs collection for backward compatibility
+    resolve_links_needs_collection = args.resolve_links and not (args.csv_out or args.json_out)
+
+    collect_results = features_requiring_collection or resolve_links_needs_collection
+
+    # Create output callback for streaming results
     output_callback = None
     batched_handler = None
+    streaming_file_handler = None
 
-    if not args.owner_report and not args.acl_report and not args.csv_out and not args.json_out and not args.resolve_links and not args.find_similar:
+    # STREAMING FILE OUTPUT: Use StreamingFileOutputHandler for --csv-out / --json-out
+    # This writes entries to file as they arrive, avoiding OOM with large result sets
+    if (args.csv_out or args.json_out) and not features_requiring_collection:
+        output_format = "json" if args.json_out else "csv"
+        output_path = args.json_out if args.json_out else args.csv_out
+
+        streaming_file_handler = StreamingFileOutputHandler(
+            client=client,
+            output_path=output_path,
+            output_format=output_format,
+            batch_size=1000,  # Batch for identity resolution
+            show_owner=args.show_owner,
+            show_group=args.show_group,
+            all_attributes=args.all_attributes,
+            progress=progress,
+            args=args,
+        )
+
+        async def output_callback(entry):
+            # Handle resolve_links inline for streaming mode
+            if args.resolve_links and entry.get("type") == "FS_FILE_TYPE_SYMLINK":
+                async with client.create_session() as link_session:
+                    target = await client.read_symlink(link_session, entry["path"])
+                    if target:
+                        if not target.startswith('/'):
+                            symlink_dir = os.path.dirname(entry["path"])
+                            entry["symlink_target"] = os.path.normpath(os.path.join(symlink_dir, target))
+                        else:
+                            entry["symlink_target"] = target
+                    else:
+                        entry["symlink_target"] = "(unreadable)"
+            await streaming_file_handler.add_entry(entry)
+
+        # Open the file and write header
+        await streaming_file_handler.open()
+
+    # STDOUT STREAMING: existing logic for stdout output
+    elif not args.owner_report and not args.acl_report and not args.find_similar and not resolve_links_needs_collection:
         if args.show_owner or args.show_group:
             # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
@@ -4427,14 +4477,32 @@ async def main_async(args):
 
     # Add diagnostic timing
     if args.progress or args.verbose:
-        print(
-            f"[INFO] Tree walk completed, collected {len(matching_files)} matching files",
-            file=sys.stderr,
-        )
+        if streaming_file_handler:
+            # Streaming mode - count comes from handler
+            pass  # Will be reported after handler close
+        else:
+            print(
+                f"[INFO] Tree walk completed, collected {len(matching_files)} matching files",
+                file=sys.stderr,
+            )
 
     # Flush any remaining batched output
     if batched_handler:
         await batched_handler.flush()
+
+    # Close streaming file handler and report results
+    if streaming_file_handler:
+        await streaming_file_handler.close()
+        rows_written = streaming_file_handler.get_rows_written()
+        output_path = args.json_out if args.json_out else args.csv_out
+        if args.verbose or args.progress:
+            print(
+                f"\n[INFO] Streaming complete: wrote {rows_written:,} rows to {output_path}",
+                file=sys.stderr,
+            )
+        # Save identity cache and exit - no further processing needed
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return
 
     # Resolve owner and group identities if --show-owner or --show-group is enabled (for non-streaming modes only)
     # Skip if batched_handler was used (streaming mode)

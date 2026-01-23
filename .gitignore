@@ -20,3 +20,5 @@ PLAN-change*
 docs/
 codefield.md
 design_docs/
+test_migration.csv
+ace_manipulation*

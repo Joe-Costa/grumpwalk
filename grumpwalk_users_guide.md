@@ -1273,10 +1273,53 @@ for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=T
 
 ### How do I reduce memory usage?
 
+Memory usage scales primarily with the number of subdirectories being traversed, not the number of files. The main memory consumers are:
+
+| Component | Impact | Tunable |
+|-----------|--------|---------|
+| Subdirectory queue | O(num_dirs) - paths held for processing | Partial |
+| Concurrency buffers | O(max_concurrent) - async task overhead | Yes |
+| Identity cache | O(unique_owners) - auth_id mappings | No |
+| Connection pool | O(connector_limit) - HTTP connections | Yes |
+
+**Reduce concurrency for memory-constrained systems:**
+```bash
+# For systems with <8GB RAM
+./grumpwalk.py --host cluster --path /data \
+  --max-concurrent 25 \
+  --connector-limit 25 \
+  --progress
+```
+
 **Process output in streaming fashion:**
 ```bash
+# Stream directly to compressed file (minimal memory)
 ./grumpwalk.py --host cluster --path /data --progress | \
   gzip > inventory.ndjson.gz
+
+# Stream to CSV file (writes rows incrementally)
+./grumpwalk.py --host cluster --path /data \
+  --csv-out inventory.csv \
+  --progress
+```
+
+**Limit traversal depth:**
+```bash
+# Process shallower trees to limit queued directories
+./grumpwalk.py --host cluster --path /data \
+  --max-depth 5 \
+  --progress
+```
+
+**Process large trees in segments:**
+```bash
+# Instead of crawling /data with 500k subdirectories at once,
+# process top-level directories separately
+for dir in project1 project2 project3; do
+  ./grumpwalk.py --host cluster --path /data/$dir \
+    --csv-out ${dir}_inventory.csv \
+    --progress
+done
 ```
 
 **Limit results for quick checks:**
@@ -1286,12 +1329,63 @@ for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=T
   --limit 1000
 ```
 
+### Memory Planning Guide
+
+Use this formula to estimate RAM requirements:
+
+```
+RAM (GB) ~ (subdirectories / 50000) + (max_concurrent * 0.05) + 0.5
+```
+
+**Example calculations:**
+- 50k subdirs, default concurrency: `50000/50000 + 100*0.05 + 0.5 = 6.5 GB`
+- 500k subdirs, default concurrency: `500000/50000 + 100*0.05 + 0.5 = 15.5 GB`
+- 500k subdirs, reduced concurrency: `500000/50000 + 25*0.05 + 0.5 = 11.75 GB`
+
+**Recommended configurations by available RAM:**
+
+| Available RAM | --max-concurrent | --connector-limit | Notes |
+|---------------|------------------|-------------------|-------|
+| 4 GB | 25 | 25 | Use --max-depth or segment paths |
+| 8 GB | 50 | 50 | OK for <100k directories |
+| 16 GB | 100 | 100 | Default, handles most cases |
+| 32+ GB | 200-500 | 200 | High performance mode |
+
+**Low-memory configuration example:**
+```bash
+# For 4GB RAM systems with large directory trees
+./grumpwalk.py --host cluster --path /data \
+  --max-concurrent 25 \
+  --connector-limit 25 \
+  --max-depth 3 \
+  --csv-out inventory.csv \
+  --progress
+```
+
 ### How do I handle very large directories?
 
 **Skip directories with too many entries:**
 ```bash
 ./grumpwalk.py --host cluster --path /data \
   --max-entries-per-dir 100000 \
+  --progress
+```
+
+**Skip known large or irrelevant directories:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --omit-subdirs '.snapshot' \
+  --omit-subdirs 'tmp' \
+  --omit-subdirs 'cache' \
+  --progress
+```
+
+**Skip specific paths entirely:**
+```bash
+./grumpwalk.py --host cluster --path / \
+  --omit-path /var/log \
+  --omit-path /tmp \
+  --omit-path /scratch \
   --progress
 ```
 

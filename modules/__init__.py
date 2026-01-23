@@ -18,6 +18,8 @@ from .utils import (
 from .output import (
     ProgressTracker,
     BatchedOutputHandler,
+    StreamingFileOutputHandler,
+    CANONICAL_FILE_FIELDS,
     Profiler,
 )
 
@@ -61,6 +63,8 @@ __all__ = [
     # Output
     "ProgressTracker",
     "BatchedOutputHandler",
+    "StreamingFileOutputHandler",
+    "CANONICAL_FILE_FIELDS",
     "Profiler",
     # Credentials
     "CREDENTIALS_FILENAME",
