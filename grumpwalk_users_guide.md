@@ -1255,14 +1255,6 @@ for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=T
   --progress
 ```
 
-**For local network with low latency:**
-```bash
-./grumpwalk.py --host cluster --path /data \
-  --max-concurrent 1000 \
-  --connector-limit 1000 \
-  --progress
-```
-
 ### How do I profile performance bottlenecks?
 
 ```bash
