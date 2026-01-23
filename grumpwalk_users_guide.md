@@ -1247,7 +1247,7 @@ for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=T
 
 ### How do I maximize crawl speed?
 
-**For large clusters (>10M files):**
+**For large clusters (>10M files): REVIEW RAM USE GUIDELINES FIRST!**
 ```bash
 ./grumpwalk.py --host cluster --path /data \
   --max-concurrent 500 \
