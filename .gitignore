@@ -16,3 +16,6 @@ __pycache__/
 test_range_*.py
 HELP_ORGANIZATION_DESIGN.md
 CLAUDE.md
+test_migration.csv
+PLAN-change*
+ace_manipulation*
