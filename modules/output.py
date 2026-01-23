@@ -269,6 +269,295 @@ class BatchedOutputHandler:
             await self._flush_batch()
 
 
+# Canonical field order for Qumulo API file entries
+# Used for CSV headers when --all-attributes is specified
+CANONICAL_FILE_FIELDS = [
+    # Core identity
+    "path",
+    "name",
+    "type",
+    "id",
+    "file_number",
+    # Size and blocks
+    "size",
+    "blocks",
+    "datablocks",
+    "metablocks",
+    # Ownership
+    "owner",
+    "owner_details",
+    "group",
+    "group_details",
+    # Timestamps
+    "creation_time",
+    "modification_time",
+    "access_time",
+    "change_time",
+    # Permissions and links
+    "mode",
+    "num_links",
+    # Extended info
+    "child_count",
+    "symlink_target_type",
+    "major_minor_numbers",
+    "extended_attributes",
+    "directory_entry_hash_policy",
+    "data_revision",
+    "user_metadata_revision",
+]
+
+
+class StreamingFileOutputHandler:
+    """
+    Memory-efficient streaming output handler for CSV and JSON file output.
+
+    Writes entries to file as they arrive, batching only for identity resolution.
+    Memory usage is O(batch_size) regardless of total file count.
+
+    This solves the OOM issue where --csv-out with millions of files would
+    accumulate all entries in memory before writing.
+    """
+
+    def __init__(
+        self,
+        client: "AsyncQumuloClient",
+        output_path: str,
+        output_format: str = "csv",
+        batch_size: int = 1000,
+        show_owner: bool = False,
+        show_group: bool = False,
+        all_attributes: bool = False,
+        progress: Optional["ProgressTracker"] = None,
+        args=None,
+    ):
+        """
+        Initialize streaming file output handler.
+
+        Args:
+            client: AsyncQumuloClient for identity resolution
+            output_path: Path to output file
+            output_format: 'csv' or 'json'
+            batch_size: Number of entries to batch for identity resolution
+            show_owner: Resolve and include owner names
+            show_group: Resolve and include group names
+            all_attributes: Include all file attributes (vs minimal)
+            progress: Optional ProgressTracker
+            args: Command-line args for determining which fields to include
+        """
+        self.client = client
+        self.output_path = output_path
+        self.output_format = output_format
+        self.batch_size = batch_size
+        self.show_owner = show_owner
+        self.show_group = show_group
+        self.all_attributes = all_attributes
+        self.progress = progress
+        self.args = args
+
+        self.batch = []
+        self.lock = asyncio.Lock()
+        self.file_handle = None
+        self.csv_writer = None
+        self.header_written = False
+        self.rows_written = 0
+
+    def _get_fieldnames(self) -> list:
+        """Determine CSV fieldnames based on configuration."""
+        if self.all_attributes:
+            # Use canonical field list plus any resolved name fields
+            fieldnames = list(CANONICAL_FILE_FIELDS)
+            if self.show_owner:
+                fieldnames.insert(fieldnames.index("owner") + 1, "owner_name")
+            if self.show_group:
+                fieldnames.insert(fieldnames.index("group") + 1, "group_name")
+            return fieldnames
+        else:
+            # Minimal fields based on what filters are active
+            fieldnames = ["path"]
+
+            # Add time field if time filter was used
+            if self.args:
+                if (self.args.older_than or self.args.newer_than or
+                    self.args.accessed_older_than or self.args.accessed_newer_than or
+                    self.args.modified_older_than or self.args.modified_newer_than or
+                    self.args.created_older_than or self.args.created_newer_than or
+                    self.args.changed_older_than or self.args.changed_newer_than):
+                    fieldnames.append(self.args.time_field)
+
+                # Add size if size filter was used
+                if self.args.larger_than or self.args.smaller_than:
+                    fieldnames.append("size")
+
+            # Add owner/group if requested
+            if self.show_owner:
+                fieldnames.append("owner")
+            if self.show_group:
+                fieldnames.append("group")
+
+            # Add symlink_target if resolve-links would be used
+            if self.args and self.args.resolve_links:
+                fieldnames.append("symlink_target")
+
+            return fieldnames
+
+    def _flatten_entry(self, entry: dict) -> dict:
+        """Flatten nested dicts for CSV output."""
+        flat = {}
+        for key, value in entry.items():
+            if isinstance(value, dict):
+                # Convert nested dicts to JSON string for CSV
+                flat[key] = json_parser.dumps(value)
+            else:
+                flat[key] = value
+        return flat
+
+    async def open(self):
+        """Open the output file and write header if CSV."""
+        import csv
+
+        self.file_handle = open(self.output_path, "w", newline="")
+
+        if self.output_format == "csv":
+            fieldnames = self._get_fieldnames()
+            self.csv_writer = csv.DictWriter(
+                self.file_handle,
+                fieldnames=fieldnames,
+                extrasaction="ignore"
+            )
+            self.csv_writer.writeheader()
+            self.header_written = True
+
+    async def add_entry(self, entry: dict):
+        """Add entry to batch and flush if batch is full."""
+        async with self.lock:
+            self.batch.append(entry)
+
+            if len(self.batch) >= self.batch_size:
+                await self._flush_batch()
+
+    async def _flush_batch(self):
+        """Resolve identities for current batch and write to file."""
+        if not self.batch:
+            return
+
+        if not self.file_handle:
+            await self.open()
+
+        identity_cache = {}
+
+        # Collect unique auth_ids for resolution
+        if self.show_owner or self.show_group:
+            unique_auth_ids = set()
+
+            if self.show_owner:
+                for entry in self.batch:
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                    if owner_auth_id:
+                        unique_auth_ids.add(str(owner_auth_id))
+
+            if self.show_group:
+                for entry in self.batch:
+                    group_details = entry.get("group_details", {})
+                    group_auth_id = group_details.get("auth_id") or entry.get("group")
+                    if group_auth_id:
+                        unique_auth_ids.add(str(group_auth_id))
+
+            # Resolve identities in batch
+            if unique_auth_ids:
+                async with self.client.create_session() as session:
+                    identity_cache = await self.client.resolve_multiple_identities(
+                        session, list(unique_auth_ids)
+                    )
+
+        # Write entries to file
+        for entry in self.batch:
+            # Check output limit
+            if self.progress and not self.progress.can_output():
+                break
+
+            # Add resolved owner name if requested
+            if self.show_owner:
+                owner_details = entry.get("owner_details", {})
+                owner_auth_id = str(owner_details.get("auth_id") or entry.get("owner", ""))
+                if owner_auth_id and owner_auth_id in identity_cache:
+                    identity = identity_cache[owner_auth_id]
+                    entry["owner_name"] = format_owner_name(identity)
+                else:
+                    entry["owner_name"] = "Unknown"
+
+            # Add resolved group name if requested
+            if self.show_group:
+                group_details = entry.get("group_details", {})
+                group_auth_id = str(group_details.get("auth_id") or entry.get("group", ""))
+                if group_auth_id and group_auth_id in identity_cache:
+                    identity = identity_cache[group_auth_id]
+                    entry["group_name"] = format_owner_name(identity)
+                else:
+                    entry["group_name"] = "Unknown"
+
+            if self.output_format == "csv":
+                if self.all_attributes:
+                    # Flatten nested dicts and write all fields
+                    flat_entry = self._flatten_entry(entry)
+                    self.csv_writer.writerow(flat_entry)
+                else:
+                    # Write minimal row
+                    row = {"path": entry["path"]}
+                    if self.args:
+                        if (self.args.older_than or self.args.newer_than or
+                            self.args.accessed_older_than or self.args.accessed_newer_than or
+                            self.args.modified_older_than or self.args.modified_newer_than or
+                            self.args.created_older_than or self.args.created_newer_than or
+                            self.args.changed_older_than or self.args.changed_newer_than):
+                            row[self.args.time_field] = entry.get(self.args.time_field)
+                        if self.args.larger_than or self.args.smaller_than:
+                            row["size"] = entry.get("size")
+                        if self.args.resolve_links and "symlink_target" in entry:
+                            row["symlink_target"] = entry.get("symlink_target")
+                    if self.show_owner:
+                        row["owner"] = entry.get("owner_name", "Unknown")
+                    if self.show_group:
+                        row["group"] = entry.get("group_name", "Unknown")
+                    self.csv_writer.writerow(row)
+            else:
+                # JSON output (NDJSON)
+                try:
+                    self.file_handle.write(
+                        json_parser.dumps(entry, escape_forward_slashes=False) + "\n"
+                    )
+                except TypeError:
+                    self.file_handle.write(json_parser.dumps(entry) + "\n")
+
+            self.rows_written += 1
+
+            # Update progress
+            if self.progress:
+                await self.progress.increment_output()
+
+        # Flush to disk periodically
+        self.file_handle.flush()
+
+        # Clear batch
+        self.batch = []
+
+    async def flush(self):
+        """Flush any remaining entries."""
+        async with self.lock:
+            await self._flush_batch()
+
+    async def close(self):
+        """Close the output file."""
+        await self.flush()
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+
+    def get_rows_written(self) -> int:
+        """Return the number of rows written."""
+        return self.rows_written
+
+
 class Profiler:
     """Track detailed performance metrics for profiling."""
 
