@@ -887,13 +887,6 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
   --acl-report --acl-resolve-names --max-depth 1
 ```
 
-### How do I find files with broken inheritance?
-
-```bash
-./grumpwalk.py --host cluster --path /data \
-  --acl-report --progress | \
-  jq 'select(.acl.control | contains(["DACL_PROTECTED"]))'
-```
 
 ---
 
