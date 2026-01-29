@@ -1242,9 +1242,8 @@ def parse_trustee(trustee_input: str) -> Dict:
 
     # NetBIOS domain format (DOMAIN\username)
     if "\\" in trustee:
-        # Need to escape the backslash for JSON
         domain, username = trustee.split("\\", 1)
-        return {"payload": {"name": f"{domain}\\\\{username}"}, "type": "name"}
+        return {"payload": {"name": f"{domain}\\{username}"}, "type": "name"}
 
     # Email or LDAP DN format
     if "@" in trustee or trustee.startswith("CN="):

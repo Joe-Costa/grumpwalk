@@ -44,7 +44,8 @@ async def resolve_owner_filters(
         parse_trustee: Function to parse trustee strings (from ACL module)
 
     Returns:
-        Set of auth_ids to match, or None if no owner filter specified
+        None if no owner filter specified, otherwise a set of auth_ids
+        (may be empty if resolution failed - filter will match nothing)
     """
     if not args.owners:
         return None
@@ -129,7 +130,9 @@ async def resolve_owner_filters(
             expanded_ids.update(equivalent_ids)
         return expanded_ids
 
-    return all_auth_ids if all_auth_ids else None
+    # Return the set even if empty - this ensures the filter is applied
+    # and matches nothing when owner was specified but couldn't be resolved
+    return all_auth_ids
 
 
 def glob_to_regex(pattern: str) -> str:
