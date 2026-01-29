@@ -98,7 +98,7 @@ A practical guide with recipes for common storage administration tasks using gru
 ./grumpwalk.py --host cluster --path /data --larger-than 1GB --type file --progress
 ```
 
-**Find small files (under 1KB) - potential stub files:**
+**Find small files (under 1KB)**
 ```bash
 ./grumpwalk.py --host cluster --path /data --smaller-than 1KB --type file
 ```
@@ -109,11 +109,6 @@ A practical guide with recipes for common storage administration tasks using gru
   --larger-than 100MB --smaller-than 1GB --type file
 ```
 
-**Find the largest files in a directory:**
-```bash
-./grumpwalk.py --host cluster --path /home --type file --progress | \
-  jq -s 'sort_by(.size) | reverse | .[0:20]'
-```
 
 ### How do I find files by age?
 
@@ -153,7 +148,13 @@ A practical guide with recipes for common storage administration tasks using gru
 
 **Find files owned by an AD user:**
 ```bash
-./grumpwalk.py --host cluster --path /shared --owner "DOMAIN\\jsmith" --ad
+./grumpwalk.py --host cluster --path /shared --owner "jsmith" --ad
+```
+
+****Find files owned by an AD user (Alternate method):**
+
+```bash
+./grumpwalk.py --host cluster --path /shared --owner "AD\jsmith"
 ```
 
 **Find files owned by multiple users (OR logic):**
