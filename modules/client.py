@@ -76,15 +76,53 @@ class AsyncQumuloClient:
         self.cache_hits = 0
         self.cache_misses = 0
 
-    def create_session(self) -> aiohttp.ClientSession:
-        """Create optimized ClientSession with connection pooling."""
+    def create_session(self, connect_timeout: int = 30) -> aiohttp.ClientSession:
+        """Create optimized ClientSession with connection pooling and timeouts."""
         connector = aiohttp.TCPConnector(
             limit=self.connector_limit,
             limit_per_host=self.connector_limit,
             ttl_dns_cache=300,
             ssl=self.ssl_context,
         )
-        return aiohttp.ClientSession(connector=connector, headers=self.headers)
+        # Set reasonable timeouts to fail fast on unreachable hosts
+        timeout = aiohttp.ClientTimeout(
+            total=None,  # No total timeout (allow long operations)
+            connect=connect_timeout,  # Connection timeout
+            sock_connect=connect_timeout,  # Socket connection timeout
+            sock_read=60,  # Read timeout per chunk
+        )
+        return aiohttp.ClientSession(
+            connector=connector,
+            headers=self.headers,
+            timeout=timeout
+        )
+
+    async def test_connection(self, timeout: int = 10) -> bool:
+        """
+        Test basic TCP connectivity to the cluster (no auth required).
+
+        Args:
+            timeout: Connection timeout in seconds
+
+        Returns:
+            True if connection succeeds
+
+        Raises:
+            asyncio.TimeoutError: If connection times out
+            OSError: If connection refused or host unreachable
+        """
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port, ssl=self.ssl_context),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except asyncio.TimeoutError:
+            raise
+        except OSError:
+            raise
 
     async def get_directory_page(
         self,

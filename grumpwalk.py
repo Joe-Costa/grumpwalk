@@ -2963,6 +2963,31 @@ async def main_async(args):
         verbose=args.verbose,
     )
 
+    # Test basic TCP connectivity to cluster before proceeding
+    print("Verifying cluster connection...", file=sys.stderr, end=" ", flush=True)
+    try:
+        await client.test_connection(timeout=10)
+        print("OK", file=sys.stderr)
+    except asyncio.TimeoutError:
+        print("FAILED", file=sys.stderr)
+        print(f"\n[ERROR] Connection timed out to {args.host}:{args.port}", file=sys.stderr)
+        print(f"[HINT] Check that the cluster is powered on and reachable", file=sys.stderr)
+        print(f"[HINT] Verify the hostname/IP and port are correct", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print("FAILED", file=sys.stderr)
+        print(f"\n[ERROR] Cannot connect to {args.host}:{args.port}", file=sys.stderr)
+        err_str = str(e).lower()
+        if "refused" in err_str or "errno 61" in err_str or "errno 111" in err_str:
+            print(f"[HINT] Connection refused - verify host and port are correct", file=sys.stderr)
+        elif "no route" in err_str or "unreachable" in err_str:
+            print(f"[HINT] Host unreachable - check network connectivity", file=sys.stderr)
+        elif "nodename" in err_str or "name or service not known" in err_str or "errno 8" in err_str:
+            print(f"[HINT] DNS resolution failed - check hostname spelling", file=sys.stderr)
+        else:
+            print(f"[HINT] {e}", file=sys.stderr)
+        sys.exit(1)
+
     # ACL Cloning Mode
     if args.source_acl or args.source_acl_file or args.acl_target:
         # Validate: need a source and a target
