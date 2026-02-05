@@ -10,12 +10,20 @@ from typing import Optional, Dict
 from urllib.parse import urlparse, parse_qs
 
 
-def format_http_error(status: int, url: str, path: Optional[str] = None) -> str:
+def format_http_error(status: int, url: str, path: Optional[str] = None, host: Optional[str] = None) -> str:
     """Format HTTP error with helpful context and suggestions."""
+    # Extract host from URL if not provided
+    if not host:
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or "<cluster>"
+        except Exception:
+            host = "<cluster>"
+
     error_messages = {
         401: (
             "Authentication failed (401 Unauthorized)",
-            "Your credentials may have expired. Please run: qq --host <cluster> login"
+            f"Your credentials may have expired. Run: qq --host {host} login"
         ),
         403: (
             "Access denied (403 Forbidden)",

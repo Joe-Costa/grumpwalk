@@ -2988,6 +2988,22 @@ async def main_async(args):
             print(f"[HINT] {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Test authentication before proceeding
+    print("Verifying credentials...", file=sys.stderr, end=" ", flush=True)
+    async with client.create_session() as session:
+        try:
+            await client.test_auth(session)
+            print("OK", file=sys.stderr)
+        except aiohttp.ClientResponseError as e:
+            print("FAILED", file=sys.stderr)
+            if e.status == 401:
+                print(f"\n[ERROR] Authentication failed (401 Unauthorized)", file=sys.stderr)
+                print(f"[HINT] Your bearer token may be expired or invalid", file=sys.stderr)
+                print(f"[HINT] Generate a new token: qq --host {args.host} login", file=sys.stderr)
+            else:
+                print(f"\n[ERROR] HTTP {e.status}: {e.message}", file=sys.stderr)
+            sys.exit(1)
+
     # ACL Cloning Mode
     if args.source_acl or args.source_acl_file or args.acl_target:
         # Validate: need a source and a target

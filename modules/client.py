@@ -124,6 +124,32 @@ class AsyncQumuloClient:
         except OSError:
             raise
 
+    async def test_auth(self, session: aiohttp.ClientSession) -> bool:
+        """
+        Test authentication by making a lightweight API call.
+
+        Args:
+            session: aiohttp ClientSession with auth headers
+
+        Returns:
+            True if authentication succeeds
+
+        Raises:
+            aiohttp.ClientResponseError: If auth fails (401) or other HTTP error
+        """
+        # Use /v1/session/who-am-i as it requires auth and is lightweight
+        url = f"{self.base_url}/v1/session/who-am-i"
+        async with session.get(url, ssl=self.ssl_context) as response:
+            if response.status == 401:
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=401,
+                    message="Authentication failed"
+                )
+            response.raise_for_status()
+            return True
+
     async def get_directory_page(
         self,
         session: aiohttp.ClientSession,
