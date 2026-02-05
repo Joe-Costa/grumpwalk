@@ -606,7 +606,7 @@ Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-
 **Downgrade from FullControl to Modify:**
 ```bash
 ./grumpwalk.py --host cluster --path /shared \
-  --replace-ace "Allow:fd:Domain Users:FullControl" \
+  --replace-ace "Allow:Domain Users" \
   --new-ace "Allow:fd:Domain Users:Modify" \
   --propagate-changes --progress
 ```
@@ -1519,6 +1519,25 @@ done
 | `Deny::Everyone:w` | Deny, no inheritance, write only |
 | `Allow:fd:Group:Read` | Allow, file+dir inherit, Read rights |
 | `Allow:fd:User:FullControl` | Allow, file+dir inherit, all rights |
+
+### ACE Operation Behavior
+
+| Operation | When trustee exists | When trustee doesn't exist |
+|-----------|--------------------|-----------------------------|
+| `--add-ace` | Merges rights with existing ACE | Creates new ACE |
+| `--replace-ace` (alone) | Replaces flags and rights in-place | No change |
+| `--replace-ace` + `--new-ace` | Replaces first match, removes duplicates | No change |
+
+**Important:** When using `--replace-ace` with `--new-ace`:
+- The `--replace-ace` pattern is a **search pattern** using `Type:Trustee` format only
+- If multiple ACEs match the same trustee, all are consolidated into one
+- The first match is replaced; additional matches are deleted
+
+**Example:** If an ACL has three ACEs for "Domain Users" (Read, Write, Execute), running:
+```bash
+--replace-ace "Allow:Domain Users" --new-ace "Allow:fd:Domain Users:Modify"
+```
+Results in a single ACE with Modify rights; the other two are removed.
 
 ### Owner/Group Change Pattern Quick Reference
 
