@@ -177,7 +177,8 @@ A practical guide with recipes for common storage administration tasks using gru
 
 **Find empty directories:**
 ```bash
-./grumpwalk.py --host cluster --path /data --type directory --progress | \
+./grumpwalk.py --host cluster --path /data --type directory \
+  --json --all-attributes --progress | \
   jq 'select(.child_count == 0)'
 ```
 
@@ -250,6 +251,7 @@ TOTAL                                               268,789    4,467     2.67 TB
 ```bash
 ./grumpwalk.py --host cluster --path /projects \
   --accessed --older-than 180 \
+  --json --all-attributes \
   --type file | \
   jq -r '.path | split("/")[1:4] | join("/")' | sort | uniq -c | sort -rn | head -20
 ```
@@ -906,6 +908,7 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
 ```bash
 ./grumpwalk.py --host cluster --path /data \
   --modified --newer-than 3 \
+  --json --all-attributes \
   --type file | \
   jq 'select(.modification_time > "2024-01-15T00:00:00" and .modification_time < "2024-01-15T12:00:00")'
 ```
@@ -934,8 +937,8 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
 **Find files where Everyone has write access:**
 ```bash
 ./grumpwalk.py --host cluster --path /data \
-  --acl-report | \
-  jq 'select(.aces[] | select(.trustee_readable == "EVERYONE@" and (.rights | contains(["MODIFY"]))))'
+  --acl-report --json | \
+  jq 'select(.trustees[] | contains("EVERYONE@") and contains("w"))'
 ```
 
 ### How do I find recently created executable content?
@@ -1152,6 +1155,11 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
 
 ### How do I analyze results with jq?
 
+**Note:** These examples assume `inventory.ndjson` was created with `--json --all-attributes`:
+```bash
+./grumpwalk.py --host cluster --path /data --json --all-attributes > inventory.ndjson
+```
+
 **Count files by extension:**
 ```bash
 cat inventory.ndjson | \
@@ -1161,7 +1169,7 @@ cat inventory.ndjson | \
 
 **Sum total size:**
 ```bash
-cat inventory.ndjson | jq -s 'map(.size) | add'
+cat inventory.ndjson | jq -s 'map(.size | tonumber) | add'
 ```
 
 **Group by owner:**
@@ -1413,8 +1421,9 @@ CLUSTER="cluster.example.com"
 # Find stale data (not accessed in 365 days)
 STALE_SIZE=$(./grumpwalk.py --host $CLUSTER --path /data \
   --accessed --older-than 365 \
+  --json --all-attributes \
   --type file 2>/dev/null | \
-  jq -s 'map(.size) | add // 0' | \
+  jq -s 'map(.size | tonumber) | add // 0' | \
   awk '{print int($1/1024/1024/1024)}')
 
 if [ "$STALE_SIZE" -gt "$THRESHOLD_GB" ]; then
@@ -1447,8 +1456,9 @@ done
 
 **To jq for filtering:**
 ```bash
-./grumpwalk.py --host cluster --path /data | \
-  jq 'select(.size > 1073741824)' > large_files.json
+./grumpwalk.py --host cluster --path /data \
+  --json --all-attributes | \
+  jq 'select((.size | tonumber) > 1073741824)' > large_files.json
 ```
 
 **To gzip for compression:**
@@ -1459,9 +1469,9 @@ done
 
 **To xargs for further processing:**
 ```bash
+# Default output is one path per line, perfect for xargs
 ./grumpwalk.py --host cluster --path /tmp \
   --name '*.tmp' --older-than 7 --type file | \
-  jq -r '.path' | \
   xargs -I {} echo "Would delete: {}"
 ```
 
