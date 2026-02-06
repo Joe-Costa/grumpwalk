@@ -1,5 +1,7 @@
 # grumpwalk.py
 
+**Version 2.0.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
 - **Find files by name, owner, size or timestamps**

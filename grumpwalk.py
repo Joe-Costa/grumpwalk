@@ -8,6 +8,8 @@ Usage:
 
 """
 
+__version__ = "2.0.0"
+
 import argparse
 import asyncio
 import copy
@@ -5315,6 +5317,12 @@ Examples:
   # Change ACE type from Allow to Deny (using --new-ace for full replacement)
   ./grumpwalk.py --host cluster.example.com --path /data --replace-ace 'Allow:Group111' --new-ace 'Deny:fd:Group111:rw' --propagate-changes
         """,
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"grumpwalk {__version__}"
     )
 
     # ============================================================================
