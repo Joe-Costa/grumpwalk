@@ -552,6 +552,8 @@ OLDDOMAIN\jsmith,NEWDOMAIN\jsmith
 
 Use `--source-acl` and `--acl-target` to clone an entire ACL (all ACEs, owner, and group) from a source path to a target path.
 
+**Hint:** You can create and save one or more source directories with the ideal ACL to use as templates in some other location of the Qumulo cluster.
+
 **Copy ACL to a single directory:**
 ```bash
 ./grumpwalk.py --host cluster \
