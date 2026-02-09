@@ -548,6 +548,54 @@ OLDDOMAIN\jsmith,NEWDOMAIN\jsmith
   --propagate-changes --progress
 ```
 
+### How do I copy an ACL from one directory to another?
+
+Use `--source-acl` and `--acl-target` to clone an entire ACL (all ACEs, owner, and group) from a source path to a target path.
+
+**Copy ACL to a single directory:**
+```bash
+./grumpwalk.py --host cluster \
+  --source-acl /template/dir \
+  --acl-target /target/dir
+```
+
+**Copy ACL and apply to all children recursively:**
+```bash
+./grumpwalk.py --host cluster \
+  --source-acl /template/dir \
+  --acl-target /target/dir \
+  --propagate-acls --progress
+```
+
+**Copy ACL along with owner and group:**
+```bash
+./grumpwalk.py --host cluster \
+  --source-acl /template/dir \
+  --acl-target /target/dir \
+  --copy-owner --copy-group \
+  --propagate-acls --progress
+```
+
+**Copy only owner and group (no ACL changes):**
+```bash
+./grumpwalk.py --host cluster \
+  --source-acl /template/dir \
+  --acl-target /target/dir \
+  --copy-owner --copy-group --owner-group-only \
+  --propagate-acls
+```
+
+**Apply ACL only to files matching a filter:**
+```bash
+# Only apply to files older than 30 days
+./grumpwalk.py --host cluster \
+  --source-acl /template/dir \
+  --acl-target /target/dir \
+  --propagate-acls \
+  --older-than 30 --type file \
+  --progress
+```
+
 ### How do I keep two users' permissions in sync?
 
 Use `--sync-cloned-aces` to update existing ACEs to match the source user's rights.
