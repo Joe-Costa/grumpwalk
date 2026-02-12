@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import argparse
 import asyncio
@@ -173,7 +173,7 @@ def qacl_trustee_to_nfsv4(trustee: Dict, trustee_details: Optional[Dict] = None)
             return f'user:{name}' if name else f'uid:{uid}'
         elif domain == 'LOCAL_GROUP':
             return f'group:{name}' if name else f'gid:{gid}'
-        elif domain in ('AD_USER', 'AD_GROUP'):
+        elif domain in ('AD_USER', 'AD_GROUP', 'ACTIVE_DIRECTORY'):
             return name if name else f'sid:{trustee.get("sid")}'
         else:
             return f'unknown:{trustee.get("auth_id")}'
@@ -1036,7 +1036,7 @@ def break_acl_inheritance(acl: dict) -> dict:
 
     This:
     1. Removes 'INHERITED' flag from all ACEs
-    2. Adds 'DACL_PROTECTED' to control flags (blocks parent inheritance)
+    2. Adds 'PROTECTED' to control flags (blocks parent inheritance)
     3. Removes 'AUTO_INHERIT' from control flags
     4. Keeps 'PRESENT' in control flags
 
@@ -1065,7 +1065,7 @@ def break_acl_inheritance(acl: dict) -> dict:
     # Update control flags
     control = set(inner.get('control', []))
     control.add('PRESENT')
-    control.add('DACL_PROTECTED')
+    control.add('PROTECTED')
     control.discard('AUTO_INHERIT')
     inner['control'] = list(control)
 
@@ -3309,6 +3309,12 @@ async def main_async(args):
         if not args.path:
             print("[ERROR] --path is required for ACE manipulation", file=sys.stderr)
             sys.exit(1)
+
+        # Auto-convert --propagate-acls to --propagate-changes for ACE manipulation
+        # This provides better UX since users naturally try --propagate-acls
+        if args.propagate_acls and not args.propagate_changes:
+            args.propagate_changes = True
+            print("[INFO] Using --propagate-changes for ACE manipulation (--propagate-acls also accepted)", file=sys.stderr)
 
         # Validate --replace-ace / --new-ace pairing
         replace_count = len(args.replace_aces) if args.replace_aces else 0

@@ -322,7 +322,7 @@ Supported trustee formats in CSV (same as command-line):
 | `--clone-ace-map` | `mappings.csv` | Bulk clone ACEs from CSV file |
 
 **Supporting Flags:**
-- `--propagate-changes` - Apply changes to all children recursively (works with ACE and owner/group operations)
+- `--propagate-changes` - Apply changes to all children recursively (`--propagate-acls` also accepted)
 - `--sync-cloned-aces` - When cloning, update existing target ACEs to match source rights
 - `--dry-run` - Preview changes without applying them
 - `--ace-backup FILE` - Save original ACLs to JSON before modification (includes file_id for safety)
@@ -363,7 +363,7 @@ Flags (inheritance):
 **Inheritance Handling:**
 
 When modifying an inherited ACE (one that has the INHERITED flag), grumpwalk automatically:
-1. **Breaks inheritance** at the target path by adding DACL_PROTECTED to control flags
+1. **Breaks inheritance** at the target path by adding PROTECTED to control flags
 2. **Converts inherited ACEs to explicit** by removing the INHERITED flag from all ACEs
 3. **Applies your modifications** to the now-explicit ACE
 

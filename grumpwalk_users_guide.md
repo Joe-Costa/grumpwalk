@@ -1601,6 +1601,22 @@ done
 ```
 Results in a single ACE with Modify rights; the other two are removed.
 
+### Inheritance Handling
+
+When modifying an inherited ACE, grumpwalk automatically:
+1. Breaks inheritance at the target path (sets PROTECTED control flag)
+2. Converts inherited ACEs to explicit (removes INHERITED flag)
+3. Applies your modifications
+
+This establishes the target as a new inheritance root. Use `--propagate-changes` to push the modified ACL to children.
+
+To restart inheritance from a parent, use ACL cloning:
+```bash
+./grumpwalk.py --host cluster.example.com \
+  --source-acl /parent/path --acl-target /child/path \
+  --propagate-acls --progress
+```
+
 ### Owner/Group Change Pattern Quick Reference
 
 | Pattern | Meaning |
@@ -1614,7 +1630,7 @@ Results in a single ACE with Modify rights; the other two are removed.
 
 ### Propagation Flag
 
-The `--propagate-changes` flag applies modifications recursively to all children:
+The `--propagate-changes` flag applies modifications recursively to all children (note: `--propagate-acls` is also accepted):
 
 | Without flag | Only the target path is modified |
 |--------------|----------------------------------|

@@ -5,6 +5,19 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2025-02-12
+
+### Fixed
+
+- ACL inheritance breaking now uses correct `PROTECTED` control flag (was using invalid `DACL_PROTECTED`)
+- Trustee names now display correctly for Active Directory users/groups (was showing `unknown:auth_id`)
+
+### Changed
+
+- `--propagate-acls` is now accepted for ACE manipulation operations (auto-converts to `--propagate-changes`)
+
+---
+
 ## [2.0.0] - 2025-02-06
 
 Initial versioned release of grumpwalk.
