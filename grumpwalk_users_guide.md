@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.0.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.0.1** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 

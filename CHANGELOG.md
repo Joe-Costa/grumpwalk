@@ -93,3 +93,13 @@ Initial versioned release of grumpwalk.
 ---
 
 For installation and usage, see [README.md](README.md) and [grumpwalk_users_guide.md](grumpwalk_users_guide.md).
+
+---
+
+## Release Checklist
+
+When releasing a new version, update the version number in:
+1. `grumpwalk.py` - `__version__` variable
+2. `README.md` - Version line at top
+3. `grumpwalk_users_guide.md` - Version line at top
+4. `CHANGELOG.md` - Add new version section
