@@ -58,6 +58,13 @@ from modules import (
     glob_to_regex,
     create_file_filter,
 )
+from modules.tuning import (
+    load_tuning_profile,
+    save_tuning_profile,
+    generate_tuning_profile,
+    format_profile_summary,
+    get_profile_path,
+)
 
 try:
     import aiohttp
@@ -5264,6 +5271,53 @@ async def main_async(args):
 
 
 def main():
+    # Load or generate tuning profile for defaults
+    tuning_profile = load_tuning_profile()
+    is_first_run = tuning_profile is None
+
+    # Check for --retune or --show-tuning early (before full arg parsing)
+    if '--retune' in sys.argv:
+        profile_name = 'balanced'
+        for i, arg in enumerate(sys.argv):
+            if arg == '--tuning-profile' and i + 1 < len(sys.argv):
+                profile_name = sys.argv[i + 1]
+        tuning_profile = generate_tuning_profile(profile_name)
+        save_tuning_profile(tuning_profile)
+        print("=" * 70, file=sys.stderr)
+        print("GrumpWalk - Tuning Profile Regenerated", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(format_profile_summary(tuning_profile), file=sys.stderr)
+        print("", file=sys.stderr)
+        print(f"Profile saved to: {get_profile_path()}", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        sys.exit(0)
+
+    if '--show-tuning' in sys.argv:
+        if tuning_profile is None:
+            tuning_profile = generate_tuning_profile('balanced')
+        print("=" * 70, file=sys.stderr)
+        print("GrumpWalk - Current Tuning Profile", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(format_profile_summary(tuning_profile), file=sys.stderr)
+        print("", file=sys.stderr)
+        profile_path = get_profile_path()
+        if profile_path.exists():
+            print(f"Profile file: {profile_path}", file=sys.stderr)
+        else:
+            print("Profile file: (not yet saved)", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        sys.exit(0)
+
+    # Get defaults from profile (or use hardcoded defaults if no profile)
+    if tuning_profile:
+        default_max_concurrent = tuning_profile['recommended']['max_concurrent']
+        default_connector_limit = tuning_profile['recommended']['connector_limit']
+        default_acl_concurrency = tuning_profile['recommended']['acl_concurrency']
+    else:
+        default_max_concurrent = 100
+        default_connector_limit = 100
+        default_acl_concurrency = 100
+
     parser = argparse.ArgumentParser(
         description="Qumulo File Filter and Directory Tree Walker Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -5701,9 +5755,9 @@ Examples:
     acl_management.add_argument(
         "--acl-concurrency",
         type=int,
-        default=100,
+        default=default_acl_concurrency,
         metavar="N",
-        help="Concurrent ACL operations during propagation (default: 100, try 500 for faster throughput)"
+        help=f"Concurrent ACL operations during propagation (default: {default_acl_concurrency})"
     )
 
     acl_management.add_argument(
@@ -5974,19 +6028,35 @@ Examples:
     # PERFORMANCE TUNING
     # ============================================================================
     performance = parser.add_argument_group('Performance Tuning',
-        'Tune concurrency and connection pool settings')
+        'Tune concurrency and connection pool settings (auto-tuned on first run)')
 
     performance.add_argument(
         "--max-concurrent",
         type=int,
-        default=100,
-        help="Maximum concurrent operations (default: 100)",
+        default=default_max_concurrent,
+        help=f"Maximum concurrent operations (default: {default_max_concurrent})",
     )
     performance.add_argument(
         "--connector-limit",
         type=int,
-        default=100,
-        help="Maximum HTTP connections in pool (default: 100)",
+        default=default_connector_limit,
+        help=f"Maximum HTTP connections in pool (default: {default_connector_limit})",
+    )
+    performance.add_argument(
+        "--retune",
+        action="store_true",
+        help="Regenerate tuning profile based on current system",
+    )
+    performance.add_argument(
+        "--show-tuning",
+        action="store_true",
+        help="Display current tuning profile and exit",
+    )
+    performance.add_argument(
+        "--tuning-profile",
+        choices=['conservative', 'balanced', 'aggressive'],
+        default='balanced',
+        help="Tuning profile (default: balanced)",
     )
 
     # Enable argcomplete bash completion if available
@@ -6057,6 +6127,22 @@ Examples:
         )
         print("Please choose either CSV or JSON output format", file=sys.stderr)
         sys.exit(1)
+
+    # Handle first-run tuning profile generation
+    if is_first_run:
+        profile_name = args.tuning_profile if hasattr(args, 'tuning_profile') else 'balanced'
+        tuning_profile = generate_tuning_profile(profile_name)
+        save_tuning_profile(tuning_profile)
+        print("=" * 70, file=sys.stderr)
+        print("GrumpWalk - First Run Setup", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print("Detected system configuration:", file=sys.stderr)
+        print(format_profile_summary(tuning_profile), file=sys.stderr)
+        print("", file=sys.stderr)
+        print(f"Profile saved to: {get_profile_path()}", file=sys.stderr)
+        print("(Use --retune to regenerate, --show-tuning to view)", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print("", file=sys.stderr)
 
     # Run async main
     try:
