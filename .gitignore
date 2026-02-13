@@ -22,3 +22,5 @@ codefield.md
 design_docs/
 test_migration.csv
 ace_manipulation*
+auto-tuning-plan.md
+tuning-profile

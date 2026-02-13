@@ -150,6 +150,11 @@ def calculate_base_concurrency(memory_gb: float) -> Dict[str, int]:
     """
     Calculate base concurrency values from available memory.
 
+    Note: Cluster/network capacity is typically the bottleneck, not local RAM.
+    Benchmarks show optimal throughput around 200-350 concurrent operations,
+    with diminishing returns above 400. Values here are conservative to avoid
+    overwhelming the cluster.
+
     Args:
         memory_gb: Available system memory in GB
 
@@ -161,13 +166,20 @@ def calculate_base_concurrency(memory_gb: float) -> Dict[str, int]:
     elif memory_gb < 8:
         return {'max_concurrent': 100, 'connector_limit': 100, 'acl_concurrency': 100}
     elif memory_gb < 16:
-        return {'max_concurrent': 200, 'connector_limit': 200, 'acl_concurrency': 150}
+        return {'max_concurrent': 150, 'connector_limit': 150, 'acl_concurrency': 125}
     elif memory_gb < 32:
-        return {'max_concurrent': 400, 'connector_limit': 400, 'acl_concurrency': 300}
-    elif memory_gb < 64:
-        return {'max_concurrent': 700, 'connector_limit': 700, 'acl_concurrency': 500}
+        return {'max_concurrent': 200, 'connector_limit': 200, 'acl_concurrency': 150}
     else:
-        return {'max_concurrent': 1000, 'connector_limit': 1000, 'acl_concurrency': 800}
+        # 32GB+ RAM: cluster/network is the bottleneck, not memory
+        return {'max_concurrent': 250, 'connector_limit': 250, 'acl_concurrency': 200}
+
+
+# Profile caps based on benchmark data (optimal: 200-350, diminishing >400)
+PROFILE_CAPS = {
+    'conservative': {'max_concurrent': 150, 'connector_limit': 150, 'acl_concurrency': 125},
+    'balanced': {'max_concurrent': 300, 'connector_limit': 300, 'acl_concurrency': 250},
+    'aggressive': {'max_concurrent': 500, 'connector_limit': 500, 'acl_concurrency': 400},
+}
 
 
 def calculate_recommended_settings(
@@ -179,6 +191,10 @@ def calculate_recommended_settings(
 ) -> Dict[str, int]:
     """
     Calculate recommended settings based on system characteristics.
+
+    Note: Cluster/network capacity is typically the bottleneck, not local resources.
+    Values are capped based on benchmark data showing optimal throughput at 200-350
+    concurrent operations, with diminishing returns above 400.
 
     Args:
         memory_gb: Available memory in GB
@@ -194,26 +210,30 @@ def calculate_recommended_settings(
     base = calculate_base_concurrency(memory_gb)
 
     # Apply platform multiplier
-    multiplier = get_platform_multiplier(os_name, is_wsl)
+    platform_mult = get_platform_multiplier(os_name, is_wsl)
 
-    # Apply profile adjustment
+    # Apply profile multiplier (scales within profile caps)
     profile_multipliers = {
-        'conservative': 0.6,
+        'conservative': 0.8,
         'balanced': 1.0,
-        'aggressive': 1.4,
+        'aggressive': 1.5,
     }
     profile_mult = profile_multipliers.get(profile, 1.0)
 
-    # Calculate final values
-    final_multiplier = multiplier * profile_mult
-
+    # Calculate values with both multipliers
+    final_mult = platform_mult * profile_mult
     recommended = {
-        'max_concurrent': max(25, int(base['max_concurrent'] * final_multiplier)),
-        'connector_limit': max(25, int(base['connector_limit'] * final_multiplier)),
-        'acl_concurrency': max(25, int(base['acl_concurrency'] * final_multiplier)),
+        'max_concurrent': max(25, int(base['max_concurrent'] * final_mult)),
+        'connector_limit': max(25, int(base['connector_limit'] * final_mult)),
+        'acl_concurrency': max(25, int(base['acl_concurrency'] * final_mult)),
     }
 
-    # Cap at file descriptor limit (leave headroom for other operations)
+    # Apply profile caps (cluster/network is typically the bottleneck)
+    caps = PROFILE_CAPS.get(profile, PROFILE_CAPS['balanced'])
+    for key in recommended:
+        recommended[key] = min(recommended[key], caps[key])
+
+    # Also cap at file descriptor limit (leave headroom for other operations)
     fd_cap = max(25, fd_limit - 50)
     recommended['max_concurrent'] = min(recommended['max_concurrent'], fd_cap)
     recommended['connector_limit'] = min(recommended['connector_limit'], fd_cap)
@@ -374,3 +394,62 @@ def format_profile_summary(profile: Dict) -> str:
     ]
 
     return '\n'.join(lines)
+
+
+# Benchmark configuration
+BENCHMARK_CONCURRENCY_LEVELS = [100, 150, 200, 250, 300, 400]
+BENCHMARK_FILE_LIMIT = 20000  # Files to scan per test
+
+
+def format_benchmark_results(results: list) -> str:
+    """
+    Format benchmark results for display.
+
+    Args:
+        results: List of dicts with 'concurrent', 'rate', 'time' keys
+
+    Returns:
+        Formatted table string
+    """
+    if not results:
+        return "  No benchmark results"
+
+    lines = [
+        "  Concurrent | Rate (obj/sec) | Time",
+        "  -----------|----------------|------",
+    ]
+
+    best_rate = max(r['rate'] for r in results)
+
+    for r in results:
+        marker = " *" if r['rate'] == best_rate else ""
+        lines.append(
+            f"  {r['concurrent']:>10} | {r['rate']:>14,.0f} | {r['time']:.1f}s{marker}"
+        )
+
+    return '\n'.join(lines)
+
+
+def suggest_from_benchmark(results: list) -> Dict[str, int]:
+    """
+    Suggest optimal settings based on benchmark results.
+
+    Args:
+        results: List of benchmark result dicts
+
+    Returns:
+        Dict with suggested max_concurrent, connector_limit, acl_concurrency
+    """
+    if not results:
+        return {'max_concurrent': 200, 'connector_limit': 200, 'acl_concurrency': 150}
+
+    # Find the concurrency level with best throughput
+    best = max(results, key=lambda r: r['rate'])
+    optimal = best['concurrent']
+
+    # Use optimal for concurrent settings, slightly lower for ACL
+    return {
+        'max_concurrent': optimal,
+        'connector_limit': optimal,
+        'acl_concurrency': max(100, int(optimal * 0.8)),
+    }

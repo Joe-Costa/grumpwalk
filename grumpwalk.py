@@ -63,7 +63,11 @@ from modules.tuning import (
     save_tuning_profile,
     generate_tuning_profile,
     format_profile_summary,
+    format_benchmark_results,
+    suggest_from_benchmark,
     get_profile_path,
+    BENCHMARK_CONCURRENCY_LEVELS,
+    BENCHMARK_FILE_LIMIT,
 )
 
 try:
@@ -6058,6 +6062,11 @@ Examples:
         default='balanced',
         help="Tuning profile (default: balanced)",
     )
+    performance.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark to find optimal concurrency settings for this cluster",
+    )
 
     # Enable argcomplete bash completion if available
     if ARGCOMPLETE_AVAILABLE:
@@ -6127,6 +6136,99 @@ Examples:
         )
         print("Please choose either CSV or JSON output format", file=sys.stderr)
         sys.exit(1)
+
+    # Handle --benchmark mode
+    if args.benchmark:
+        if not args.host or not args.path:
+            print("[ERROR] --benchmark requires --host and --path", file=sys.stderr)
+            sys.exit(1)
+
+        print("=" * 70, file=sys.stderr)
+        print("GrumpWalk - Performance Benchmark", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(f"Cluster: {args.host}", file=sys.stderr)
+        print(f"Path:    {args.path}", file=sys.stderr)
+        print(f"Testing: {BENCHMARK_CONCURRENCY_LEVELS}", file=sys.stderr)
+        print(f"Limit:   {BENCHMARK_FILE_LIMIT:,} files per test", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+
+        # Run benchmark asynchronously
+        async def run_benchmark():
+            from modules.credentials import credential_store_filename, get_credentials
+            creds_path = args.credentials_store or credential_store_filename()
+            token = get_credentials(creds_path)
+            if not token:
+                print("[ERROR] No credentials found. Run: qq login", file=sys.stderr)
+                sys.exit(1)
+
+            results = []
+            import time
+
+            for concurrent in BENCHMARK_CONCURRENCY_LEVELS:
+                print(f"\n[BENCH] Testing concurrent={concurrent}...", file=sys.stderr)
+
+                client = AsyncQumuloClient(
+                    host=args.host,
+                    bearer_token=token,
+                    port=args.port,
+                    max_concurrent=concurrent,
+                    connector_limit=concurrent,
+                    verbose=False,
+                )
+
+                # Use ProgressTracker with limit to stop early
+                progress = ProgressTracker(
+                    verbose=False,
+                    limit=BENCHMARK_FILE_LIMIT
+                )
+
+                start = time.time()
+
+                async with client.create_session() as session:
+                    await client.walk_tree_async(
+                        session=session,
+                        path=args.path,
+                        file_filter=None,
+                        collect_results=False,
+                        progress=progress,
+                    )
+
+                elapsed = time.time() - start
+                count = progress.matches
+                rate = count / elapsed if elapsed > 0 else 0
+                results.append({'concurrent': concurrent, 'rate': rate, 'time': elapsed})
+                print(f"[BENCH] {count:,} files in {elapsed:.1f}s = {rate:,.0f} obj/sec", file=sys.stderr)
+
+            return results
+
+        benchmark_results = asyncio.run(run_benchmark())
+
+        print("\n" + "=" * 70, file=sys.stderr)
+        print("Benchmark Results:", file=sys.stderr)
+        print(format_benchmark_results(benchmark_results), file=sys.stderr)
+
+        suggested = suggest_from_benchmark(benchmark_results)
+        print(f"\nSuggested settings:", file=sys.stderr)
+        print(f"  max-concurrent:  {suggested['max_concurrent']}", file=sys.stderr)
+        print(f"  connector-limit: {suggested['connector_limit']}", file=sys.stderr)
+        print(f"  acl-concurrency: {suggested['acl_concurrency']}", file=sys.stderr)
+
+        # Ask to save
+        print("\nSave these settings to tuning profile? [y/N] ", file=sys.stderr, end="", flush=True)
+        try:
+            response = input().strip().lower()
+            if response in ('y', 'yes'):
+                profile = load_tuning_profile() or generate_tuning_profile('balanced')
+                profile['recommended'] = suggested
+                profile['profile'] = 'benchmarked'
+                profile['benchmark_results'] = benchmark_results
+                save_tuning_profile(profile)
+                print(f"Profile saved to: {get_profile_path()}", file=sys.stderr)
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+        print("=" * 70, file=sys.stderr)
+        sys.exit(0)
 
     # Handle first-run tuning profile generation
     if is_first_run:
