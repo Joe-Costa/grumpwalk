@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.0.1** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.1.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1298,6 +1298,69 @@ for owner, stats in sorted(owners.items(), key=lambda x: x[1]['size'], reverse=T
 ---
 
 ## Performance Optimization
+
+### How do I use auto-tuning?
+
+Grumpwalk automatically detects your system resources and generates optimal performance settings on first run. A tuning profile is saved to `tuning-profile` in the grumpwalk directory.
+
+**View current tuning profile:**
+```bash
+./grumpwalk.py --show-tuning
+```
+
+**Regenerate tuning profile:**
+```bash
+./grumpwalk.py --retune
+```
+
+**Select a tuning profile:**
+```bash
+# Conservative (lower concurrency, safer for constrained systems)
+./grumpwalk.py --host cluster --path /data --tuning-profile conservative
+
+# Balanced (default, good for most systems)
+./grumpwalk.py --host cluster --path /data --tuning-profile balanced
+
+# Aggressive (higher concurrency, for well-resourced systems)
+./grumpwalk.py --host cluster --path /data --tuning-profile aggressive
+```
+
+### How do I benchmark my cluster?
+
+The `--benchmark` flag tests multiple concurrency levels against your cluster and suggests optimal settings based on actual throughput measurements.
+
+**Run a benchmark:**
+```bash
+./grumpwalk.py --host cluster --path /data --benchmark
+```
+
+This will:
+1. Test concurrency levels: 100, 150, 200, 250, 300, 400
+2. Measure throughput (objects/second) at each level
+3. Identify the optimal setting for your cluster
+4. Offer to save the results to your tuning profile
+
+**Example output:**
+```
+======================================================================
+Benchmark Results:
+  Concurrent | Rate (obj/sec) | Time
+  -----------|----------------|------
+         100 |         17,066 | 6.8s
+         150 |         17,628 | 6.6s
+         200 |         17,803 | 6.5s
+         250 |         16,288 | 7.1s
+         300 |         18,061 | 6.4s *
+         400 |         13,456 | 8.6s
+
+Suggested settings:
+  max-concurrent:  300
+  connector-limit: 300
+  acl-concurrency: 240
+======================================================================
+```
+
+The `*` marks the optimal concurrency level. Note that higher concurrency does not always mean better throughput - cluster and network capacity are often the bottleneck, not local resources.
 
 ### How do I maximize crawl speed?
 

@@ -5,6 +5,25 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-02-13
+
+### Added
+
+- **Auto-tuning system** - Automatic performance tuning based on system resources
+  - Detects platform (macOS, Linux, Windows, WSL)
+  - Detects available RAM and file descriptor limits
+  - Generates tuning profile on first run, saved to `tuning-profile`
+  - Platform-specific multipliers for optimal performance
+- `--retune` flag to regenerate tuning profile
+- `--show-tuning` flag to display current tuning profile
+- `--tuning-profile` option to select profile: conservative, balanced, aggressive
+- `--benchmark` flag to test optimal concurrency for your specific cluster
+  - Tests multiple concurrency levels (100-400)
+  - Measures throughput and suggests optimal settings
+  - Option to save benchmark results to tuning profile
+
+---
+
 ## [2.0.1] - 2025-02-12
 
 ### Fixed

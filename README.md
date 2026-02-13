@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.0.1** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 2.1.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
@@ -33,6 +33,7 @@ Don't forget to check out the [Grumwalk User's Guide](grumpwalk_users_guide.md) 
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
 - **ACE manipulation** - Surgically add, remove, or modify individual ACEs within ACLs
 - **Similarity detection** - Find similar files using adaptive sampling
+- **Auto-tuning** - Automatic performance tuning based on system resources
 
 ## Requirements
 
@@ -663,6 +664,53 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 ./grumpwalk.py --host cluster.example.com --path /backups \
   --find-similar --sample-size 256KB --sample-points 11 \
   --csv-out similar.csv --progress
+```
+
+## Auto-Tuning
+
+Grumpwalk automatically detects your system resources and generates optimal performance settings on first run.
+
+### First Run
+
+On first run, grumpwalk detects your platform (macOS, Linux, Windows, WSL), available RAM, and file descriptor limits to generate a tuning profile saved to `tuning-profile` in the grumpwalk directory.
+
+### Tuning Commands
+
+```bash
+# Show current tuning profile
+./grumpwalk.py --show-tuning
+
+# Regenerate tuning profile
+./grumpwalk.py --retune
+
+# Use a specific profile (conservative, balanced, aggressive)
+./grumpwalk.py --host cluster --path /data --tuning-profile aggressive
+
+# Run benchmark to find optimal settings for your cluster
+./grumpwalk.py --host cluster --path /data --benchmark
+```
+
+### Benchmark Mode
+
+The `--benchmark` flag tests multiple concurrency levels against your cluster and suggests optimal settings:
+
+```
+======================================================================
+Benchmark Results:
+  Concurrent | Rate (obj/sec) | Time
+  -----------|----------------|------
+         100 |         17,066 | 6.8s
+         150 |         17,628 | 6.6s
+         200 |         17,803 | 6.5s
+         250 |         16,288 | 7.1s
+         300 |         18,061 | 6.4s *
+         400 |         13,456 | 8.6s
+
+Suggested settings:
+  max-concurrent:  300
+  connector-limit: 300
+  acl-concurrency: 240
+======================================================================
 ```
 
 ## Performance Tips
