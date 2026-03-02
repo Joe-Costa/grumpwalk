@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.1.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.2.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1237,6 +1237,44 @@ cat inventory.ndjson | \
   sort | uniq -c | sort -rn | head -20
 ```
 
+### How do I get raw UID/GID/SID values without name resolution?
+
+Use `--dont-resolve-ids` with `--show-owner` or `--show-group` to skip identity API calls and output raw identifiers. This is faster and useful when you need the actual UID/GID/SID values rather than human-readable names.
+
+**Plain text output:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --show-owner --show-group --dont-resolve-ids
+```
+
+Output:
+```
+/data/file1.txt	UID:1001	GID:100
+/data/file2.txt	SID:S-1-5-21-3192274952-881459882-370606532-1352	SID:S-1-5-21-3192274952-881459882-370606532-513
+```
+
+**CSV export with raw IDs:**
+```bash
+./grumpwalk.py --host cluster --path /home \
+  --show-owner --show-group --dont-resolve-ids \
+  --csv-out ownership_raw.csv
+```
+
+**JSON output with raw IDs:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --show-owner --dont-resolve-ids --json
+```
+
+Output format reference:
+
+| ID Type | Output Format | Example |
+|---------|---------------|---------|
+| NFS UID | `UID:<value>` | `UID:1001` |
+| NFS GID | `GID:<value>` | `GID:100` |
+| SMB SID | `SID:<value>` | `SID:S-1-5-21-...` |
+| Local account | `auth_id:<value>` | `auth_id:admin` |
+
 ### How do I analyze with DuckDB?
 
 ```sql
@@ -1371,6 +1409,15 @@ The `*` marks the optimal concurrency level. Note that higher concurrency does n
   --connector-limit 500 \
   --progress
 ```
+
+**Skip identity resolution when you only need raw IDs:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --show-owner --dont-resolve-ids \
+  --progress
+```
+
+This avoids API calls to `/v1/identity/expand` for every unique owner/group, which can be a significant bottleneck on large result sets.
 
 ### How do I profile performance bottlenecks?
 
@@ -1603,6 +1650,7 @@ done
 | Find old files | `--older-than 365 --type file` |
 | Find by name | `--name '*.log'` |
 | Owner report | `--owner-report --progress` |
+| Show raw IDs | `--show-owner --dont-resolve-ids` |
 | ACL audit | `--acl-report --acl-resolve-names` |
 | Add permission | `--add-ace 'Allow:fd:Group:Modify' --propagate-changes` |
 | Remove permission | `--remove-ace 'Allow:Everyone' --propagate-changes` |

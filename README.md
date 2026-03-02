@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.1.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 2.2.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
@@ -215,6 +215,8 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 - `--uid` - Owner is UID number
 - `--expand-identity` - Match equivalent identities (AD user + NFS UID)
 - `--show-owner` - Display owner information in output
+- `--show-group` - Display group information in output
+- `--dont-resolve-ids` - Skip identity resolution; output raw UID/GID/SID values
 - `--owner-report` - Generate capacity report by owner
 - `--use-capacity` - Use capacity-based calculation (datablocks + metablocks) for owner report
 - `--report-logical-size` - Report logical file size instead of disk capacity
@@ -734,6 +736,12 @@ Suggested settings:
 ```
 /home/joe/file1.txt    joe (UID 1000)
 /home/jane/file2.log   AD\jane
+```
+
+### With --show-owner --dont-resolve-ids
+```
+/home/joe/file1.txt    UID:1000
+/home/jane/file2.log   SID:S-1-5-21-3192274952-881459882-370606532-1352
 ```
 
 ### With --resolve-links

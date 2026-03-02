@@ -11,7 +11,7 @@ import time
 from typing import Optional, TYPE_CHECKING
 
 # Import utility functions from the utils module
-from .utils import format_time, format_owner_name
+from .utils import format_time, format_raw_id, format_owner_name
 
 # Try to use ujson for faster parsing
 try:
@@ -141,6 +141,7 @@ class BatchedOutputHandler:
         output_format: str = "text",
         progress: Optional["ProgressTracker"] = None,
         all_attributes: bool = False,
+        dont_resolve_ids: bool = False,
     ):
         self.client = client
         self.batch_size = batch_size
@@ -151,6 +152,7 @@ class BatchedOutputHandler:
         self.lock = asyncio.Lock()
         self.progress = progress
         self.all_attributes = all_attributes
+        self.dont_resolve_ids = dont_resolve_ids
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -167,29 +169,31 @@ class BatchedOutputHandler:
 
         identity_cache = {}
 
-        # Collect unique auth_ids (owners and/or groups) from batch
-        unique_auth_ids = set()
+        # Skip identity resolution when --dont-resolve-ids is set
+        if not self.dont_resolve_ids:
+            # Collect unique auth_ids (owners and/or groups) from batch
+            unique_auth_ids = set()
 
-        if self.show_owner:
-            for entry in self.batch:
-                owner_details = entry.get("owner_details", {})
-                owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-                if owner_auth_id:
-                    unique_auth_ids.add(owner_auth_id)
+            if self.show_owner:
+                for entry in self.batch:
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                    if owner_auth_id:
+                        unique_auth_ids.add(owner_auth_id)
 
-        if self.show_group:
-            for entry in self.batch:
-                group_details = entry.get("group_details", {})
-                group_auth_id = group_details.get("auth_id") or entry.get("group")
-                if group_auth_id:
-                    unique_auth_ids.add(group_auth_id)
+            if self.show_group:
+                for entry in self.batch:
+                    group_details = entry.get("group_details", {})
+                    group_auth_id = group_details.get("auth_id") or entry.get("group")
+                    if group_auth_id:
+                        unique_auth_ids.add(group_auth_id)
 
-        # Resolve all identities in parallel
-        if unique_auth_ids:
-            async with self.client.create_session() as session:
-                identity_cache = await self.client.resolve_multiple_identities(
-                    session, list(unique_auth_ids)
-                )
+            # Resolve all identities in parallel
+            if unique_auth_ids:
+                async with self.client.create_session() as session:
+                    identity_cache = await self.client.resolve_multiple_identities(
+                        session, list(unique_auth_ids)
+                    )
 
         # Output batch
         for entry in self.batch:
@@ -206,22 +210,30 @@ class BatchedOutputHandler:
                     output_entry = {"path": entry["path"]}
 
                     if self.show_owner:
-                        owner_details = entry.get("owner_details", {})
-                        owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-                        if owner_auth_id and owner_auth_id in identity_cache:
-                            identity = identity_cache[owner_auth_id]
-                            output_entry["owner"] = format_owner_name(identity)
+                        if self.dont_resolve_ids:
+                            owner_details = entry.get("owner_details", {})
+                            output_entry["owner"] = format_raw_id(owner_details, entry.get("owner", ""))
                         else:
-                            output_entry["owner"] = "Unknown"
+                            owner_details = entry.get("owner_details", {})
+                            owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                            if owner_auth_id and owner_auth_id in identity_cache:
+                                identity = identity_cache[owner_auth_id]
+                                output_entry["owner"] = format_owner_name(identity)
+                            else:
+                                output_entry["owner"] = "Unknown"
 
                     if self.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get("group")
-                        if group_auth_id and group_auth_id in identity_cache:
-                            identity = identity_cache[group_auth_id]
-                            output_entry["group"] = format_owner_name(identity)
+                        if self.dont_resolve_ids:
+                            group_details = entry.get("group_details", {})
+                            output_entry["group"] = format_raw_id(group_details, entry.get("group", ""))
                         else:
-                            output_entry["group"] = "Unknown"
+                            group_details = entry.get("group_details", {})
+                            group_auth_id = group_details.get("auth_id") or entry.get("group")
+                            if group_auth_id and group_auth_id in identity_cache:
+                                identity = identity_cache[group_auth_id]
+                                output_entry["group"] = format_owner_name(identity)
+                            else:
+                                output_entry["group"] = "Unknown"
 
                 # Use escape_forward_slashes=False for ujson to avoid \/
                 try:
@@ -234,24 +246,32 @@ class BatchedOutputHandler:
                 output_line = entry["path"]
 
                 if self.show_owner:
-                    owner_details = entry.get("owner_details", {})
-                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-                    if owner_auth_id and owner_auth_id in identity_cache:
-                        identity = identity_cache[owner_auth_id]
-                        owner_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{owner_name}"
+                    if self.dont_resolve_ids:
+                        owner_details = entry.get("owner_details", {})
+                        owner_name = format_raw_id(owner_details, entry.get("owner", ""))
                     else:
-                        output_line = f"{output_line}\tUnknown"
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                        if owner_auth_id and owner_auth_id in identity_cache:
+                            identity = identity_cache[owner_auth_id]
+                            owner_name = format_owner_name(identity)
+                        else:
+                            owner_name = "Unknown"
+                    output_line = f"{output_line}\t{owner_name}"
 
                 if self.show_group:
-                    group_details = entry.get("group_details", {})
-                    group_auth_id = group_details.get("auth_id") or entry.get("group")
-                    if group_auth_id and group_auth_id in identity_cache:
-                        identity = identity_cache[group_auth_id]
-                        group_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{group_name}"
+                    if self.dont_resolve_ids:
+                        group_details = entry.get("group_details", {})
+                        group_name = format_raw_id(group_details, entry.get("group", ""))
                     else:
-                        output_line = f"{output_line}\tUnknown"
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get("group")
+                        if group_auth_id and group_auth_id in identity_cache:
+                            identity = identity_cache[group_auth_id]
+                            group_name = format_owner_name(identity)
+                        else:
+                            group_name = "Unknown"
+                    output_line = f"{output_line}\t{group_name}"
 
                 print(output_line)
             sys.stdout.flush()
@@ -329,6 +349,7 @@ class StreamingFileOutputHandler:
         all_attributes: bool = False,
         progress: Optional["ProgressTracker"] = None,
         args=None,
+        dont_resolve_ids: bool = False,
     ):
         """
         Initialize streaming file output handler.
@@ -343,6 +364,7 @@ class StreamingFileOutputHandler:
             all_attributes: Include all file attributes (vs minimal)
             progress: Optional ProgressTracker
             args: Command-line args for determining which fields to include
+            dont_resolve_ids: Skip identity resolution and output raw IDs
         """
         self.client = client
         self.output_path = output_path
@@ -353,6 +375,7 @@ class StreamingFileOutputHandler:
         self.all_attributes = all_attributes
         self.progress = progress
         self.args = args
+        self.dont_resolve_ids = dont_resolve_ids
 
         self.batch = []
         self.lock = asyncio.Lock()
@@ -445,8 +468,8 @@ class StreamingFileOutputHandler:
 
         identity_cache = {}
 
-        # Collect unique auth_ids for resolution
-        if self.show_owner or self.show_group:
+        # Skip identity resolution when --dont-resolve-ids is set
+        if (self.show_owner or self.show_group) and not self.dont_resolve_ids:
             unique_auth_ids = set()
 
             if self.show_owner:
@@ -476,25 +499,33 @@ class StreamingFileOutputHandler:
             if self.progress and not self.progress.can_output():
                 break
 
-            # Add resolved owner name if requested
+            # Add owner name if requested
             if self.show_owner:
-                owner_details = entry.get("owner_details", {})
-                owner_auth_id = str(owner_details.get("auth_id") or entry.get("owner", ""))
-                if owner_auth_id and owner_auth_id in identity_cache:
-                    identity = identity_cache[owner_auth_id]
-                    entry["owner_name"] = format_owner_name(identity)
+                if self.dont_resolve_ids:
+                    owner_details = entry.get("owner_details", {})
+                    entry["owner_name"] = format_raw_id(owner_details, entry.get("owner", ""))
                 else:
-                    entry["owner_name"] = "Unknown"
+                    owner_details = entry.get("owner_details", {})
+                    owner_auth_id = str(owner_details.get("auth_id") or entry.get("owner", ""))
+                    if owner_auth_id and owner_auth_id in identity_cache:
+                        identity = identity_cache[owner_auth_id]
+                        entry["owner_name"] = format_owner_name(identity)
+                    else:
+                        entry["owner_name"] = "Unknown"
 
-            # Add resolved group name if requested
+            # Add group name if requested
             if self.show_group:
-                group_details = entry.get("group_details", {})
-                group_auth_id = str(group_details.get("auth_id") or entry.get("group", ""))
-                if group_auth_id and group_auth_id in identity_cache:
-                    identity = identity_cache[group_auth_id]
-                    entry["group_name"] = format_owner_name(identity)
+                if self.dont_resolve_ids:
+                    group_details = entry.get("group_details", {})
+                    entry["group_name"] = format_raw_id(group_details, entry.get("group", ""))
                 else:
-                    entry["group_name"] = "Unknown"
+                    group_details = entry.get("group_details", {})
+                    group_auth_id = str(group_details.get("auth_id") or entry.get("group", ""))
+                    if group_auth_id and group_auth_id in identity_cache:
+                        identity = identity_cache[group_auth_id]
+                        entry["group_name"] = format_owner_name(identity)
+                    else:
+                        entry["group_name"] = "Unknown"
 
             if self.output_format == "csv":
                 if self.all_attributes:

@@ -11,6 +11,7 @@ from .utils import (
     parse_size_to_bytes,
     format_bytes,
     format_time,
+    format_raw_id,
     format_owner_name,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     "parse_size_to_bytes",
     "format_bytes",
     "format_time",
+    "format_raw_id",
     "format_owner_name",
     # Output
     "ProgressTracker",

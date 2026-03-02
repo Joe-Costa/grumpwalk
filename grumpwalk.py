@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import argparse
 import asyncio
@@ -39,6 +39,7 @@ from modules import (
     parse_size_to_bytes,
     format_bytes,
     format_time,
+    format_raw_id,
     format_owner_name,
     ProgressTracker,
     BatchedOutputHandler,
@@ -1984,7 +1985,8 @@ async def generate_acl_report(
     show_progress: bool = False,
     resolve_names: bool = False,
     show_owner: bool = False,
-    show_group: bool = False
+    show_group: bool = False,
+    dont_resolve_ids: bool = False
 ) -> Dict:
     """
     Generate ACL report for a list of files.
@@ -2111,8 +2113,11 @@ async def generate_acl_report(
     }
 
     # Resolve names if requested (for ACLs, owners, or groups)
+    # When dont_resolve_ids is set, skip owner/group resolution but still resolve ACL trustee names
     identity_cache = {}
-    if resolve_names or show_owner or show_group:
+    need_owner_resolution = show_owner and not dont_resolve_ids
+    need_group_resolution = show_group and not dont_resolve_ids
+    if resolve_names or need_owner_resolution or need_group_resolution:
         # Collect all unique auth_ids
         all_auth_ids = set()
 
@@ -2124,8 +2129,8 @@ async def generate_acl_report(
                     auth_ids = extract_auth_ids_from_acl(acl_data)
                     all_auth_ids.update(auth_ids)
 
-        # Collect owner auth_ids if show_owner is enabled
-        if show_owner:
+        # Collect owner auth_ids if show_owner is enabled (and not skipping resolution)
+        if need_owner_resolution:
             for file_info in file_acls.values():
                 # Try to get auth_id from owner_details first, fallback to owner field
                 owner_details = file_info.get('owner_details', {})
@@ -2133,8 +2138,8 @@ async def generate_acl_report(
                 if owner_auth_id:
                     all_auth_ids.add(owner_auth_id)
 
-        # Collect group auth_ids if show_group is enabled
-        if show_group:
+        # Collect group auth_ids if show_group is enabled (and not skipping resolution)
+        if need_group_resolution:
             for file_info in file_acls.values():
                 # Try to get auth_id from group_details first, fallback to group field
                 group_details = file_info.get('group_details', {})
@@ -4423,6 +4428,7 @@ async def main_async(args):
             all_attributes=args.all_attributes,
             progress=progress,
             args=args,
+            dont_resolve_ids=args.dont_resolve_ids,
         )
 
         async def output_callback(entry):
@@ -4458,6 +4464,7 @@ async def main_async(args):
                 output_format=output_format,
                 progress=progress,
                 all_attributes=args.all_attributes,
+                dont_resolve_ids=args.dont_resolve_ids,
             )
 
             async def output_callback(entry):
@@ -4565,9 +4572,9 @@ async def main_async(args):
         return
 
     # Resolve owner and group identities if --show-owner or --show-group is enabled (for non-streaming modes only)
-    # Skip if batched_handler was used (streaming mode)
+    # Skip if batched_handler was used (streaming mode) or --dont-resolve-ids is set
     identity_cache_for_output = {}
-    if (args.show_owner or args.show_group) and matching_files and not batched_handler:
+    if (args.show_owner or args.show_group) and matching_files and not batched_handler and not args.dont_resolve_ids:
         # Collect unique auth_ids (owners and/or groups) from matching files
         unique_auth_ids = set()
 
@@ -4642,7 +4649,8 @@ async def main_async(args):
                 show_progress=args.progress,
                 resolve_names=args.acl_resolve_names,
                 show_owner=args.show_owner,
-                show_group=args.show_group
+                show_group=args.show_group,
+                dont_resolve_ids=args.dont_resolve_ids
             )
 
         # Get identity cache
@@ -4705,24 +4713,30 @@ async def main_async(args):
                 group_name = None
 
                 if args.show_owner:
-                    # Use the numeric owner field as the auth_id
-                    owner_auth_id = acl_info.get('owner')
-                    if owner_auth_id and owner_auth_id in identity_cache:
-                        owner_name = format_owner_name(identity_cache[owner_auth_id])
-                    elif owner_auth_id:
-                        owner_name = f"auth_id:{owner_auth_id}"
+                    if args.dont_resolve_ids:
+                        owner_name = format_raw_id(owner_details, acl_info.get('owner', ''))
                     else:
-                        owner_name = "Unknown"
+                        # Use the numeric owner field as the auth_id
+                        owner_auth_id = acl_info.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache:
+                            owner_name = format_owner_name(identity_cache[owner_auth_id])
+                        elif owner_auth_id:
+                            owner_name = f"auth_id:{owner_auth_id}"
+                        else:
+                            owner_name = "Unknown"
 
                 if args.show_group:
-                    # Use the numeric group field as the auth_id
-                    group_auth_id = acl_info.get('group')
-                    if group_auth_id and group_auth_id in identity_cache:
-                        group_name = format_owner_name(identity_cache[group_auth_id])
-                    elif group_auth_id:
-                        group_name = f"auth_id:{group_auth_id}"
+                    if args.dont_resolve_ids:
+                        group_name = format_raw_id(group_details, acl_info.get('group', ''))
                     else:
-                        group_name = "Unknown"
+                        # Use the numeric group field as the auth_id
+                        group_auth_id = acl_info.get('group')
+                        if group_auth_id and group_auth_id in identity_cache:
+                            group_name = format_owner_name(identity_cache[group_auth_id])
+                        elif group_auth_id:
+                            group_name = f"auth_id:{group_auth_id}"
+                        else:
+                            group_name = "Unknown"
 
                 acl_rows.append({
                     'path': path,
@@ -4826,24 +4840,30 @@ async def main_async(args):
 
                 # Add owner and group if requested
                 if args.show_owner:
-                    # Use the numeric owner field as the auth_id
-                    owner_auth_id = acl_info.get('owner')
-                    if owner_auth_id and owner_auth_id in identity_cache:
-                        json_entry['owner'] = format_owner_name(identity_cache[owner_auth_id])
-                    elif owner_auth_id:
-                        json_entry['owner'] = f"auth_id:{owner_auth_id}"
+                    if args.dont_resolve_ids:
+                        json_entry['owner'] = format_raw_id(owner_details, acl_info.get('owner', ''))
                     else:
-                        json_entry['owner'] = "Unknown"
+                        # Use the numeric owner field as the auth_id
+                        owner_auth_id = acl_info.get('owner')
+                        if owner_auth_id and owner_auth_id in identity_cache:
+                            json_entry['owner'] = format_owner_name(identity_cache[owner_auth_id])
+                        elif owner_auth_id:
+                            json_entry['owner'] = f"auth_id:{owner_auth_id}"
+                        else:
+                            json_entry['owner'] = "Unknown"
 
                 if args.show_group:
-                    # Use the numeric group field as the auth_id
-                    group_auth_id = acl_info.get('group')
-                    if group_auth_id and group_auth_id in identity_cache:
-                        json_entry['group'] = format_owner_name(identity_cache[group_auth_id])
-                    elif group_auth_id:
-                        json_entry['group'] = f"auth_id:{group_auth_id}"
+                    if args.dont_resolve_ids:
+                        json_entry['group'] = format_raw_id(group_details, acl_info.get('group', ''))
                     else:
-                        json_entry['group'] = "Unknown"
+                        # Use the numeric group field as the auth_id
+                        group_auth_id = acl_info.get('group')
+                        if group_auth_id and group_auth_id in identity_cache:
+                            json_entry['group'] = format_owner_name(identity_cache[group_auth_id])
+                        elif group_auth_id:
+                            json_entry['group'] = f"auth_id:{group_auth_id}"
+                        else:
+                            json_entry['group'] = "Unknown"
 
                 # Add ACL info
                 json_entry.update({
@@ -5046,31 +5066,39 @@ async def main_async(args):
                 return
 
             if args.all_attributes:
-                # Add resolved owner name to entries if --show-owner is enabled
+                # Add owner name to entries if --show-owner is enabled
                 if args.show_owner:
                     for entry in matching_files:
-                        owner_details = entry.get("owner_details", {})
-                        owner_auth_id = owner_details.get("auth_id") or entry.get(
-                            "owner"
-                        )
-                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[owner_auth_id]
-                            entry["owner_name"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            owner_details = entry.get("owner_details", {})
+                            entry["owner_name"] = format_raw_id(owner_details, entry.get("owner", ""))
                         else:
-                            entry["owner_name"] = "Unknown"
+                            owner_details = entry.get("owner_details", {})
+                            owner_auth_id = owner_details.get("auth_id") or entry.get(
+                                "owner"
+                            )
+                            if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[owner_auth_id]
+                                entry["owner_name"] = format_owner_name(identity)
+                            else:
+                                entry["owner_name"] = "Unknown"
 
-                # Add resolved group name to entries if --show-group is enabled
+                # Add group name to entries if --show-group is enabled
                 if args.show_group:
                     for entry in matching_files:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            entry["group_name"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            group_details = entry.get("group_details", {})
+                            entry["group_name"] = format_raw_id(group_details, entry.get("group", ""))
                         else:
-                            entry["group_name"] = "Unknown"
+                            group_details = entry.get("group_details", {})
+                            group_auth_id = group_details.get("auth_id") or entry.get(
+                                "group"
+                            )
+                            if group_auth_id and group_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[group_auth_id]
+                                entry["group_name"] = format_owner_name(identity)
+                            else:
+                                entry["group_name"] = "Unknown"
 
                 # Write all attributes
                 fieldnames = sorted(matching_files[0].keys())
@@ -5113,25 +5141,33 @@ async def main_async(args):
                     if args.larger_than or args.smaller_than:
                         row["size"] = entry.get("size")
                     if args.show_owner:
-                        owner_details = entry.get("owner_details", {})
-                        owner_auth_id = owner_details.get("auth_id") or entry.get(
-                            "owner"
-                        )
-                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[owner_auth_id]
-                            row["owner"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            owner_details = entry.get("owner_details", {})
+                            row["owner"] = format_raw_id(owner_details, entry.get("owner", ""))
                         else:
-                            row["owner"] = "Unknown"
+                            owner_details = entry.get("owner_details", {})
+                            owner_auth_id = owner_details.get("auth_id") or entry.get(
+                                "owner"
+                            )
+                            if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[owner_auth_id]
+                                row["owner"] = format_owner_name(identity)
+                            else:
+                                row["owner"] = "Unknown"
                     if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            row["group"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            group_details = entry.get("group_details", {})
+                            row["group"] = format_raw_id(group_details, entry.get("group", ""))
                         else:
-                            row["group"] = "Unknown"
+                            group_details = entry.get("group_details", {})
+                            group_auth_id = group_details.get("auth_id") or entry.get(
+                                "group"
+                            )
+                            if group_auth_id and group_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[group_auth_id]
+                                row["group"] = format_owner_name(identity)
+                            else:
+                                row["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         row["symlink_target"] = entry["symlink_target"]
                     writer.writerow(row)
@@ -5153,29 +5189,37 @@ async def main_async(args):
 
             for entry in matching_files:
                 if args.all_attributes:
-                    # Add resolved owner name to entry if --show-owner is enabled
+                    # Add owner name to entry if --show-owner is enabled
                     if args.show_owner:
-                        owner_details = entry.get("owner_details", {})
-                        owner_auth_id = owner_details.get("auth_id") or entry.get(
-                            "owner"
-                        )
-                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[owner_auth_id]
-                            entry["owner_name"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            owner_details = entry.get("owner_details", {})
+                            entry["owner_name"] = format_raw_id(owner_details, entry.get("owner", ""))
                         else:
-                            entry["owner_name"] = "Unknown"
+                            owner_details = entry.get("owner_details", {})
+                            owner_auth_id = owner_details.get("auth_id") or entry.get(
+                                "owner"
+                            )
+                            if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[owner_auth_id]
+                                entry["owner_name"] = format_owner_name(identity)
+                            else:
+                                entry["owner_name"] = "Unknown"
 
-                    # Add resolved group name to entry if --show-group is enabled
+                    # Add group name to entry if --show-group is enabled
                     if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            entry["group_name"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            group_details = entry.get("group_details", {})
+                            entry["group_name"] = format_raw_id(group_details, entry.get("group", ""))
                         else:
-                            entry["group_name"] = "Unknown"
+                            group_details = entry.get("group_details", {})
+                            group_auth_id = group_details.get("auth_id") or entry.get(
+                                "group"
+                            )
+                            if group_auth_id and group_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[group_auth_id]
+                                entry["group_name"] = format_owner_name(identity)
+                            else:
+                                entry["group_name"] = "Unknown"
 
                     output_handle.write(json_parser.dumps(entry) + "\n")
                 else:
@@ -5186,25 +5230,33 @@ async def main_async(args):
                     if args.larger_than or args.smaller_than:
                         minimal_entry["size"] = entry.get("size")
                     if args.show_owner:
-                        owner_details = entry.get("owner_details", {})
-                        owner_auth_id = owner_details.get("auth_id") or entry.get(
-                            "owner"
-                        )
-                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[owner_auth_id]
-                            minimal_entry["owner"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            owner_details = entry.get("owner_details", {})
+                            minimal_entry["owner"] = format_raw_id(owner_details, entry.get("owner", ""))
                         else:
-                            minimal_entry["owner"] = "Unknown"
+                            owner_details = entry.get("owner_details", {})
+                            owner_auth_id = owner_details.get("auth_id") or entry.get(
+                                "owner"
+                            )
+                            if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[owner_auth_id]
+                                minimal_entry["owner"] = format_owner_name(identity)
+                            else:
+                                minimal_entry["owner"] = "Unknown"
                     if args.show_group:
-                        group_details = entry.get("group_details", {})
-                        group_auth_id = group_details.get("auth_id") or entry.get(
-                            "group"
-                        )
-                        if group_auth_id and group_auth_id in identity_cache_for_output:
-                            identity = identity_cache_for_output[group_auth_id]
-                            minimal_entry["group"] = format_owner_name(identity)
+                        if args.dont_resolve_ids:
+                            group_details = entry.get("group_details", {})
+                            minimal_entry["group"] = format_raw_id(group_details, entry.get("group", ""))
                         else:
-                            minimal_entry["group"] = "Unknown"
+                            group_details = entry.get("group_details", {})
+                            group_auth_id = group_details.get("auth_id") or entry.get(
+                                "group"
+                            )
+                            if group_auth_id and group_auth_id in identity_cache_for_output:
+                                identity = identity_cache_for_output[group_auth_id]
+                                minimal_entry["group"] = format_owner_name(identity)
+                            else:
+                                minimal_entry["group"] = "Unknown"
                     if args.resolve_links and "symlink_target" in entry:
                         minimal_entry["symlink_target"] = entry["symlink_target"]
                     output_handle.write(json_parser.dumps(minimal_entry) + "\n")
@@ -5225,25 +5277,33 @@ async def main_async(args):
 
                 # Add owner information if --show-owner is enabled
                 if args.show_owner:
-                    owner_details = entry.get("owner_details", {})
-                    owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
-                    if owner_auth_id and owner_auth_id in identity_cache_for_output:
-                        identity = identity_cache_for_output[owner_auth_id]
-                        owner_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{owner_name}"
+                    if args.dont_resolve_ids:
+                        owner_details = entry.get("owner_details", {})
+                        owner_name = format_raw_id(owner_details, entry.get("owner", ""))
                     else:
-                        output_line = f"{output_line}\tUnknown"
+                        owner_details = entry.get("owner_details", {})
+                        owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                        if owner_auth_id and owner_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[owner_auth_id]
+                            owner_name = format_owner_name(identity)
+                        else:
+                            owner_name = "Unknown"
+                    output_line = f"{output_line}\t{owner_name}"
 
                 # Add group information if --show-group is enabled
                 if args.show_group:
-                    group_details = entry.get("group_details", {})
-                    group_auth_id = group_details.get("auth_id") or entry.get("group")
-                    if group_auth_id and group_auth_id in identity_cache_for_output:
-                        identity = identity_cache_for_output[group_auth_id]
-                        group_name = format_owner_name(identity)
-                        output_line = f"{output_line}\t{group_name}"
+                    if args.dont_resolve_ids:
+                        group_details = entry.get("group_details", {})
+                        group_name = format_raw_id(group_details, entry.get("group", ""))
                     else:
-                        output_line = f"{output_line}\tUnknown"
+                        group_details = entry.get("group_details", {})
+                        group_auth_id = group_details.get("auth_id") or entry.get("group")
+                        if group_auth_id and group_auth_id in identity_cache_for_output:
+                            identity = identity_cache_for_output[group_auth_id]
+                            group_name = format_owner_name(identity)
+                        else:
+                            group_name = "Unknown"
+                    output_line = f"{output_line}\t{group_name}"
 
                 print(output_line)
 
@@ -5667,6 +5727,11 @@ Examples:
         "--show-group",
         action="store_true",
         help="Display group information in output (works with all features)",
+    )
+    owner_report.add_argument(
+        "--dont-resolve-ids",
+        action="store_true",
+        help="Skip identity resolution for --show-owner/--show-group; output raw UID/GID/SID values",
     )
     owner_report.add_argument(
         "--use-capacity",

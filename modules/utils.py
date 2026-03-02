@@ -147,6 +147,36 @@ def format_time(seconds: float) -> str:
     return f"{friendly} ({total_seconds:.1f}s)"
 
 
+def format_raw_id(details: dict, fallback: str = "") -> str:
+    """Format raw identity ID without resolution.
+
+    Args:
+        details: owner_details or group_details dict with id_type and id_value
+        fallback: fallback value if details are empty or missing keys
+
+    Returns:
+        Formatted string like UID:1001, GID:100, SID:S-1-5-21-..., or auth_id:<value>
+    """
+    if not details:
+        return f"auth_id:{fallback}" if fallback else "Unknown"
+
+    id_type = details.get("id_type", "")
+    id_value = details.get("id_value", "")
+
+    if id_type == "NFS_UID":
+        return f"UID:{id_value}"
+    elif id_type == "NFS_GID":
+        return f"GID:{id_value}"
+    elif id_type == "SMB_SID":
+        return f"SID:{id_value}"
+    elif id_value:
+        return f"auth_id:{id_value}"
+    elif fallback:
+        return f"auth_id:{fallback}"
+    else:
+        return "Unknown"
+
+
 def format_owner_name(identity: Dict) -> str:
     """Format owner name from resolved identity."""
     if not identity:
