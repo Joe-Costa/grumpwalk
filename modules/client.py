@@ -15,13 +15,12 @@ from datetime import datetime
 from typing import List, Optional, Dict, Set, Tuple
 from urllib.parse import quote
 
+from .utils import log_stderr
+
 try:
     import aiohttp
 except ImportError:
-    print(
-        "[ERROR] aiohttp not installed. Install with: pip install aiohttp",
-        file=sys.stderr,
-    )
+    log_stderr("ERROR", "aiohttp not installed. Install with: pip install aiohttp")
     sys.exit(1)
 
 # Import from other modules
@@ -371,14 +370,11 @@ class AsyncQumuloClient:
                         return await response.json()
                     else:
                         if self.verbose:
-                            print(
-                                f"[WARN] Failed to get ACL for {path}: HTTP {response.status}",
-                                file=sys.stderr,
-                            )
+                            log_stderr("WARN", f"Failed to get ACL for {path}: HTTP {response.status}")
                         return None
             except aiohttp.ClientError as e:
                 if self.verbose:
-                    print(f"[WARN] Error getting ACL for {path}: {e}", file=sys.stderr)
+                    log_stderr("WARN", f"Error getting ACL for {path}: {e}")
                 return None
 
     async def set_file_acl(
@@ -630,11 +626,11 @@ class AsyncQumuloClient:
                         return data
                     else:
                         if self.verbose:
-                            print(f"[WARN] Failed to read chunk from {path} at offset {offset}: HTTP {response.status}", file=sys.stderr)
+                            log_stderr("WARN", f"Failed to read chunk from {path} at offset {offset}: HTTP {response.status}")
                         return None
             except aiohttp.ClientError as e:
                 if self.verbose:
-                    print(f"[WARN] Error reading chunk from {path}: {e}", file=sys.stderr)
+                    log_stderr("WARN", f"Error reading chunk from {path}: {e}")
                 return None
 
     def calculate_adaptive_concurrency(self, total_entries: int) -> int:
@@ -1227,11 +1223,7 @@ class AsyncQumuloClient:
                 batch_size = min(batch_size, 10)
 
             if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
-                print(
-                    f"\r[INFO] Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} "
-                    f"(reduced from {self.max_concurrent})",
-                    file=sys.stderr,
-                )
+                log_stderr("INFO", f"Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} (reduced from {self.max_concurrent})")
 
             # Process subdirectories in batches
             all_results = []

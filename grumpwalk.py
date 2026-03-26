@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import argparse
 import asyncio
@@ -34,6 +34,11 @@ except ImportError:
 
 # Import modular components
 from modules import (
+    log_stderr,
+    log_to_file,
+    init_log_file,
+    close_log_file,
+    LOG_LEVELS,
     format_http_error,
     extract_pagination_token,
     parse_size_to_bytes,
@@ -74,10 +79,7 @@ from modules.tuning import (
 try:
     import aiohttp
 except ImportError:
-    print(
-        "[ERROR] aiohttp not installed. Install with: pip install aiohttp",
-        file=sys.stderr,
-    )
+    log_stderr("ERROR", "aiohttp not installed. Install with: pip install aiohttp")
     sys.exit(1)
 
 # Try to use ujson for faster parsing
@@ -687,7 +689,7 @@ def nfsv4_rights_to_qacl(rights_str: str) -> List[str]:
         elif char in ' +':
             continue  # Skip separators
         else:
-            print(f"[WARN] Unknown right character '{char}' in pattern", file=sys.stderr)
+            log_stderr("WARN", f"Unknown right character '{char}' in pattern")
 
     return list(rights)
 
@@ -709,7 +711,7 @@ def nfsv4_flags_to_qacl(flags_str: str) -> List[str]:
         elif char == 'g':
             pass  # 'g' is group indicator, not a flag
         else:
-            print(f"[WARN] Unknown flag character '{char}' in pattern", file=sys.stderr)
+            log_stderr("WARN", f"Unknown flag character '{char}' in pattern")
     return flags
 
 
@@ -742,7 +744,7 @@ def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
 
     # Parse ACE type (Allow/Deny)
     if len(parts) < 2:
-        print(f"[ERROR] Invalid ACE pattern '{pattern}': expected at least Type:Trustee", file=sys.stderr)
+        log_stderr("ERROR", f"Invalid ACE pattern '{pattern}': expected at least Type:Trustee")
         return None
 
     ace_type = parts[0].upper()
@@ -751,20 +753,20 @@ def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
     elif ace_type in ('DENY', 'DENIED', 'D'):
         result['type'] = 'DENIED'
     else:
-        print(f"[ERROR] Invalid ACE type '{parts[0]}': expected Allow or Deny", file=sys.stderr)
+        log_stderr("ERROR", f"Invalid ACE type '{parts[0]}': expected Allow or Deny")
         return None
 
     if pattern_type == 'remove':
         # Format: Type:Trustee
         if len(parts) != 2:
-            print(f"[ERROR] Invalid remove pattern '{pattern}': expected Type:Trustee", file=sys.stderr)
+            log_stderr("ERROR", f"Invalid remove pattern '{pattern}': expected Type:Trustee")
             return None
         result['raw_trustee'] = parts[1]
 
     elif pattern_type in ('add_rights', 'remove_rights'):
         # Format: Type:Trustee:Rights
         if len(parts) != 3:
-            print(f"[ERROR] Invalid rights pattern '{pattern}': expected Type:Trustee:Rights", file=sys.stderr)
+            log_stderr("ERROR", f"Invalid rights pattern '{pattern}': expected Type:Trustee:Rights")
             return None
         result['raw_trustee'] = parts[1]
         result['rights'] = nfsv4_rights_to_qacl(parts[2])
@@ -772,7 +774,7 @@ def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
     elif pattern_type == 'add':
         # Format: Type:Flags:Trustee:Rights
         if len(parts) != 4:
-            print(f"[ERROR] Invalid add pattern '{pattern}': expected Type:Flags:Trustee:Rights", file=sys.stderr)
+            log_stderr("ERROR", f"Invalid add pattern '{pattern}': expected Type:Flags:Trustee:Rights")
             return None
         result['flags'] = nfsv4_flags_to_qacl(parts[1])
         result['raw_trustee'] = parts[2]
@@ -933,7 +935,7 @@ async def resolve_pattern_trustees(
             # Everyone has well-known auth_id
             pattern['resolved_auth_id'] = '8589934592'  # Well-known Everyone auth_id
             if verbose:
-                print(f"[INFO] '{raw_trustee}' -> auth_id 8589934592 (Everyone)", file=sys.stderr)
+                log_stderr("INFO", f"'{raw_trustee}' -> auth_id 8589934592 (Everyone)")
             continue
 
         # Use parse_trustee to get the right format for identity resolution
@@ -953,14 +955,14 @@ async def resolve_pattern_trustees(
             # If already an auth_id, use it directly
             pattern['resolved_auth_id'] = str(identifier)
             if verbose:
-                print(f"[INFO] '{raw_trustee}' is already auth_id {identifier}", file=sys.stderr)
+                log_stderr("INFO", f"'{raw_trustee}' is already auth_id {identifier}")
             continue
         else:  # name
             identifier = payload.get('name')
 
         # Resolve to auth_id using identity API
         if verbose:
-            print(f"[INFO] Resolving trustee '{raw_trustee}' ({id_type})...", file=sys.stderr)
+            log_stderr("INFO", f"Resolving trustee '{raw_trustee}' ({id_type})...")
 
         resolved = await client.resolve_identity(session, identifier, id_type)
 
@@ -968,13 +970,13 @@ async def resolve_pattern_trustees(
             auth_id = str(resolved['auth_id'])
             pattern['resolved_auth_id'] = auth_id
             # Always show resolution result
-            print(f"[INFO] Resolved '{raw_trustee}' -> auth_id {auth_id}", file=sys.stderr)
+            log_stderr("INFO", f"Resolved '{raw_trustee}' -> auth_id {auth_id}")
 
             # Cache the resolved identity for future use
             if auth_id not in client.persistent_identity_cache:
                 client.persistent_identity_cache[auth_id] = resolved
         else:
-            print(f"[WARN] Could not resolve trustee '{raw_trustee}' - matching may fail", file=sys.stderr)
+            log_stderr("WARN", f"Could not resolve trustee '{raw_trustee}' - matching may fail")
 
 
 def normalize_acl_for_put(acl: dict) -> dict:
@@ -1213,13 +1215,12 @@ def apply_ace_modifications(
             pat_type = pattern.get('type')
             pat_auth_id = pattern.get('resolved_auth_id')
             if verbose:
-                print(f"[DEBUG] ACE type='{ace_type}' auth_id='{ace_auth_id}' "
-                      f"vs pattern type='{pat_type}' auth_id='{pat_auth_id}'", file=sys.stderr)
+                log_stderr("DEBUG", f"ACE type='{ace_type}' auth_id='{ace_auth_id}' vs pattern type='{pat_type}' auth_id='{pat_auth_id}'")
             if match_ace(ace, pattern):
                 should_remove = True
                 stats['removed'] += 1
                 if verbose:
-                    print(f"[DEBUG]   -> MATCH - will remove", file=sys.stderr)
+                    log_stderr("DEBUG", "  -> MATCH - will remove")
                 break
         if not should_remove:
             new_aces.append(ace)
@@ -1252,16 +1253,14 @@ def apply_ace_modifications(
                 ace['rights'] = list(new_rights)
                 matched = True
         if not matched:
-            print(f"[WARN] No matching ACE found for --add-rights pattern", file=sys.stderr)
+            log_stderr("WARN", "No matching ACE found for --add-rights pattern")
 
     # 4. Replace ACEs (full replacement or type-changing replacement)
     for find_pattern, new_ace_pattern in replace_aces:
         matching_indices = []
 
         if verbose:
-            print(f"[DEBUG] Looking for ACE: type={find_pattern.get('type')} "
-                  f"trustee={find_pattern.get('raw_trustee')} "
-                  f"resolved_auth_id={find_pattern.get('resolved_auth_id')}", file=sys.stderr)
+            log_stderr("DEBUG", f"Looking for ACE: type={find_pattern.get('type')} trustee={find_pattern.get('raw_trustee')} resolved_auth_id={find_pattern.get('resolved_auth_id')}")
 
         # First pass: find ALL matching ACEs
         for i, ace in enumerate(aces):
@@ -1271,12 +1270,11 @@ def apply_ace_modifications(
                     ace_auth_id = ace_trustee.get('auth_id', '')
                 else:
                     ace_auth_id = ace_trustee
-                print(f"[DEBUG]   Checking ACE[{i}]: type={ace.get('type')} "
-                      f"auth_id={ace_auth_id}", file=sys.stderr)
+                log_stderr("DEBUG", f"  Checking ACE[{i}]: type={ace.get('type')} auth_id={ace_auth_id}")
             if match_ace(ace, find_pattern):
                 matching_indices.append(i)
                 if verbose:
-                    print(f"[DEBUG]   -> MATCH at index {i}", file=sys.stderr)
+                    log_stderr("DEBUG", f"  -> MATCH at index {i}")
 
         if matching_indices:
             # Replace first match, remove any duplicates
@@ -1292,21 +1290,20 @@ def apply_ace_modifications(
                 }
                 aces[first_idx] = new_ace
                 if verbose:
-                    print(f"[DEBUG] Replaced ACE[{first_idx}] {find_pattern.get('type')}:{find_pattern.get('raw_trustee')} "
-                          f"with {new_ace_pattern.get('type')}:{new_ace_pattern.get('raw_trustee')}", file=sys.stderr)
+                    log_stderr("DEBUG", f"Replaced ACE[{first_idx}] {find_pattern.get('type')}:{find_pattern.get('raw_trustee')} with {new_ace_pattern.get('type')}:{new_ace_pattern.get('raw_trustee')}")
             else:
                 # In-place mode: update flags and rights only (same type+trustee)
                 aces[first_idx]['flags'] = find_pattern.get('flags', [])
                 aces[first_idx]['rights'] = find_pattern.get('rights', [])
                 if verbose:
-                    print(f"[DEBUG] Replaced ACE[{first_idx}] in-place for {find_pattern.get('raw_trustee')}", file=sys.stderr)
+                    log_stderr("DEBUG", f"Replaced ACE[{first_idx}] in-place for {find_pattern.get('raw_trustee')}")
             stats['replaced'] += 1
 
             # Remove duplicate matching ACEs (in reverse order to preserve indices)
             if len(matching_indices) > 1:
                 for dup_idx in reversed(matching_indices[1:]):
                     if verbose:
-                        print(f"[DEBUG] Removing duplicate ACE at index {dup_idx}", file=sys.stderr)
+                        log_stderr("DEBUG", f"Removing duplicate ACE at index {dup_idx}")
                     del aces[dup_idx]
                     stats['removed'] += 1
 
@@ -1315,12 +1312,10 @@ def apply_ace_modifications(
             if new_ace_pattern is not None:
                 # Paired mode (--replace-ace X --new-ace Y): Don't create if X not found
                 # This is a transformation operation, not "ensure exists"
-                print(f"[WARN] No matching {find_pattern.get('type')} ACE found for trustee "
-                      f"'{find_pattern.get('raw_trustee')}' - skipping (nothing to replace)", file=sys.stderr)
+                log_stderr("WARN", f"No matching {find_pattern.get('type')} ACE found for trustee '{find_pattern.get('raw_trustee')}' - skipping (nothing to replace)")
             else:
                 # Non-paired mode (--replace-ace only): Create new ACE if not found
-                print(f"[WARN] No matching {find_pattern.get('type')} ACE found for trustee "
-                      f"'{find_pattern.get('raw_trustee')}' - creating new ACE", file=sys.stderr)
+                log_stderr("WARN", f"No matching {find_pattern.get('type')} ACE found for trustee '{find_pattern.get('raw_trustee')}' - creating new ACE")
                 new_ace = {
                     'type': find_pattern['type'],
                     'flags': find_pattern.get('flags', []),
@@ -1331,7 +1326,7 @@ def apply_ace_modifications(
                 aces.append(new_ace)
                 stats['added'] += 1
                 if verbose:
-                    print(f"[DEBUG] Adding new ACE for {find_pattern.get('raw_trustee')}", file=sys.stderr)
+                    log_stderr("DEBUG", f"Adding new ACE for {find_pattern.get('raw_trustee')}")
 
     # 6. Add new ACEs (merge if same type+trustee exists)
     for pattern in add_aces:
@@ -1366,8 +1361,7 @@ def apply_ace_modifications(
 
         if not source_auth_id or not target_trustee:
             if verbose:
-                print(f"[DEBUG] Skipping migrate pattern - missing auth_id or target: "
-                      f"source={source_auth_id}, target={target_trustee}", file=sys.stderr)
+                log_stderr("DEBUG", f"Skipping migrate pattern - missing auth_id or target: source={source_auth_id}, target={target_trustee}")
             continue
 
         # Find all ACEs matching the source trustee and migrate them
@@ -1411,16 +1405,14 @@ def apply_ace_modifications(
                     aces_to_remove.append(ace)
                     stats['migrated'] += 1
                     if verbose:
-                        print(f"[DEBUG] Merged {ace_type} ACE rights from {source_auth_id} "
-                              f"into existing {target_trustee} ACE", file=sys.stderr)
+                        log_stderr("DEBUG", f"Merged {ace_type} ACE rights from {source_auth_id} into existing {target_trustee} ACE")
                 else:
                     # No existing target - replace trustee in-place
                     ace['trustee'] = target_trustee
                     ace['_needs_resolution'] = True
                     stats['migrated'] += 1
                     if verbose:
-                        print(f"[DEBUG] Migrated {ace_type} ACE from {source_auth_id} "
-                              f"to {target_trustee}", file=sys.stderr)
+                        log_stderr("DEBUG", f"Migrated {ace_type} ACE from {source_auth_id} to {target_trustee}")
 
         # Remove ACEs that were merged into existing targets
         for ace in aces_to_remove:
@@ -1433,8 +1425,7 @@ def apply_ace_modifications(
 
         if not source_auth_id or not target_auth_id:
             if verbose:
-                print(f"[DEBUG] Skipping clone pattern - missing auth_id: "
-                      f"source={source_auth_id}, target={target_auth_id}", file=sys.stderr)
+                log_stderr("DEBUG", f"Skipping clone pattern - missing auth_id: source={source_auth_id}, target={target_auth_id}")
             continue
 
         # Find all ACEs matching the source trustee (any type)
@@ -1472,13 +1463,11 @@ def apply_ace_modifications(
                         target_ace['flags'] = list(ace.get('flags', []))
                         synced_count += 1
                         if verbose:
-                            print(f"[DEBUG] Synced {ace.get('type')} ACE for {target_auth_id} "
-                                  f"with rights from {source_auth_id}", file=sys.stderr)
+                            log_stderr("DEBUG", f"Synced {ace.get('type')} ACE for {target_auth_id} with rights from {source_auth_id}")
                     else:
                         # Default: skip if target already exists
                         if verbose:
-                            print(f"[DEBUG] Clone skipped - {ace.get('type')} ACE already exists "
-                                  f"for target trustee {target_auth_id}", file=sys.stderr)
+                            log_stderr("DEBUG", f"Clone skipped - {ace.get('type')} ACE already exists for target trustee {target_auth_id}")
                 else:
                     # Target ACE does not exist - create a clone
                     # Use raw trustee name and _needs_resolution marker
@@ -1493,18 +1482,15 @@ def apply_ace_modifications(
                     aces.append(cloned_ace)
                     cloned_count += 1
                     if verbose:
-                        print(f"[DEBUG] Cloned {ace.get('type')} ACE from {source_auth_id} "
-                              f"to {cp.get('target_trustee')}", file=sys.stderr)
+                        log_stderr("DEBUG", f"Cloned {ace.get('type')} ACE from {source_auth_id} to {cp.get('target_trustee')}")
 
         stats['cloned'] += cloned_count
         stats['synced'] += synced_count
         if verbose:
             if cloned_count > 0:
-                print(f"[DEBUG] Cloned {cloned_count} ACE(s) from {cp.get('source_trustee')} "
-                      f"to {cp.get('target_trustee')}", file=sys.stderr)
+                log_stderr("DEBUG", f"Cloned {cloned_count} ACE(s) from {cp.get('source_trustee')} to {cp.get('target_trustee')}")
             if synced_count > 0:
-                print(f"[DEBUG] Synced {synced_count} ACE(s) for {cp.get('target_trustee')} "
-                      f"from {cp.get('source_trustee')}", file=sys.stderr)
+                log_stderr("DEBUG", f"Synced {synced_count} ACE(s) for {cp.get('target_trustee')} from {cp.get('source_trustee')}")
 
     # 9. Re-sort into canonical order
     aces = sort_aces_canonical(aces)
@@ -1546,7 +1532,7 @@ async def get_file_type(
         return entry.get('type') if entry else None
     except Exception as e:
         if client.verbose:
-            print(f"[WARN] Could not determine type for {path}: {e}", file=sys.stderr)
+            log_stderr("WARN", f"Could not determine type for {path}: {e}")
         return None
 
 
@@ -1606,8 +1592,7 @@ async def check_acl_type_compatibility(
     print("  - Inheritance flags may not be configured correctly", file=sys.stderr)
 
     if propagate:
-        print("\n[!] --propagate-acls is enabled. This will apply the file ACL to", file=sys.stderr)
-        print("    all child objects including subdirectories.", file=sys.stderr)
+        log_stderr("!", "--propagate-acls is enabled. This will apply the file ACL to\n    all child objects including subdirectories.", newline_before=True)
 
     print("\n" + "=" * 70, file=sys.stderr)
 
@@ -1615,10 +1600,10 @@ async def check_acl_type_compatibility(
     while True:
         response = input("Proceed? (Yes/No): ").strip().lower()
         if response in ['yes', 'y']:
-            print("[INFO] Proceeding with ACL application...\n", file=sys.stderr)
+            log_stderr("INFO", "Proceeding with ACL application...\n")
             return True
         elif response in ['no', 'n']:
-            print("[INFO] Operation cancelled by user.", file=sys.stderr)
+            log_stderr("INFO", "Operation cancelled by user.")
             return False
         else:
             print("Please enter 'Yes' or 'No'.", file=sys.stderr)
@@ -1638,6 +1623,49 @@ def format_time_estimate(seconds: float) -> str:
         return f"{hours}h {minutes}m"
 
 
+async def display_scope_aggregates(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    path: str,
+    label: str = "Processing",
+    verbose: bool = False,
+    max_depth: int = None,
+    omit_subdirs: list = None,
+):
+    """Fetch and display directory aggregate counts before a tree operation.
+
+    Shows the total number of subdirectories and files under the given path
+    so the user knows the scope of work before a propagation begins.
+    Failures are non-fatal -- the operation proceeds without the display.
+    """
+    try:
+        aggregates = await client.get_directory_aggregates(session, path)
+        total_files = aggregates.get('total_files', 'unknown')
+        total_dirs = aggregates.get('total_directories', 'unknown')
+
+        if isinstance(total_files, str):
+            files_str = total_files
+        else:
+            files_str = f"{int(total_files):,}"
+
+        if isinstance(total_dirs, str):
+            dirs_str = total_dirs
+        else:
+            dirs_str = f"{int(total_dirs):,}"
+
+        filter_note = ""
+        if max_depth or omit_subdirs:
+            filter_note = " (before filters)"
+
+        print(
+            f"{label} {path} ({dirs_str} subdirectories, {files_str} files){filter_note}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        if verbose:
+            log_stderr("WARN", f"Could not fetch directory aggregates: {e}")
+
+
 async def apply_acl_to_tree(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -1652,10 +1680,14 @@ async def apply_acl_to_tree(
     copy_owner: bool = False,
     copy_group: bool = False,
     owner_group_only: bool = False,
-    acl_concurrency: int = 100
+    acl_concurrency: int = 100,
+    dry_run: bool = False
 ) -> dict:
     """
     Apply ACL and/or owner/group to target path, optionally propagating to filtered children.
+
+    If dry_run is True, walks the tree and reports what would change without
+    calling any write APIs.
 
     Applies to:
     1. Target path itself (no INHERITED flag modification for ACL)
@@ -1702,50 +1734,59 @@ async def apply_acl_to_tree(
     start_time = time.time()
 
     # Step 1: Apply to target path
-    if progress:
+    if dry_run:
         if owner_group_only:
-            print(f"[OWNER/GROUP] Applying owner/group to target: {target_path}", file=sys.stderr)
+            log_stderr("DRY RUN", f"Would apply owner/group to target: {target_path}")
         elif copy_owner or copy_group:
-            print(f"[ACL+OWNER/GROUP] Applying ACL and owner/group to target: {target_path}", file=sys.stderr)
+            log_stderr("DRY RUN", f"Would apply ACL and owner/group to target: {target_path}")
         else:
-            print(f"[ACL CLONE] Applying ACL to target: {target_path}", file=sys.stderr)
+            log_stderr("DRY RUN", f"Would apply ACL to target: {target_path}")
+        stats['objects_changed'] = 1
+    else:
+        if progress:
+            if owner_group_only:
+                log_stderr("OWNER/GROUP", f"Applying owner/group to target: {target_path}")
+            elif copy_owner or copy_group:
+                log_stderr("ACL+OWNER/GROUP", f"Applying ACL and owner/group to target: {target_path}")
+            else:
+                log_stderr("ACL CLONE", f"Applying ACL to target: {target_path}")
 
-    # Apply ACL if not owner_group_only
-    if not owner_group_only:
-        success, error_msg = await client.set_file_acl(
-            session, target_path, acl_data, mark_inherited=False
-        )
+        # Apply ACL if not owner_group_only
+        if not owner_group_only:
+            success, error_msg = await client.set_file_acl(
+                session, target_path, acl_data, mark_inherited=False
+            )
 
-        if not success:
-            print(f"\n[ERROR] Failed to apply ACL to target path: {target_path}", file=sys.stderr)
-            print(f"[ERROR] {error_msg}", file=sys.stderr)
-            stats['objects_failed'] = 1
-            stats['errors'].append({
-                'path': target_path,
-                'error_code': 'INITIAL_FAILURE',
-                'message': error_msg
-            })
-            return stats
+            if not success:
+                log_stderr("ERROR", f"Failed to apply ACL to target path: {target_path}", newline_before=True)
+                log_stderr("ERROR", f"{error_msg}")
+                stats['objects_failed'] = 1
+                stats['errors'].append({
+                    'path': target_path,
+                    'error_code': 'INITIAL_FAILURE',
+                    'message': error_msg
+                })
+                return stats
 
-    # Apply owner/group if requested
-    if (copy_owner or copy_group) and owner_group_data:
-        owner_to_set = owner_group_data.get('owner') if copy_owner else None
-        group_to_set = owner_group_data.get('group') if copy_group else None
+        # Apply owner/group if requested
+        if (copy_owner or copy_group) and owner_group_data:
+            owner_to_set = owner_group_data.get('owner') if copy_owner else None
+            group_to_set = owner_group_data.get('group') if copy_group else None
 
-        success, error_msg = await client.set_file_owner_group(
-            session, target_path, owner=owner_to_set, group=group_to_set
-        )
+            success, error_msg = await client.set_file_owner_group(
+                session, target_path, owner=owner_to_set, group=group_to_set
+            )
 
-        if not success:
-            print(f"\n[ERROR] Failed to apply owner/group to target path: {target_path}", file=sys.stderr)
-            print(f"[ERROR] {error_msg}", file=sys.stderr)
-            stats['objects_failed'] = 1
-            stats['errors'].append({
-                'path': target_path,
-                'error_code': 'OWNER_GROUP_FAILURE',
-                'message': error_msg
-            })
-            return stats
+            if not success:
+                log_stderr("ERROR", f"Failed to apply owner/group to target path: {target_path}", newline_before=True)
+                log_stderr("ERROR", f"{error_msg}")
+                stats['objects_failed'] = 1
+                stats['errors'].append({
+                    'path': target_path,
+                    'error_code': 'OWNER_GROUP_FAILURE',
+                    'message': error_msg
+                })
+                return stats
 
     stats['objects_changed'] = 1
     stats['total_objects_processed'] = 1
@@ -1769,7 +1810,10 @@ async def apply_acl_to_tree(
 
     # Helper async function to apply both ACL and owner/group to a single file
     async def apply_to_single_file(path: str):
-        """Apply ACL and/or owner/group to a single file"""
+        """Apply ACL and/or owner/group to a single file. In dry-run mode, just report."""
+        if dry_run:
+            return (True, None)
+
         acl_success = True
         og_success = True
         error_msg = None
@@ -1831,7 +1875,7 @@ async def apply_acl_to_tree(
             )
         except Exception as e:
             if progress:
-                print(f"\n[ERROR] Tree walk failed: {e}", file=sys.stderr)
+                log_stderr("ERROR", f"Tree walk failed: {e}", newline_before=True)
         finally:
             producer_done.set()
 
@@ -1898,17 +1942,17 @@ async def apply_acl_to_tree(
 
                         if continue_on_error:
                             if progress:
-                                print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
+                                log_stderr("WARN", f"Error on {path}: {error_msg}, continuing...", newline_before=True)
                         else:
-                            print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
-                            print(f"[ERROR] {error_msg}", file=sys.stderr)
+                            log_stderr("ERROR", f"Failed to apply ACL to: {path}", newline_before=True)
+                            log_stderr("ERROR", f"{error_msg}")
 
                             while True:
                                 response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
                                 if response in ['c', 'continue']:
                                     break
                                 elif response in ['a', 'abort']:
-                                    print("[INFO] Operation aborted by user.", file=sys.stderr)
+                                    log_stderr("INFO", "Operation aborted by user.")
                                     abort_requested.set()
                                     return
                                 print("Invalid response. Please enter 'c' or 'a'.")
@@ -1928,17 +1972,17 @@ async def apply_acl_to_tree(
 
                             if continue_on_error:
                                 if progress:
-                                    print(f"\n[WARN] Error on {path}: {error_msg}, continuing...", file=sys.stderr)
+                                    log_stderr("WARN", f"Error on {path}: {error_msg}, continuing...", newline_before=True)
                             else:
-                                print(f"\n[ERROR] Failed to apply ACL to: {path}", file=sys.stderr)
-                                print(f"[ERROR] {error_msg}", file=sys.stderr)
+                                log_stderr("ERROR", f"Failed to apply ACL to: {path}", newline_before=True)
+                                log_stderr("ERROR", f"{error_msg}")
 
                                 while True:
                                     response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
                                     if response in ['c', 'continue']:
                                         break
                                     elif response in ['a', 'abort']:
-                                        print("[INFO] Operation aborted by user.", file=sys.stderr)
+                                        log_stderr("INFO", "Operation aborted by user.")
                                         abort_requested.set()
                                         return
                                     print("Invalid response. Please enter 'c' or 'a'.")
@@ -1950,8 +1994,10 @@ async def apply_acl_to_tree(
                     queue_size = entry_queue.qsize()
 
                     # Show queue size to indicate backpressure
+                    progress_label = "DRY RUN" if dry_run else "ACL CLONE"
+                    changed_label = "Would change" if dry_run else "Changed"
                     print(
-                        f"\r[ACL CLONE] Changed: {stats['objects_changed']:,} | "
+                        f"\r[{progress_label}] {changed_label}: {stats['objects_changed']:,} | "
                         f"Failed: {stats['objects_failed']:,} | "
                         f"Processed: {processed:,} | "
                         f"Queue: {queue_size:,} | "
@@ -1973,7 +2019,8 @@ async def apply_acl_to_tree(
     if progress:
         print()  # New line after progress
         elapsed = time.time() - start_time
-        print(f"[ACL CLONE] Completed in {elapsed:.1f}s", file=sys.stderr)
+        complete_label = "DRY RUN" if dry_run else "ACL CLONE"
+        log_stderr(complete_label, f"Completed in {elapsed:.1f}s")
 
     return stats
 
@@ -2042,7 +2089,7 @@ async def generate_acl_report(
             if isinstance(result, Exception):
                 # Task raised an exception
                 if client.verbose:
-                    print(f"[WARN] Error processing ACL for {path}: {result}", file=sys.stderr)
+                    log_stderr("WARN", f"Error processing ACL for {path}: {result}")
                 file_acls[path] = {
                     'acl_data': None,
                     'is_directory': is_directory,
@@ -2092,16 +2139,12 @@ async def generate_acl_report(
             else:
                 # For non-TTY, print periodic updates
                 if processed % 1000 == 0 or processed == total_files:
-                    print(
-                        f"[ACL REPORT] {processed:,} / {total_files:,} processed | "
-                        f"{remaining:,} remaining | {rate:.1f} files/sec",
-                        file=sys.stderr
-                    )
+                    log_stderr("ACL REPORT", f"{processed:,} / {total_files:,} processed | {remaining:,} remaining | {rate:.1f} files/sec")
 
     if show_progress:
         if sys.stderr.isatty():
             print(file=sys.stderr)  # New line after progress
-        print(f"[ACL REPORT] Completed processing {total_files:,} files", file=sys.stderr)
+        log_stderr("ACL REPORT", f"Completed processing {total_files:,} files")
 
     # Calculate statistics
     files_with_acls = sum(1 for info in file_acls.values() if info['acl_data'] is not None)
@@ -2148,7 +2191,7 @@ async def generate_acl_report(
                     all_auth_ids.add(group_auth_id)
 
         if all_auth_ids and show_progress:
-            print(f"[ACL REPORT] Resolving {len(all_auth_ids)} unique identities...", file=sys.stderr)
+            log_stderr("ACL REPORT", f"Resolving {len(all_auth_ids)} unique identities...")
 
         # Resolve identities using existing infrastructure
         if all_auth_ids:
@@ -2218,7 +2261,7 @@ def load_trustee_mappings(filepath: str, verbose: bool = False) -> List[dict]:
                 # Skip header row
                 if line_num == 1 and has_header:
                     if verbose:
-                        print(f"[DEBUG] Skipping header row: {row}", file=sys.stderr)
+                        log_stderr("DEBUG", f"Skipping header row: {row}")
                     continue
 
                 # Skip empty rows
@@ -2248,8 +2291,7 @@ def load_trustee_mappings(filepath: str, verbose: bool = False) -> List[dict]:
                 })
 
         if verbose:
-            print(f"[DEBUG] Loaded {len(mappings)} trustee mappings from {filepath}",
-                  file=sys.stderr)
+            log_stderr("DEBUG", f"Loaded {len(mappings)} trustee mappings from {filepath}")
 
         return mappings
 
@@ -2619,8 +2661,8 @@ async def find_similar(
         hash_lib = "SHA-256 (slow - install xxhash for 10x speedup: pip install xxhash)"
 
     if progress and progress.verbose:
-        print(f"[SIMILARITY DETECTION] Using {hash_lib} for file hashing", file=sys.stderr)
-        print(f"[SIMILARITY DETECTION] Phase 1: Metadata pre-filtering {len(files):,} files", file=sys.stderr)
+        log_stderr("SIMILARITY DETECTION", f"Using {hash_lib} for file hashing")
+        log_stderr("SIMILARITY DETECTION", f"Phase 1: Metadata pre-filtering {len(files):,} files")
 
     # Phase 1: Group by metadata (size, datablocks, sparse_file)
     metadata_groups = defaultdict(list)
@@ -2639,7 +2681,7 @@ async def find_similar(
 
     if progress and progress.verbose:
         total_potential = sum(len(v) for v in potential_duplicates.values())
-        print(f"[SIMILARITY DETECTION] Found {total_potential:,} potential similar files in {len(potential_duplicates):,} groups", file=sys.stderr)
+        log_stderr("SIMILARITY DETECTION", f"Found {total_potential:,} potential similar files in {len(potential_duplicates):,} groups")
 
     # If estimate-only mode, calculate and display data transfer estimate, then exit
     if estimate_only:
@@ -2706,7 +2748,7 @@ async def find_similar(
 
     # Phase 2: Compute sample hashes for potential similar files
     if progress and progress.verbose:
-        print(f"[SIMILARITY DETECTION] Phase 2: Computing sample hashes", file=sys.stderr)
+        log_stderr("SIMILARITY DETECTION", "Phase 2: Computing sample hashes")
 
     hash_groups = defaultdict(list)
     BATCH_SIZE = 1000  # Process files in batches to avoid overwhelming the system
@@ -2790,14 +2832,14 @@ async def find_similar(
     elif progress and progress.verbose:
         elapsed = time.time() - hash_start_time
         rate = files_hashed / elapsed if elapsed > 0 else 0
-        print(f"[SIMILARITY DETECTION] FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s", file=sys.stderr)
+        log_stderr("SIMILARITY DETECTION", f"FINAL: {files_hashed:,} files hashed | {rate:.1f} files/sec | {elapsed:.1f}s")
 
     # Filter to only groups with 2+ files (actual similar files)
     similar_groups = {k: v for k, v in hash_groups.items() if len(v) >= 2}
 
     if progress and progress.verbose:
         total_similar = sum(len(v) for v in similar_groups.values())
-        print(f"[SIMILARITY DETECTION] Found {total_similar:,} confirmed similar files in {len(similar_groups):,} groups", file=sys.stderr)
+        log_stderr("SIMILARITY DETECTION", f"Found {total_similar:,} confirmed similar files in {len(similar_groups):,} groups")
 
     return similar_groups
 
@@ -2925,34 +2967,41 @@ async def main_async(args):
     # Determine if we're in ACL cloning mode
     acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
 
-    print("=" * 70, file=sys.stderr)
+    # Helper to print a line to both stderr and log file
+    def banner_line(line: str):
+        print(line, file=sys.stderr)
+        log_to_file(line)
+
+    banner_line("=" * 70)
     if acl_cloning_mode:
-        print("GrumpWalk - ACL Cloning Mode", file=sys.stderr)
+        banner_line("GrumpWalk - ACL Cloning Mode")
     else:
-        print("GrumpWalk - Qumulo Directory Tree Walk", file=sys.stderr)
-    print("=" * 70, file=sys.stderr)
-    print(f"Cluster:          {args.host}", file=sys.stderr)
+        banner_line("GrumpWalk - Qumulo Directory Tree Walk")
+    banner_line("=" * 70)
+    banner_line(f"Cluster:          {args.host}")
 
     if acl_cloning_mode:
         if args.source_acl_file:
-            print(f"Source ACL:       {args.source_acl_file} (file)", file=sys.stderr)
+            banner_line(f"Source ACL:       {args.source_acl_file} (file)")
         else:
-            print(f"Source ACL:       {args.source_acl}", file=sys.stderr)
-        print(f"Target path:      {args.acl_target}", file=sys.stderr)
+            banner_line(f"Source ACL:       {args.source_acl}")
+        banner_line(f"Target path:      {args.acl_target}")
         if args.propagate_acls:
-            print(f"Propagate:        Enabled", file=sys.stderr)
-        print(f"ACL concurrency:  {args.acl_concurrency}", file=sys.stderr)
+            banner_line(f"Propagate:        Enabled")
+        banner_line(f"ACL concurrency:  {args.acl_concurrency}")
     else:
-        print(f"Path:             {args.path}", file=sys.stderr)
+        banner_line(f"Path:             {args.path}")
 
-    print(f"JSON parser:      {JSON_PARSER_NAME}", file=sys.stderr)
-    print(f"Walk concurrency: {args.max_concurrent}", file=sys.stderr)
-    print(f"Connection pool:  {args.connector_limit}", file=sys.stderr)
+    banner_line(f"JSON parser:      {JSON_PARSER_NAME}")
+    banner_line(f"Walk concurrency: {args.max_concurrent}")
+    banner_line(f"Connection pool:  {args.connector_limit}")
     if args.max_depth:
-        print(f"Max depth:        {args.max_depth}", file=sys.stderr)
+        banner_line(f"Max depth:        {args.max_depth}")
     if args.progress:
-        print(f"Progress:         Enabled", file=sys.stderr)
-    print("=" * 70, file=sys.stderr)
+        banner_line(f"Progress:         Enabled")
+    if args.log_file:
+        banner_line(f"Log file:         {args.log_file} (level: {args.log_level})")
+    banner_line("=" * 70)
 
     # Load credentials
     if args.credentials_store:
@@ -2988,22 +3037,22 @@ async def main_async(args):
         print("OK", file=sys.stderr)
     except asyncio.TimeoutError:
         print("FAILED", file=sys.stderr)
-        print(f"\n[ERROR] Connection timed out to {args.host}:{args.port}", file=sys.stderr)
-        print(f"[HINT] Check that the cluster is powered on and reachable", file=sys.stderr)
-        print(f"[HINT] Verify the hostname/IP and port are correct", file=sys.stderr)
+        log_stderr("ERROR", f"Connection timed out to {args.host}:{args.port}", newline_before=True)
+        log_stderr("HINT", "Check that the cluster is powered on and reachable")
+        log_stderr("HINT", "Verify the hostname/IP and port are correct")
         sys.exit(1)
     except OSError as e:
         print("FAILED", file=sys.stderr)
-        print(f"\n[ERROR] Cannot connect to {args.host}:{args.port}", file=sys.stderr)
+        log_stderr("ERROR", f"Cannot connect to {args.host}:{args.port}", newline_before=True)
         err_str = str(e).lower()
         if "refused" in err_str or "errno 61" in err_str or "errno 111" in err_str:
-            print(f"[HINT] Connection refused - verify host and port are correct", file=sys.stderr)
+            log_stderr("HINT", "Connection refused - verify host and port are correct")
         elif "no route" in err_str or "unreachable" in err_str:
-            print(f"[HINT] Host unreachable - check network connectivity", file=sys.stderr)
+            log_stderr("HINT", "Host unreachable - check network connectivity")
         elif "nodename" in err_str or "name or service not known" in err_str or "errno 8" in err_str:
-            print(f"[HINT] DNS resolution failed - check hostname spelling", file=sys.stderr)
+            log_stderr("HINT", "DNS resolution failed - check hostname spelling")
         else:
-            print(f"[HINT] {e}", file=sys.stderr)
+            log_stderr("HINT", f"{e}")
         sys.exit(1)
 
     # Test authentication before proceeding
@@ -3015,23 +3064,23 @@ async def main_async(args):
         except aiohttp.ClientResponseError as e:
             print("FAILED", file=sys.stderr)
             if e.status == 401:
-                print(f"\n[ERROR] Authentication failed (401 Unauthorized)", file=sys.stderr)
-                print(f"[HINT] Your bearer token may be expired or invalid", file=sys.stderr)
-                print(f"[HINT] Generate a new token: qq --host {args.host} login", file=sys.stderr)
+                log_stderr("ERROR", "Authentication failed (401 Unauthorized)", newline_before=True)
+                log_stderr("HINT", "Your bearer token may be expired or invalid")
+                log_stderr("HINT", f"Generate a new token: qq --host {args.host} login")
             else:
-                print(f"\n[ERROR] HTTP {e.status}: {e.message}", file=sys.stderr)
+                log_stderr("ERROR", f"HTTP {e.status}: {e.message}", newline_before=True)
             sys.exit(1)
 
     # ACL Cloning Mode
     if args.source_acl or args.source_acl_file or args.acl_target:
         # Validate: need a source and a target
         if not ((args.source_acl or args.source_acl_file) and args.acl_target):
-            print("[ERROR] Both a source (--source-acl or --source-acl-file) and --acl-target must be specified", file=sys.stderr)
+            log_stderr("ERROR", "Both a source (--source-acl or --source-acl-file) and --acl-target must be specified")
             sys.exit(1)
 
         # Validate: can't specify both source types
         if args.source_acl and args.source_acl_file:
-            print("[ERROR] Cannot specify both --source-acl and --source-acl-file", file=sys.stderr)
+            log_stderr("ERROR", "Cannot specify both --source-acl and --source-acl-file")
             sys.exit(1)
 
         async with client.create_session() as session:
@@ -3043,49 +3092,49 @@ async def main_async(args):
                         source_acl = json.load(f)
                     if args.verbose:
                         ace_count = len(source_acl.get('acl', {}).get('aces', []))
-                        print(f"[INFO] Loaded ACL from file with {ace_count} ACEs", file=sys.stderr)
+                        log_stderr("INFO", f"Loaded ACL from file with {ace_count} ACEs")
                 except FileNotFoundError:
-                    print(f"[ERROR] ACL file not found: {args.source_acl_file}", file=sys.stderr)
+                    log_stderr("ERROR", f"ACL file not found: {args.source_acl_file}")
                     sys.exit(1)
                 except json.JSONDecodeError as e:
-                    print(f"[ERROR] Invalid JSON in ACL file: {e}", file=sys.stderr)
+                    log_stderr("ERROR", f"Invalid JSON in ACL file: {e}")
                     sys.exit(1)
             else:
                 # Retrieve ACL from cluster
                 if args.verbose:
-                    print(f"[INFO] Retrieving ACL from: {args.source_acl}", file=sys.stderr)
+                    log_stderr("INFO", f"Retrieving ACL from: {args.source_acl}")
 
                 source_acl = await client.get_file_acl(session, args.source_acl)
 
                 if not source_acl:
-                    print(f"[ERROR] Could not retrieve ACL from {args.source_acl}", file=sys.stderr)
+                    log_stderr("ERROR", f"Could not retrieve ACL from {args.source_acl}")
                     sys.exit(1)
 
                 if args.verbose:
                     ace_count = len(source_acl.get('acl', {}).get('aces', []))
-                    print(f"[INFO] Retrieved ACL with {ace_count} ACEs", file=sys.stderr)
+                    log_stderr("INFO", f"Retrieved ACL with {ace_count} ACEs")
 
             # Step 1b: Retrieve owner/group if requested
             owner_group_data = None
             if args.copy_owner or args.copy_group:
                 if args.source_acl_file:
-                    print("[ERROR] Cannot use --copy-owner or --copy-group with --source-acl-file", file=sys.stderr)
+                    log_stderr("ERROR", "Cannot use --copy-owner or --copy-group with --source-acl-file")
                     sys.exit(1)
 
                 if args.verbose:
-                    print(f"[INFO] Retrieving owner/group from: {args.source_acl}", file=sys.stderr)
+                    log_stderr("INFO", f"Retrieving owner/group from: {args.source_acl}")
 
                 owner_group_data = await client.get_file_owner_group(session, args.source_acl)
 
                 if not owner_group_data:
-                    print(f"[ERROR] Could not retrieve owner/group from {args.source_acl}", file=sys.stderr)
+                    log_stderr("ERROR", f"Could not retrieve owner/group from {args.source_acl}")
                     sys.exit(1)
 
                 if args.verbose:
                     if args.copy_owner:
-                        print(f"[INFO] Source owner: {owner_group_data.get('owner')}", file=sys.stderr)
+                        log_stderr("INFO", f"Source owner: {owner_group_data.get('owner')}")
                     if args.copy_group:
-                        print(f"[INFO] Source group: {owner_group_data.get('group')}", file=sys.stderr)
+                        log_stderr("INFO", f"Source group: {owner_group_data.get('group')}")
 
             # Step 2: Check ACL type compatibility and warn if needed (skip if using file)
             if not args.source_acl_file:
@@ -3110,6 +3159,16 @@ async def main_async(args):
 
             file_filter = create_file_filter(args, owner_auth_ids)
 
+            # Display scope before propagation
+            if args.propagate_acls:
+                await display_scope_aggregates(
+                    client, session, args.acl_target,
+                    label="Propagating to",
+                    verbose=args.verbose,
+                    max_depth=args.max_depth,
+                    omit_subdirs=args.omit_subdirs,
+                )
+
             # Step 4: Apply ACL and/or owner/group to target tree
             stats = await apply_acl_to_tree(
                 client=client,
@@ -3125,16 +3184,18 @@ async def main_async(args):
                 copy_owner=args.copy_owner,
                 copy_group=args.copy_group,
                 owner_group_only=args.owner_group_only,
-                acl_concurrency=args.acl_concurrency
+                acl_concurrency=args.acl_concurrency,
+                dry_run=args.dry_run
             )
 
             # Step 5: Print summary
+            dry_label = " (DRY RUN)" if args.dry_run else ""
             if args.owner_group_only:
-                print("\nOWNER/GROUP COPY SUMMARY", file=sys.stderr)
+                print(f"\nOWNER/GROUP COPY SUMMARY{dry_label}", file=sys.stderr)
             elif args.copy_owner or args.copy_group:
-                print("\nACL + OWNER/GROUP COPY SUMMARY", file=sys.stderr)
+                print(f"\nACL + OWNER/GROUP COPY SUMMARY{dry_label}", file=sys.stderr)
             else:
-                print("\nACL CLONING SUMMARY", file=sys.stderr)
+                print(f"\nACL CLONING SUMMARY{dry_label}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             if args.source_acl_file:
                 print(f"Source:            {args.source_acl_file} (file)", file=sys.stderr)
@@ -3150,9 +3211,13 @@ async def main_async(args):
                 copied_items.append("Owner")
             if args.copy_group:
                 copied_items.append("Group")
-            print(f"Copied:            {', '.join(copied_items)}", file=sys.stderr)
+            if args.dry_run:
+                print(f"Would copy:        {', '.join(copied_items)}", file=sys.stderr)
+            else:
+                print(f"Copied:            {', '.join(copied_items)}", file=sys.stderr)
 
-            print(f"Objects changed:   {stats['objects_changed']:,}", file=sys.stderr)
+            changed_label = "Would change:" if args.dry_run else "Objects changed:"
+            print(f"{changed_label:19}{stats['objects_changed']:,}", file=sys.stderr)
             print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
             if file_filter:
                 print(f"Objects skipped:   {stats['objects_skipped']:,} (filter mismatch)", file=sys.stderr)
@@ -3175,7 +3240,7 @@ async def main_async(args):
     if args.ace_restore:
         import json
 
-        print("\n[INFO] ACE Restore Mode", file=sys.stderr)
+        log_stderr("INFO", "ACE Restore Mode", newline_before=True)
         print("=" * 70, file=sys.stderr)
         print(f"Backup file:       {args.ace_restore}", file=sys.stderr)
 
@@ -3184,10 +3249,10 @@ async def main_async(args):
             with open(args.ace_restore, 'r') as f:
                 backup_data = json.load(f)
         except FileNotFoundError:
-            print(f"[ERROR] Backup file not found: {args.ace_restore}", file=sys.stderr)
+            log_stderr("ERROR", f"Backup file not found: {args.ace_restore}")
             sys.exit(1)
         except json.JSONDecodeError as e:
-            print(f"[ERROR] Invalid JSON in backup file: {e}", file=sys.stderr)
+            log_stderr("ERROR", f"Invalid JSON in backup file: {e}")
             sys.exit(1)
 
         # Extract backup data
@@ -3197,7 +3262,7 @@ async def main_async(args):
         backup_timestamp = backup_data.get('timestamp')
 
         if not backup_path or not backup_acl:
-            print("[ERROR] Backup file is missing required fields (path, original_acl)", file=sys.stderr)
+            log_stderr("ERROR", "Backup file is missing required fields (path, original_acl)")
             sys.exit(1)
 
         print(f"Original path:     {backup_path}", file=sys.stderr)
@@ -3224,7 +3289,7 @@ async def main_async(args):
             current_attr = await client.get_file_attr(session, target_path)
 
             if not current_attr:
-                print(f"[ERROR] Could not retrieve attributes from {target_path}", file=sys.stderr)
+                log_stderr("ERROR", f"Could not retrieve attributes from {target_path}")
                 print("        The path may not exist or you may not have permission to access it.", file=sys.stderr)
                 sys.exit(1)
 
@@ -3233,48 +3298,55 @@ async def main_async(args):
             # Verify file_id matches (safety check)
             if backup_file_id and current_file_id:
                 if str(backup_file_id) != str(current_file_id):
-                    print(f"\n[WARNING] File ID mismatch detected!", file=sys.stderr)
+                    log_stderr("WARNING", "File ID mismatch detected!", newline_before=True)
                     print(f"          Backup file ID:  {backup_file_id}", file=sys.stderr)
                     print(f"          Current file ID: {current_file_id}", file=sys.stderr)
                     print(f"          This may indicate the path now refers to a different file.", file=sys.stderr)
 
                     if not args.force_restore:
-                        print(f"\n[ERROR] Refusing to restore due to file ID mismatch.", file=sys.stderr)
+                        log_stderr("ERROR", "Refusing to restore due to file ID mismatch.", newline_before=True)
                         print(f"        Use --force-restore to override this safety check.", file=sys.stderr)
                         sys.exit(1)
                     else:
-                        print(f"\n[WARNING] Proceeding with restore due to --force-restore flag.", file=sys.stderr)
+                        log_stderr("WARNING", "Proceeding with restore due to --force-restore flag.", newline_before=True)
                 else:
-                    print(f"[INFO] File ID verified: {current_file_id}", file=sys.stderr)
+                    log_stderr("INFO", f"File ID verified: {current_file_id}")
             elif backup_file_id and not current_file_id:
-                print(f"[WARNING] Could not verify file ID (current file has no ID)", file=sys.stderr)
+                log_stderr("WARNING", "Could not verify file ID (current file has no ID)")
             elif not backup_file_id:
-                print(f"[WARNING] Backup does not contain file_id (older backup format)", file=sys.stderr)
+                log_stderr("WARNING", "Backup does not contain file_id (older backup format)")
 
             # Dry run: show what would be restored
             if args.dry_run:
-                print("\n[DRY RUN] Would restore the following ACL:", file=sys.stderr)
+                log_stderr("DRY RUN", "Would restore the following ACL:", newline_before=True)
                 print("-" * 60, file=sys.stderr)
                 for i, ace in enumerate(backup_aces):
                     ace_str = qacl_ace_to_readable(ace, is_dir=True)
                     print(f"  {i+1}. {ace_str}", file=sys.stderr)
                 print("-" * 60, file=sys.stderr)
-                print("[DRY RUN] No changes were made.", file=sys.stderr)
+                log_stderr("DRY RUN", "No changes were made.")
                 return
 
             # Apply the backed-up ACL
-            print(f"\n[INFO] Restoring ACL to: {target_path}", file=sys.stderr)
+            log_stderr("INFO", f"Restoring ACL to: {target_path}", newline_before=True)
             success, error = await client.set_file_acl(session, target_path, backup_acl, mark_inherited=False)
 
             if not success:
-                print(f"[ERROR] Failed to restore ACL: {error}", file=sys.stderr)
+                log_stderr("ERROR", f"Failed to restore ACL: {error}")
                 sys.exit(1)
 
-            print(f"[INFO] ACL restored successfully ({len(backup_aces)} ACEs)", file=sys.stderr)
+            log_stderr("INFO", f"ACL restored successfully ({len(backup_aces)} ACEs)")
 
             # Propagate if requested
             if args.propagate_changes:
-                print(f"\n[INFO] Propagating restored ACL to children of: {target_path}", file=sys.stderr)
+                log_stderr("INFO", f"Propagating restored ACL to children of: {target_path}", newline_before=True)
+                await display_scope_aggregates(
+                    client, session, target_path,
+                    label="Propagating to",
+                    verbose=args.verbose,
+                    max_depth=args.max_depth,
+                    omit_subdirs=args.omit_subdirs,
+                )
 
                 # Resolve owner filters if any
                 owner_auth_ids = None
@@ -3296,11 +3368,11 @@ async def main_async(args):
                     acl_concurrency=args.acl_concurrency
                 )
 
-                print(f"\n[INFO] Propagation complete:", file=sys.stderr)
+                log_stderr("INFO", "Propagation complete:", newline_before=True)
                 print(f"  Objects changed:  {propagate_stats['objects_changed']:,}", file=sys.stderr)
                 print(f"  Objects failed:   {propagate_stats['objects_failed']:,}", file=sys.stderr)
 
-        print("\n[INFO] ACE restore complete", file=sys.stderr)
+        log_stderr("INFO", "ACE restore complete", newline_before=True)
         return  # Exit after ACE restore
 
     # ACE MANIPULATION MODE
@@ -3314,7 +3386,7 @@ async def main_async(args):
     # Check for mutually exclusive flags: ACL cloning vs ACE manipulation
     acl_cloning_mode = args.source_acl or args.source_acl_file
     if ace_manipulation_mode and acl_cloning_mode:
-        print("[ERROR] ACL cloning (--source-acl, --source-acl-file, --acl-target) cannot be combined with", file=sys.stderr)
+        log_stderr("ERROR", "ACL cloning (--source-acl, --source-acl-file, --acl-target) cannot be combined with")
         print("        ACE manipulation (--add-ace, --remove-ace, --replace-ace, --add-rights, --remove-rights, --clone-ace-*)", file=sys.stderr)
         print("", file=sys.stderr)
         print("        Use ACL cloning to copy an entire ACL from one path to another.", file=sys.stderr)
@@ -3323,25 +3395,25 @@ async def main_async(args):
 
     if ace_manipulation_mode:
         if not args.path:
-            print("[ERROR] --path is required for ACE manipulation", file=sys.stderr)
+            log_stderr("ERROR", "--path is required for ACE manipulation")
             sys.exit(1)
 
         # Auto-convert --propagate-acls to --propagate-changes for ACE manipulation
         # This provides better UX since users naturally try --propagate-acls
         if args.propagate_acls and not args.propagate_changes:
             args.propagate_changes = True
-            print("[INFO] Using --propagate-changes for ACE manipulation (--propagate-acls also accepted)", file=sys.stderr)
+            log_stderr("INFO", "Using --propagate-changes for ACE manipulation (--propagate-acls also accepted)")
 
         # Validate --replace-ace / --new-ace pairing
         replace_count = len(args.replace_aces) if args.replace_aces else 0
         new_ace_count = len(args.new_aces) if args.new_aces else 0
 
         if new_ace_count > 0 and replace_count == 0:
-            print("[ERROR] --new-ace requires --replace-ace to specify which ACE to replace", file=sys.stderr)
+            log_stderr("ERROR", "--new-ace requires --replace-ace to specify which ACE to replace")
             sys.exit(1)
 
         if new_ace_count > 0 and new_ace_count != replace_count:
-            print(f"[ERROR] --replace-ace and --new-ace must be paired 1:1", file=sys.stderr)
+            log_stderr("ERROR", "--replace-ace and --new-ace must be paired 1:1")
             print(f"        Found {replace_count} --replace-ace and {new_ace_count} --new-ace", file=sys.stderr)
             sys.exit(1)
 
@@ -3358,12 +3430,12 @@ async def main_async(args):
             # Each --new-ace should immediately follow a --replace-ace (with its value in between)
             for j, new_pos in enumerate(new_ace_positions):
                 if j >= len(replace_positions):
-                    print(f"[ERROR] --new-ace at position {new_pos} has no matching --replace-ace", file=sys.stderr)
+                    log_stderr("ERROR", f"--new-ace at position {new_pos} has no matching --replace-ace")
                     sys.exit(1)
                 replace_pos = replace_positions[j]
                 # --new-ace should be 2 positions after --replace-ace (--replace-ace VALUE --new-ace)
                 if new_pos != replace_pos + 2:
-                    print(f"[ERROR] --new-ace must immediately follow --replace-ace 'PATTERN'", file=sys.stderr)
+                    log_stderr("ERROR", "--new-ace must immediately follow --replace-ace 'PATTERN'")
                     print(f"        Expected: --replace-ace 'FIND' --new-ace 'REPLACE'", file=sys.stderr)
                     sys.exit(1)
 
@@ -3372,19 +3444,19 @@ async def main_async(args):
         clone_target_count = len(args.clone_ace_targets) if args.clone_ace_targets else 0
 
         if clone_source_count > 0 and clone_target_count == 0:
-            print("[ERROR] --clone-ace-source requires --clone-ace-target", file=sys.stderr)
+            log_stderr("ERROR", "--clone-ace-source requires --clone-ace-target")
             sys.exit(1)
 
         if clone_target_count > 0 and clone_source_count == 0:
-            print("[ERROR] --clone-ace-target requires --clone-ace-source", file=sys.stderr)
+            log_stderr("ERROR", "--clone-ace-target requires --clone-ace-source")
             sys.exit(1)
 
         if clone_source_count != clone_target_count:
-            print(f"[ERROR] --clone-ace-source and --clone-ace-target must be paired 1:1", file=sys.stderr)
+            log_stderr("ERROR", "--clone-ace-source and --clone-ace-target must be paired 1:1")
             print(f"        Found {clone_source_count} --clone-ace-source and {clone_target_count} --clone-ace-target", file=sys.stderr)
             sys.exit(1)
 
-        print("\n[INFO] ACE Manipulation Mode", file=sys.stderr)
+        log_stderr("INFO", "ACE Manipulation Mode", newline_before=True)
         print("=" * 70, file=sys.stderr)
 
         # Parse all patterns
@@ -3472,13 +3544,12 @@ async def main_async(args):
                         'target_trustee': mapping['target'],
                         'line': mapping['line'],  # For error reporting
                     })
-                print(f"[INFO] Loaded {len(csv_mappings)} clone mappings from {args.clone_ace_map}",
-                      file=sys.stderr)
+                log_stderr("INFO", f"Loaded {len(csv_mappings)} clone mappings from {args.clone_ace_map}")
             except FileNotFoundError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
+                log_stderr("ERROR", f"{e}")
                 sys.exit(1)
             except ValueError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
+                log_stderr("ERROR", f"{e}")
                 sys.exit(1)
 
         # Load --migrate-trustees CSV
@@ -3492,13 +3563,12 @@ async def main_async(args):
                         'target_trustee': mapping['target'],
                         'line': mapping['line'],  # For error reporting
                     })
-                print(f"[INFO] Loaded {len(csv_mappings)} migration mappings from {args.migrate_trustees}",
-                      file=sys.stderr)
+                log_stderr("INFO", f"Loaded {len(csv_mappings)} migration mappings from {args.migrate_trustees}")
             except FileNotFoundError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
+                log_stderr("ERROR", f"{e}")
                 sys.exit(1)
             except ValueError as e:
-                print(f"[ERROR] {e}", file=sys.stderr)
+                log_stderr("ERROR", f"{e}")
                 sys.exit(1)
 
         # Show what will be done
@@ -3546,11 +3616,11 @@ async def main_async(args):
 
             # Resolve clone pattern trustees (both source and target)
             if clone_patterns:
-                print(f"\n[INFO] Resolving clone trustee identities...", file=sys.stderr)
+                log_stderr("INFO", "Resolving clone trustee identities...", newline_before=True)
                 for cp in clone_patterns:
                     # Resolve source trustee
                     source = cp['source_trustee']
-                    print(f"[INFO] Resolving source trustee '{source}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving source trustee '{source}'...")
 
                     # Use parse_trustee to get the right format for identity resolution
                     source_spec = parse_trustee(source)
@@ -3572,14 +3642,14 @@ async def main_async(args):
                     result = await client.resolve_identity(session, source_identifier, source_id_type)
                     if result and result.get('auth_id'):
                         cp['source_auth_id'] = str(result['auth_id'])
-                        print(f"[INFO] Resolved source '{source}' -> auth_id {cp['source_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved source '{source}' -> auth_id {cp['source_auth_id']}")
                     else:
-                        print(f"[ERROR] Could not resolve source trustee: {source}", file=sys.stderr)
+                        log_stderr("ERROR", f"Could not resolve source trustee: {source}")
                         sys.exit(1)
 
                     # Resolve target trustee
                     target = cp['target_trustee']
-                    print(f"[INFO] Resolving target trustee '{target}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving target trustee '{target}'...")
 
                     # Use parse_trustee to get the right format for identity resolution
                     target_spec = parse_trustee(target)
@@ -3602,20 +3672,20 @@ async def main_async(args):
                     if result and result.get('auth_id'):
                         cp['target_auth_id'] = str(result['auth_id'])
                         cp['target_identity'] = result  # Store full identity for ACE creation
-                        print(f"[INFO] Resolved target '{target}' -> auth_id {cp['target_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved target '{target}' -> auth_id {cp['target_auth_id']}")
                     else:
-                        print(f"[ERROR] Could not resolve target trustee: {target}", file=sys.stderr)
+                        log_stderr("ERROR", f"Could not resolve target trustee: {target}")
                         sys.exit(1)
 
             # Resolve migrate pattern trustees (both source and target need auth_id)
             if migrate_patterns:
                 if args.verbose:
-                    print(f"\n[INFO] Resolving migrate trustee identities...", file=sys.stderr)
+                    log_stderr("INFO", "Resolving migrate trustee identities...", newline_before=True)
                 for mp in migrate_patterns:
                     # Resolve source trustee to get auth_id for matching
                     source = mp['source_trustee']
                     if args.verbose:
-                        print(f"[INFO] Resolving source trustee '{source}'...", file=sys.stderr)
+                        log_stderr("INFO", f"Resolving source trustee '{source}'...")
 
                     # Use parse_trustee to get the right format for identity resolution
                     source_spec = parse_trustee(source)
@@ -3638,15 +3708,15 @@ async def main_async(args):
                     if result and result.get('auth_id'):
                         mp['source_auth_id'] = str(result['auth_id'])
                         if args.verbose:
-                            print(f"[INFO] Resolved source '{source}' -> auth_id {mp['source_auth_id']}", file=sys.stderr)
+                            log_stderr("INFO", f"Resolved source '{source}' -> auth_id {mp['source_auth_id']}")
                     else:
-                        print(f"[ERROR] Could not resolve source trustee: {source}", file=sys.stderr)
+                        log_stderr("ERROR", f"Could not resolve source trustee: {source}")
                         sys.exit(1)
 
                     # Resolve target trustee to get auth_id for duplicate detection
                     target = mp['target_trustee']
                     if args.verbose:
-                        print(f"[INFO] Resolving target trustee '{target}'...", file=sys.stderr)
+                        log_stderr("INFO", f"Resolving target trustee '{target}'...")
 
                     target_spec = parse_trustee(target)
                     target_payload = target_spec['payload']
@@ -3667,22 +3737,22 @@ async def main_async(args):
                     if result and result.get('auth_id'):
                         mp['target_auth_id'] = str(result['auth_id'])
                         if args.verbose:
-                            print(f"[INFO] Resolved target '{target}' -> auth_id {mp['target_auth_id']}", file=sys.stderr)
+                            log_stderr("INFO", f"Resolved target '{target}' -> auth_id {mp['target_auth_id']}")
                     else:
-                        print(f"[ERROR] Could not resolve target trustee: {target}", file=sys.stderr)
+                        log_stderr("ERROR", f"Could not resolve target trustee: {target}")
                         sys.exit(1)
 
             if all_patterns:
-                print(f"\n[INFO] Resolving trustee identities...", file=sys.stderr)
+                log_stderr("INFO", "Resolving trustee identities...", newline_before=True)
                 await resolve_pattern_trustees(client, session, all_patterns, verbose=args.verbose)
 
             # Step 2: Get current ACL and file attributes from path
-            print(f"[INFO] Retrieving ACL from: {args.path}", file=sys.stderr)
+            log_stderr("INFO", f"Retrieving ACL from: {args.path}")
             current_acl = await client.get_file_acl(session, args.path)
             file_attr = await client.get_file_attr(session, args.path)
 
             if not current_acl:
-                print(f"[ERROR] Could not retrieve ACL from {args.path}", file=sys.stderr)
+                log_stderr("ERROR", f"Could not retrieve ACL from {args.path}")
                 sys.exit(1)
 
             # Extract file_id for backup safety (allows restore even if path is renamed)
@@ -3692,7 +3762,7 @@ async def main_async(args):
             acl_inner = current_acl.get('acl', current_acl)
             current_aces = acl_inner.get('aces', [])
             inherited_count = sum(1 for ace in current_aces if 'INHERITED' in ace.get('flags', []))
-            print(f"[INFO] Current ACL has {len(current_aces)} ACEs ({inherited_count} inherited)", file=sys.stderr)
+            log_stderr("INFO", f"Current ACL has {len(current_aces)} ACEs ({inherited_count} inherited)")
 
             # Step 3: Apply modifications in memory
             modified_acl, stats = apply_ace_modifications(
@@ -3709,7 +3779,7 @@ async def main_async(args):
             )
 
             # Show modification summary
-            print(f"\n[INFO] Modifications:", file=sys.stderr)
+            log_stderr("INFO", "Modifications:", newline_before=True)
             print(f"  ACEs removed:         {stats['removed']}", file=sys.stderr)
             print(f"  ACEs added:           {stats['added']}", file=sys.stderr)
             print(f"  ACEs replaced:        {stats['replaced']}", file=sys.stderr)
@@ -3727,7 +3797,7 @@ async def main_async(args):
 
             # Dry run: show what would happen and exit
             if args.dry_run:
-                print("\n[DRY RUN] Would apply the following ACL:", file=sys.stderr)
+                log_stderr("DRY RUN", "Would apply the following ACL:", newline_before=True)
                 print("-" * 60, file=sys.stderr)
 
                 # Show each ACE in readable format
@@ -3740,7 +3810,7 @@ async def main_async(args):
                     print(f"  {i+1}. {ace_str}{marker}", file=sys.stderr)
 
                 print("-" * 60, file=sys.stderr)
-                print("[DRY RUN] No changes were made.", file=sys.stderr)
+                log_stderr("DRY RUN", "No changes were made.")
                 # Save identity cache before exiting (trustees were resolved)
                 save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
                 return
@@ -3757,11 +3827,11 @@ async def main_async(args):
                 try:
                     with open(args.ace_backup, 'w') as f:
                         json.dump(backup_data, f, indent=2)
-                    print(f"[INFO] Backup saved to: {args.ace_backup}", file=sys.stderr)
+                    log_stderr("INFO", f"Backup saved to: {args.ace_backup}")
                     if file_id:
-                        print(f"[INFO] File ID {file_id} recorded for safety verification", file=sys.stderr)
+                        log_stderr("INFO", f"File ID {file_id} recorded for safety verification")
                 except Exception as e:
-                    print(f"[ERROR] Failed to save backup: {e}", file=sys.stderr)
+                    log_stderr("ERROR", f"Failed to save backup: {e}")
                     sys.exit(1)
 
             # Step 4: Resolve any new trustees that need auth_id
@@ -3769,7 +3839,7 @@ async def main_async(args):
                 if ace.get('_needs_resolution'):
                     raw_trustee = ace.get('trustee')
                     if args.verbose:
-                        print(f"[INFO] Resolving trustee: {raw_trustee}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolving trustee: {raw_trustee}")
 
                     # Use parse_trustee to get the right format for identity resolution
                     trustee_spec = parse_trustee(raw_trustee)
@@ -3803,26 +3873,33 @@ async def main_async(args):
                         }
                         del ace['_needs_resolution']
                         if args.verbose:
-                            print(f"[INFO] Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}", file=sys.stderr)
+                            log_stderr("INFO", f"Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}")
                     else:
-                        print(f"[ERROR] Could not resolve trustee: {raw_trustee}", file=sys.stderr)
+                        log_stderr("ERROR", f"Could not resolve trustee: {raw_trustee}")
                         sys.exit(1)
 
             # Step 5: Apply modified ACL to target path
-            print(f"\n[INFO] Applying modified ACL to: {args.path}", file=sys.stderr)
+            log_stderr("INFO", f"Applying modified ACL to: {args.path}", newline_before=True)
             # Normalize ACL for PUT request (convert trustee objects to auth_id strings)
             normalized_acl = normalize_acl_for_put(modified_acl)
             success, error = await client.set_file_acl(session, args.path, normalized_acl, mark_inherited=False)
 
             if not success:
-                print(f"[ERROR] Failed to apply ACL: {error}", file=sys.stderr)
+                log_stderr("ERROR", f"Failed to apply ACL: {error}")
                 sys.exit(1)
 
-            print("[INFO] ACL applied successfully", file=sys.stderr)
+            log_stderr("INFO", "ACL applied successfully")
 
             # Step 6: Propagate to children if requested
             if args.propagate_changes:
-                print(f"\n[INFO] Propagating ACL to children of: {args.path}", file=sys.stderr)
+                log_stderr("INFO", f"Propagating ACL to children of: {args.path}", newline_before=True)
+                await display_scope_aggregates(
+                    client, session, args.path,
+                    label="Propagating to",
+                    verbose=args.verbose,
+                    max_depth=args.max_depth,
+                    omit_subdirs=args.omit_subdirs,
+                )
 
                 # Resolve owner filters if any
                 owner_auth_ids = None
@@ -3846,7 +3923,7 @@ async def main_async(args):
                     acl_concurrency=args.acl_concurrency
                 )
 
-                print(f"\n[INFO] Propagation complete:", file=sys.stderr)
+                log_stderr("INFO", "Propagation complete:", newline_before=True)
                 print(f"  Objects changed:  {propagate_stats['objects_changed']:,}", file=sys.stderr)
                 print(f"  Objects failed:   {propagate_stats['objects_failed']:,}", file=sys.stderr)
                 if file_filter:
@@ -3855,7 +3932,7 @@ async def main_async(args):
                 if propagate_stats['objects_failed'] > 0:
                     sys.exit(1)
 
-        print("\n[INFO] ACE manipulation complete", file=sys.stderr)
+        log_stderr("INFO", "ACE manipulation complete", newline_before=True)
         # Save identity cache before exiting
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return  # Exit after ACE manipulation
@@ -3867,7 +3944,7 @@ async def main_async(args):
 
     if change_owner_mode:
         if args.verbose:
-            print("\n[INFO] Owner/Group Change Mode", file=sys.stderr)
+            log_stderr("INFO", "Owner/Group Change Mode", newline_before=True)
             print("=" * 70, file=sys.stderr)
 
         # Parse all owner change patterns from CLI and CSV
@@ -3886,7 +3963,7 @@ async def main_async(args):
                         'target_trustee': parse_trustee(parsed['target']),
                     })
                 except ValueError as e:
-                    print(f"[ERROR] {e}", file=sys.stderr)
+                    log_stderr("ERROR", f"{e}")
                     sys.exit(1)
 
         # Parse --change-group patterns
@@ -3901,7 +3978,7 @@ async def main_async(args):
                         'target_trustee': parse_trustee(parsed['target']),
                     })
                 except ValueError as e:
-                    print(f"[ERROR] {e}", file=sys.stderr)
+                    log_stderr("ERROR", f"{e}")
                     sys.exit(1)
 
         # Load CSV files
@@ -3917,7 +3994,7 @@ async def main_async(args):
                         'line': mapping.get('line'),
                     })
             except (FileNotFoundError, ValueError) as e:
-                print(f"[ERROR] Failed to load owner mappings file: {e}", file=sys.stderr)
+                log_stderr("ERROR", f"Failed to load owner mappings file: {e}")
                 sys.exit(1)
 
         if args.change_groups_file:
@@ -3932,7 +4009,7 @@ async def main_async(args):
                         'line': mapping.get('line'),
                     })
             except (FileNotFoundError, ValueError) as e:
-                print(f"[ERROR] Failed to load group mappings file: {e}", file=sys.stderr)
+                log_stderr("ERROR", f"Failed to load group mappings file: {e}")
                 sys.exit(1)
 
         # Display summary of mappings
@@ -3948,11 +4025,11 @@ async def main_async(args):
                     print(f"                  {p['source']} -> {p['target']}", file=sys.stderr)
 
         if args.dry_run:
-            print(f"[DRY RUN] Preview mode - no changes will be made", file=sys.stderr)
+            log_stderr("DRY RUN", "Preview mode - no changes will be made")
 
         if args.verbose:
             print("=" * 70, file=sys.stderr)
-            print("\n[INFO] Resolving identities...", file=sys.stderr)
+            log_stderr("INFO", "Resolving identities...", newline_before=True)
 
         # Helper to extract identifier and type from parsed trustee
         def get_identifier_and_type(trustee_spec):
@@ -3975,30 +4052,30 @@ async def main_async(args):
                 # Resolve source
                 source_name = p['source']
                 if args.verbose:
-                    print(f"[INFO] Resolving source owner '{source_name}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving source owner '{source_name}'...")
                 source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
                 result = await client.resolve_identity(session, source_identifier, source_id_type)
                 if result and result.get('auth_id'):
                     p['source_auth_id'] = str(result['auth_id'])
                     if args.verbose:
-                        print(f"[INFO] Resolved source '{source_name}' -> auth_id {p['source_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved source '{source_name}' -> auth_id {p['source_auth_id']}")
                 else:
-                    print(f"[WARN] Could not resolve source owner '{source_name}' - may not exist", file=sys.stderr)
+                    log_stderr("WARN", f"Could not resolve source owner '{source_name}' - may not exist")
                     p['source_auth_id'] = None
 
                 # Resolve target - MUST succeed
                 target_name = p['target']
                 if args.verbose:
-                    print(f"[INFO] Resolving target owner '{target_name}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving target owner '{target_name}'...")
                 target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
                 result = await client.resolve_identity(session, target_identifier, target_id_type)
                 if result and result.get('auth_id'):
                     p['target_auth_id'] = str(result['auth_id'])
                     if args.verbose:
-                        print(f"[INFO] Resolved target '{target_name}' -> auth_id {p['target_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved target '{target_name}' -> auth_id {p['target_auth_id']}")
                 else:
-                    print(f"[ERROR] Could not resolve target owner '{target_name}'", file=sys.stderr)
-                    print(f"[ERROR] Target must exist before changing ownership", file=sys.stderr)
+                    log_stderr("ERROR", f"Could not resolve target owner '{target_name}'")
+                    log_stderr("ERROR", "Target must exist before changing ownership")
                     sys.exit(1)
 
             # Resolve group change patterns
@@ -4006,30 +4083,30 @@ async def main_async(args):
                 # Resolve source
                 source_name = p['source']
                 if args.verbose:
-                    print(f"[INFO] Resolving source group '{source_name}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving source group '{source_name}'...")
                 source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
                 result = await client.resolve_identity(session, source_identifier, source_id_type)
                 if result and result.get('auth_id'):
                     p['source_auth_id'] = str(result['auth_id'])
                     if args.verbose:
-                        print(f"[INFO] Resolved source '{source_name}' -> auth_id {p['source_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved source '{source_name}' -> auth_id {p['source_auth_id']}")
                 else:
-                    print(f"[WARN] Could not resolve source group '{source_name}' - may not exist", file=sys.stderr)
+                    log_stderr("WARN", f"Could not resolve source group '{source_name}' - may not exist")
                     p['source_auth_id'] = None
 
                 # Resolve target - MUST succeed
                 target_name = p['target']
                 if args.verbose:
-                    print(f"[INFO] Resolving target group '{target_name}'...", file=sys.stderr)
+                    log_stderr("INFO", f"Resolving target group '{target_name}'...")
                 target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
                 result = await client.resolve_identity(session, target_identifier, target_id_type)
                 if result and result.get('auth_id'):
                     p['target_auth_id'] = str(result['auth_id'])
                     if args.verbose:
-                        print(f"[INFO] Resolved target '{target_name}' -> auth_id {p['target_auth_id']}", file=sys.stderr)
+                        log_stderr("INFO", f"Resolved target '{target_name}' -> auth_id {p['target_auth_id']}")
                 else:
-                    print(f"[ERROR] Could not resolve target group '{target_name}'", file=sys.stderr)
-                    print(f"[ERROR] Target must exist before changing group", file=sys.stderr)
+                    log_stderr("ERROR", f"Could not resolve target group '{target_name}'")
+                    log_stderr("ERROR", "Target must exist before changing group")
                     sys.exit(1)
 
         # Build lookup dicts for fast matching
@@ -4052,7 +4129,7 @@ async def main_async(args):
                 }
 
         if not owner_source_to_target and not group_source_to_target:
-            print("\n[WARN] No valid source identities could be resolved. No files will be changed.", file=sys.stderr)
+            log_stderr("WARN", "No valid source identities could be resolved. No files will be changed.", newline_before=True)
             return
 
         # Initialize statistics
@@ -4106,9 +4183,9 @@ async def main_async(args):
 
         if args.verbose:
             if args.propagate_changes:
-                print(f"\n[INFO] Processing {args.path} and all children...", file=sys.stderr)
+                log_stderr("INFO", f"Processing {args.path} and all children...", newline_before=True)
             else:
-                print(f"\n[INFO] Processing {args.path} only (use --propagate-changes for children)...", file=sys.stderr)
+                log_stderr("INFO", f"Processing {args.path} only (use --propagate-changes for children)...", newline_before=True)
         start_time = time.time()
 
         # Helper function to process a single file/directory for ownership change
@@ -4140,12 +4217,12 @@ async def main_async(args):
             # Dry run - just log what would change
             if args.dry_run:
                 if new_owner:
-                    print(f"[DRY RUN] Would change owner: {file_path}", file=sys.stderr)
+                    log_stderr("DRY RUN", f"Would change owner: {file_path}")
                     print(f"          {owner_change_info['source_name']} (auth_id: {file_owner}) -> "
                           f"{owner_change_info['target_name']} (auth_id: {new_owner})", file=sys.stderr)
                     change_stats['owners_changed'] += 1
                 if new_group:
-                    print(f"[DRY RUN] Would change group: {file_path}", file=sys.stderr)
+                    log_stderr("DRY RUN", f"Would change group: {file_path}")
                     print(f"          {group_change_info['source_name']} (auth_id: {file_group}) -> "
                           f"{group_change_info['target_name']} (auth_id: {new_group})", file=sys.stderr)
                     change_stats['groups_changed'] += 1
@@ -4163,11 +4240,11 @@ async def main_async(args):
                 if new_owner:
                     change_stats['owners_changed'] += 1
                     if args.verbose:
-                        print(f"[INFO] Changed owner: {file_path}", file=sys.stderr)
+                        log_stderr("INFO", f"Changed owner: {file_path}")
                 if new_group:
                     change_stats['groups_changed'] += 1
                     if args.verbose:
-                        print(f"[INFO] Changed group: {file_path}", file=sys.stderr)
+                        log_stderr("INFO", f"Changed group: {file_path}")
             else:
                 if new_owner:
                     change_stats['owner_change_failed'] += 1
@@ -4178,10 +4255,18 @@ async def main_async(args):
                     'error': error_msg
                 })
                 if args.verbose:
-                    print(f"[ERROR] Failed to change ownership: {file_path}: {error_msg}", file=sys.stderr)
+                    log_stderr("ERROR", f"Failed to change ownership: {file_path}: {error_msg}")
 
         async with client.create_session() as session:
             if args.propagate_changes:
+                await display_scope_aggregates(
+                    client, session, args.path,
+                    label="Changing ownership in",
+                    verbose=args.verbose,
+                    max_depth=args.max_depth,
+                    omit_subdirs=args.omit_subdirs,
+                )
+
                 # Walk the tree and change ownership for all matching files
                 async def tree_walk_callback(entry):
                     await process_file_for_ownership_change(session, entry)
@@ -4216,7 +4301,7 @@ async def main_async(args):
                     }
                     await process_file_for_ownership_change(session, entry)
                 else:
-                    print(f"[ERROR] Could not get attributes for: {args.path}", file=sys.stderr)
+                    log_stderr("ERROR", f"Could not get attributes for: {args.path}")
                     change_stats['errors'].append({
                         'path': args.path,
                         'error': 'Could not get file attributes'
@@ -4265,7 +4350,7 @@ async def main_async(args):
 
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
-        print("\n[INFO] Directory statistics mode (exploration)", file=sys.stderr)
+        log_stderr("INFO", "Directory statistics mode (exploration)", newline_before=True)
         print("=" * 70, file=sys.stderr)
         start_time = time.time()
 
@@ -4304,10 +4389,7 @@ async def main_async(args):
             if args.verbose:
                 print(f"Owner auth_ids: {', '.join(owner_auth_ids)}", file=sys.stderr)
         else:
-            print(
-                "[WARN] No valid owners resolved - no files will match!",
-                file=sys.stderr,
-            )
+            log_stderr("WARN", "No valid owners resolved - no files will match!")
 
     # Create file filter
     file_filter = create_file_filter(args, owner_auth_ids)
@@ -4348,33 +4430,13 @@ async def main_async(args):
 
     # Fetch and display directory aggregates to inform user of search scope
     async with client.create_session() as session:
-        try:
-            aggregates = await client.get_directory_aggregates(session, args.path)
-            total_files = aggregates.get('total_files', 'unknown')
-            total_dirs = aggregates.get('total_directories', 'unknown')
-
-            # Format numbers with commas
-            if isinstance(total_files, str):
-                files_str = total_files
-            else:
-                files_str = f"{int(total_files):,}"
-
-            if isinstance(total_dirs, str):
-                dirs_str = total_dirs
-            else:
-                dirs_str = f"{int(total_dirs):,}"
-
-            # Add note if traversal filters are active
-            filter_note = ""
-            if args.max_depth or args.omit_subdirs:
-                filter_note = " (before filters)"
-
-            print(f"Searching directory {args.path} ({dirs_str} subdirectories, {files_str} files){filter_note}",
-                  file=sys.stderr)
-        except Exception as e:
-            # If aggregates fail, just continue without displaying them
-            if args.verbose:
-                print(f"[WARN] Could not fetch directory aggregates: {e}", file=sys.stderr)
+        await display_scope_aggregates(
+            client, session, args.path,
+            label="Searching directory",
+            verbose=args.verbose,
+            max_depth=args.max_depth,
+            omit_subdirs=args.omit_subdirs,
+        )
 
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
@@ -4548,10 +4610,7 @@ async def main_async(args):
             # Streaming mode - count comes from handler
             pass  # Will be reported after handler close
         else:
-            print(
-                f"[INFO] Tree walk completed, collected {len(matching_files)} matching files",
-                file=sys.stderr,
-            )
+            log_stderr("INFO", f"Tree walk completed, collected {len(matching_files)} matching files")
 
     # Flush any remaining batched output
     if batched_handler:
@@ -4563,10 +4622,7 @@ async def main_async(args):
         rows_written = streaming_file_handler.get_rows_written()
         output_path = args.json_out if args.json_out else args.csv_out
         if args.verbose or args.progress:
-            print(
-                f"\n[INFO] Streaming complete: wrote {rows_written:,} rows to {output_path}",
-                file=sys.stderr,
-            )
+            log_stderr("INFO", f"Streaming complete: wrote {rows_written:,} rows to {output_path}", newline_before=True)
         # Save identity cache and exit - no further processing needed
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return
@@ -4793,7 +4849,7 @@ async def main_async(args):
 
                     writer.writerow(row)
 
-            print(f"\n[INFO] ACL CSV exported to: {args.acl_csv}", file=sys.stderr)
+            log_stderr("INFO", f"ACL CSV exported to: {args.acl_csv}", newline_before=True)
 
         # Export to JSON if requested
         if args.json or args.json_out:
@@ -4881,7 +4937,7 @@ async def main_async(args):
 
             if args.json_out:
                 output_handle.close()
-                print(f"\n[INFO] ACL JSON exported to: {args.json_out}", file=sys.stderr)
+                log_stderr("INFO", f"ACL JSON exported to: {args.json_out}", newline_before=True)
 
         print("\n" + "=" * 70, file=sys.stderr)
 
@@ -4928,13 +4984,13 @@ async def main_async(args):
                     writer = csv.DictWriter(csv_file, fieldnames=["similar_group", "path", "size", "coverage"])
                     writer.writeheader()
                 if args.verbose:
-                    print(f"\n[INFO] Created empty CSV file: {args.csv_out}", file=sys.stderr)
+                    log_stderr("INFO", f"Created empty CSV file: {args.csv_out}", newline_before=True)
             elif args.json_out:
                 # Create empty JSON file
                 with open(args.json_out, "w") as json_file:
                     pass  # Empty file
                 if args.verbose:
-                    print(f"\n[INFO] Created empty JSON file: {args.json_out}", file=sys.stderr)
+                    log_stderr("INFO", f"Created empty JSON file: {args.json_out}", newline_before=True)
         else:
             total_groups = len(similar_files)
             total_similar = sum(len(group) for group in similar_files.values())
@@ -4991,7 +5047,7 @@ async def main_async(args):
                             })
 
                 if args.verbose:
-                    print(f"\n[INFO] Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.csv_out}", file=sys.stderr)
+                    log_stderr("INFO", f"Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.csv_out}", newline_before=True)
             elif args.json_out or args.json:
                 # Handle JSON output for similar files
                 output_handle = open(args.json_out, 'w') if args.json_out else sys.stdout
@@ -5019,7 +5075,7 @@ async def main_async(args):
                     if args.json_out:
                         output_handle.close()
                         if args.verbose:
-                            print(f"\n[INFO] Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.json_out}", file=sys.stderr)
+                            log_stderr("INFO", f"Wrote {total_similar:,} similar files ({total_groups:,} groups) to {args.json_out}", newline_before=True)
             else:
                 # Output similar file groups to stderr (text mode)
                 for group_id, (fingerprint, files) in enumerate(similar_files.items(), 1):
@@ -5042,10 +5098,7 @@ async def main_async(args):
     # Apply limit if specified
     if args.limit and len(matching_files) > args.limit:
         if args.verbose:
-            print(
-                f"\n[INFO] Limiting results to {args.limit} files (found {len(matching_files)})",
-                file=sys.stderr,
-            )
+            log_stderr("INFO", f"Limiting results to {args.limit} files (found {len(matching_files)})", newline_before=True)
         matching_files = matching_files[: args.limit]
 
     # Output results
@@ -5059,10 +5112,7 @@ async def main_async(args):
         with open(args.csv_out, "w", newline="") as csv_file:
             if not matching_files:
                 if args.verbose:
-                    print(
-                        f"[INFO] No matching files found, CSV file will be empty",
-                        file=sys.stderr,
-                    )
+                    log_stderr("INFO", "No matching files found, CSV file will be empty")
                 return
 
             if args.all_attributes:
@@ -5173,10 +5223,7 @@ async def main_async(args):
                     writer.writerow(row)
 
         if args.verbose:
-            print(
-                f"\n[INFO] Wrote {len(matching_files)} results to {args.csv_out}",
-                file=sys.stderr,
-            )
+            log_stderr("INFO", f"Wrote {len(matching_files)} results to {args.csv_out}", newline_before=True)
     elif args.json or args.json_out:
         # JSON output
         # Skip if batched_handler was used (already output via streaming)
@@ -5263,7 +5310,7 @@ async def main_async(args):
 
             if args.json_out:
                 output_handle.close()
-                print(f"\n[INFO] Results written to {args.json_out}", file=sys.stderr)
+                log_stderr("INFO", f"Results written to {args.json_out}", newline_before=True)
     else:
         # Plain text output
         # Only output if we didn't use streaming callback (which already printed results)
@@ -5314,17 +5361,14 @@ async def main_async(args):
 
     # Summary
     if args.verbose:
-        print(
-            f"\n[INFO] Processed {progress.total_objects if progress else 'N/A'} objects in {elapsed:.2f}s",
-            file=sys.stderr,
-        )
-        print(f"[INFO] Found {len(matching_files)} matching files", file=sys.stderr)
+        log_stderr("INFO", f"Processed {progress.total_objects if progress else 'N/A'} objects in {elapsed:.2f}s", newline_before=True)
+        log_stderr("INFO", f"Found {len(matching_files)} matching files")
         rate = (
             (progress.total_objects if progress else len(matching_files)) / elapsed
             if elapsed > 0
             else 0
         )
-        print(f"[INFO] Processing rate: {rate:.1f} obj/sec", file=sys.stderr)
+        log_stderr("INFO", f"Processing rate: {rate:.1f} obj/sec")
 
     # Print profiling report
     if profiler:
@@ -5684,12 +5728,29 @@ Examples:
     output.add_argument(
         "--verbose",
         action="store_true",
-        help="Show detailed logging",
+        help="Show detailed diagnostic output to the terminal (stderr). "
+             "Independent of --log-file.",
+    )
+    output.add_argument(
+        "--log-file",
+        metavar="FILE",
+        help="Write log output to file (timestamps include timezone). "
+             "Independent of --verbose and --progress.",
+    )
+    output.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "ERROR"],
+        default="INFO",
+        help="Minimum log level for --log-file (default: INFO). "
+             "ERROR includes errors and warnings. "
+             "INFO adds operational messages. "
+             "DEBUG adds all diagnostic output.",
     )
     output.add_argument(
         "--progress",
         action="store_true",
-        help="Show real-time progress statistics",
+        help="Show real-time progress statistics to the terminal (stderr). "
+             "Independent of --log-file.",
     )
     output.add_argument(
         "--limit",
@@ -6205,7 +6266,7 @@ Examples:
     # Handle --benchmark mode
     if args.benchmark:
         if not args.host or not args.path:
-            print("[ERROR] --benchmark requires --host and --path", file=sys.stderr)
+            log_stderr("ERROR", "--benchmark requires --host and --path")
             sys.exit(1)
 
         print("=" * 70, file=sys.stderr)
@@ -6223,14 +6284,14 @@ Examples:
             creds_path = args.credentials_store or credential_store_filename()
             token = get_credentials(creds_path)
             if not token:
-                print("[ERROR] No credentials found. Run: qq login", file=sys.stderr)
+                log_stderr("ERROR", "No credentials found. Run: qq login")
                 sys.exit(1)
 
             results = []
             import time
 
             for concurrent in BENCHMARK_CONCURRENCY_LEVELS:
-                print(f"\n[BENCH] Testing concurrent={concurrent}...", file=sys.stderr)
+                log_stderr("BENCH", f"Testing concurrent={concurrent}...", newline_before=True)
 
                 client = AsyncQumuloClient(
                     host=args.host,
@@ -6262,7 +6323,7 @@ Examples:
                 count = progress.matches
                 rate = count / elapsed if elapsed > 0 else 0
                 results.append({'concurrent': concurrent, 'rate': rate, 'time': elapsed})
-                print(f"[BENCH] {count:,} files in {elapsed:.1f}s = {rate:,.0f} obj/sec", file=sys.stderr)
+                log_stderr("BENCH", f"{count:,} files in {elapsed:.1f}s = {rate:,.0f} obj/sec")
 
             return results
 
@@ -6311,40 +6372,58 @@ Examples:
         print("=" * 70, file=sys.stderr)
         print("", file=sys.stderr)
 
+    # Initialize log file if requested (before any output)
+    if args.log_file:
+        try:
+            init_log_file(args.log_file, args.log_level)
+        except IOError as e:
+            print(f"[ERROR] Cannot open log file: {args.log_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     # Run async main
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user", file=sys.stderr)
+        log_stderr("INFO", "Interrupted by user", newline_before=True)
         sys.exit(130)
     except aiohttp.ClientResponseError as e:
         # HTTP error with detailed message
         path_for_error = args.path if args.path else (args.acl_target if hasattr(args, 'acl_target') else 'N/A')
         error_msg = format_http_error(e.status, str(e.request_info.url), path_for_error)
-        print(error_msg, file=sys.stderr)
+        # Route through log_stderr so it reaches the log file
+        for line in error_msg.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('[ERROR]'):
+                log_stderr("ERROR", line[len('[ERROR]'):].strip())
+            elif line.startswith('[HINT]'):
+                log_stderr("HINT", line[len('[HINT]'):].strip())
+            elif line:
+                log_stderr("ERROR", line)
         if args.verbose:
             import traceback
             traceback.print_exc()
         sys.exit(1)
     except aiohttp.ClientConnectorError as e:
-        print(f"\n[ERROR] Cannot connect to cluster: {args.host}:{args.port}", file=sys.stderr)
-        print(f"[HINT] Check that the cluster is reachable and the hostname/port are correct", file=sys.stderr)
+        log_stderr("ERROR", f"Cannot connect to cluster: {args.host}:{args.port}", newline_before=True)
+        log_stderr("HINT", "Check that the cluster is reachable and the hostname/port are correct")
         if args.verbose:
-            print(f"[DEBUG] {e}", file=sys.stderr)
+            log_stderr("DEBUG", f"{e}")
         sys.exit(1)
     except aiohttp.ClientError as e:
-        print(f"\n[ERROR] Network error: {e}", file=sys.stderr)
-        print(f"[HINT] Check your network connection to the cluster", file=sys.stderr)
+        log_stderr("ERROR", f"Network error: {e}", newline_before=True)
+        log_stderr("HINT", "Check your network connection to the cluster")
         if args.verbose:
             import traceback
             traceback.print_exc()
         sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR] {e}", file=sys.stderr)
+        log_stderr("ERROR", f"{e}", newline_before=True)
         if args.verbose:
             import traceback
             traceback.print_exc()
         sys.exit(1)
+    finally:
+        close_log_file()
 
 
 if __name__ == "__main__":

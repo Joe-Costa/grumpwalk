@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.2.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.3.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1993,5 +1993,96 @@ EOF
 4. **Combine `--progress` with `--verbose`** - Monitor what's happening in real-time
 5. **Use `--max-depth` for testing** - Limit scope during validation
 6. **Chain operations carefully** - Some filters may interact unexpectedly; verify with dry-run
+
+### What does --verbose show?
+
+The `--verbose` flag enables detailed diagnostic output beyond what `--progress` provides.
+Use it when you need to understand what grumpwalk is doing internally -- particularly
+when debugging ACE operations, verifying identity resolution, or diagnosing filter behavior.
+
+`--progress` and `--verbose` control what is shown in the **terminal** (stderr).
+They are independent of `--log-file`, which writes to a file with its own `--log-level`.
+
+`--progress` shows **how fast** the operation is running (objects/sec, match counts).
+`--verbose` shows **what decisions** grumpwalk is making along the way.
+
+| Category | What it shows |
+|---|---|
+| Identity resolution | Trustee name-to-auth_id lookups, cached identity loads, cache save confirmations |
+| ACE manipulation | Which ACEs matched removal/replacement patterns, duplicate cleanup, clone and migration details |
+| Owner/group changes | Per-file ownership change reporting, source/target resolution details |
+| Filter resolution | Resolved owner auth_ids, directory aggregate fetch warnings |
+| Trustee mappings | Loading of CSV mapping files for clone, migrate, and owner change operations |
+| Auto-tuning | Profile load/generation details |
+| Adaptive concurrency | When batch sizes are reduced for large or small directories |
+
+Example output with `--verbose`:
+
+```
+[2026-03-26 14:30:05] [INFO] Loaded 42 cached identities from file_filter_resolved_identities
+[2026-03-26 14:30:05] [INFO] Adaptive concurrency: Processing 3 subdirs with batch size 10 (reduced from 200)
+[2026-03-26 14:30:06] [DEBUG] ACE type='Allowed' auth_id='501' vs pattern type='Allowed' auth_id='501'
+[2026-03-26 14:30:06] [DEBUG]   -> MATCH - will remove
+[2026-03-26 14:30:07] [INFO] Saved 42 identities to cache file
+```
+
+### Capturing log output to a file
+
+#### Using --log-file (recommended)
+
+The `--log-file` flag writes log output to a file with timezone-aware timestamps.
+Use `--log-level` to control verbosity. Stderr output is unaffected -- you still see
+progress and messages in the terminal.
+
+```bash
+# Log everything to a file (default level: INFO)
+./grumpwalk.py --host cluster --path /data --progress \
+  --log-file run.log
+
+# Log only errors and warnings
+./grumpwalk.py --host cluster --path /data --progress \
+  --log-file run.log --log-level ERROR
+
+# Log all diagnostic output (including ACE matching, identity resolution)
+./grumpwalk.py --host cluster --path /data --verbose \
+  --log-file debug.log --log-level DEBUG
+```
+
+The log file includes a header recording the timezone:
+
+```
+# grumpwalk log started 2026-03-26 11:09:38 PDT (UTC-0700)
+# All timestamps are local time (PDT)
+# Log level: INFO
+```
+
+Log levels are cumulative:
+
+| Level | What it captures |
+|---|---|
+| ERROR | Errors, warnings, and hints |
+| INFO | Everything in ERROR, plus operational messages (default) |
+| DEBUG | Everything, including ACE matching internals and per-entry diagnostics |
+
+#### Using shell redirection
+
+You can also capture stderr directly using shell redirection. This captures
+everything printed to stderr, including progress lines.
+
+```bash
+# Save data and logs to separate files
+./grumpwalk.py --host cluster --path /data --progress \
+  > output.ndjson 2> run.log
+
+# View logs in the terminal and save to a file (bash)
+./grumpwalk.py --host cluster --path /data --progress \
+  > output.ndjson 2> >(tee run.log >&2)
+
+# Suppress all log output
+./grumpwalk.py --host cluster --path /data 2>/dev/null > output.ndjson
+```
+
+The `2> >(tee ...)` syntax is bash-specific (process substitution). In other shells,
+redirect to a file and tail it separately.
 
 

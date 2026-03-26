@@ -11,6 +11,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Set, TYPE_CHECKING, Callable
 
+from .utils import log_stderr
+
 # Try to use aiohttp
 try:
     import aiohttp
@@ -70,7 +72,7 @@ async def resolve_owner_filters(
                 if identity.get("resolved") and identity.get("auth_id"):
                     all_auth_ids.add(identity["auth_id"])
             except Exception as e:
-                print(f"[WARN] Failed to resolve UID {owner}: {e}", file=sys.stderr)
+                log_stderr("WARN", f"Failed to resolve UID {owner}: {e}")
         elif owner_type == "ad":
             # Active Directory - resolve by name with AD domain
             payload_info = parse_trustee(f"ad:{owner}")
@@ -86,7 +88,7 @@ async def resolve_owner_filters(
                         if identity.get("auth_id"):
                             all_auth_ids.add(identity["auth_id"])
             except Exception as e:
-                print(f"[WARN] Failed to resolve AD user {owner}: {e}", file=sys.stderr)
+                log_stderr("WARN", f"Failed to resolve AD user {owner}: {e}")
         elif owner_type == "local":
             # Local - resolve by name with LOCAL domain
             payload_info = parse_trustee(f"local:{owner}")
@@ -102,9 +104,7 @@ async def resolve_owner_filters(
                         if identity.get("auth_id"):
                             all_auth_ids.add(identity["auth_id"])
             except Exception as e:
-                print(
-                    f"[WARN] Failed to resolve local user {owner}: {e}", file=sys.stderr
-                )
+                log_stderr("WARN", f"Failed to resolve local user {owner}: {e}")
         else:
             # Auto-detect - parse and resolve
             payload_info = parse_trustee(owner)
@@ -120,7 +120,7 @@ async def resolve_owner_filters(
                         if identity.get("auth_id"):
                             all_auth_ids.add(identity["auth_id"])
             except Exception as e:
-                print(f"[WARN] Failed to resolve owner {owner}: {e}", file=sys.stderr)
+                log_stderr("WARN", f"Failed to resolve owner {owner}: {e}")
 
     # If expand-identity is enabled, expand all auth_ids
     if args.expand_identity and all_auth_ids:
@@ -272,7 +272,7 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
                 regex_pattern = glob_to_regex(pattern)
                 name_patterns_or.append(re.compile(regex_pattern, regex_flags))
             except re.error as e:
-                print(f"[ERROR] Invalid pattern '{pattern}': {e}", file=sys.stderr)
+                log_stderr("ERROR", f"Invalid pattern '{pattern}': {e}")
                 sys.exit(1)
 
     # Compile name patterns (AND logic)
@@ -285,7 +285,7 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
                 regex_pattern = glob_to_regex(pattern)
                 name_patterns_and.append(re.compile(regex_pattern, regex_flags))
             except re.error as e:
-                print(f"[ERROR] Invalid pattern '{pattern}': {e}", file=sys.stderr)
+                log_stderr("ERROR", f"Invalid pattern '{pattern}': {e}")
                 sys.exit(1)
 
     # Map type argument to Qumulo API type

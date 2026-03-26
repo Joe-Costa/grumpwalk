@@ -6,6 +6,11 @@ This package contains modular components for the grumpwalk file search tool.
 
 # Import utility functions
 from .utils import (
+    log_stderr,
+    log_to_file,
+    init_log_file,
+    close_log_file,
+    LOG_LEVELS,
     format_http_error,
     extract_pagination_token,
     parse_size_to_bytes,
@@ -55,6 +60,11 @@ from .filters import (
 
 __all__ = [
     # Utils
+    "log_stderr",
+    "log_to_file",
+    "init_log_file",
+    "close_log_file",
+    "LOG_LEVELS",
     "format_http_error",
     "extract_pagination_token",
     "parse_size_to_bytes",

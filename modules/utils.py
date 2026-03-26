@@ -5,9 +5,118 @@ This module contains general-purpose utility functions for formatting,
 parsing, and error handling.
 """
 
+import sys
 import re
-from typing import Optional, Dict
+from datetime import datetime, timezone
+from typing import Optional, Dict, IO
 from urllib.parse import urlparse, parse_qs
+
+
+# Log file state -- configured via init_log_file(), used by log_stderr()
+_log_file: Optional[IO] = None
+_log_level: int = 1  # Default: INFO
+
+# Log level constants
+LOG_LEVEL_DEBUG = 0
+LOG_LEVEL_INFO = 1
+LOG_LEVEL_ERROR = 2
+
+LOG_LEVELS = {
+    "DEBUG": LOG_LEVEL_DEBUG,
+    "INFO": LOG_LEVEL_INFO,
+    "ERROR": LOG_LEVEL_ERROR,
+}
+
+# Map every tag used in the codebase to a log level
+_TAG_TO_LEVEL = {
+    # ERROR level -- things that went wrong
+    "ERROR": LOG_LEVEL_ERROR,
+    "WARN": LOG_LEVEL_ERROR,
+    "WARNING": LOG_LEVEL_ERROR,
+    "!": LOG_LEVEL_ERROR,
+    # ERROR level -- hints always accompany errors
+    "HINT": LOG_LEVEL_ERROR,
+    # INFO level -- operational messages
+    "INFO": LOG_LEVEL_INFO,
+    "DRY RUN": LOG_LEVEL_INFO,
+    "ACL CLONE": LOG_LEVEL_INFO,
+    "ACL REPORT": LOG_LEVEL_INFO,
+    "ACL+OWNER/GROUP": LOG_LEVEL_INFO,
+    "OWNER/GROUP": LOG_LEVEL_INFO,
+    "SIMILARITY DETECTION": LOG_LEVEL_INFO,
+    "BENCH": LOG_LEVEL_INFO,
+    # DEBUG level -- internals
+    "DEBUG": LOG_LEVEL_DEBUG,
+}
+
+
+def init_log_file(filepath: str, level: str = "INFO") -> None:
+    """Open a log file for writing and set the log level.
+
+    Writes a header with timezone information. The log file uses
+    line buffering so entries are visible immediately.
+
+    Args:
+        filepath: Path to the log file (will be created or truncated)
+        level: Minimum log level: DEBUG, INFO, or ERROR
+    """
+    global _log_file, _log_level
+
+    _log_level = LOG_LEVELS.get(level.upper(), LOG_LEVEL_INFO)
+    _log_file = open(filepath, "w", buffering=1)  # line-buffered
+
+    # Write header with timezone info
+    now = datetime.now().astimezone()
+    tz_name = now.strftime("%Z")
+    tz_offset = now.strftime("%z")
+    _log_file.write(f"# grumpwalk log started {now.strftime('%Y-%m-%d %H:%M:%S')} {tz_name} (UTC{tz_offset})\n")
+    _log_file.write(f"# All timestamps are local time ({tz_name})\n")
+    _log_file.write(f"# Log level: {level.upper()}\n")
+    _log_file.flush()
+
+
+def close_log_file() -> None:
+    """Close the log file if open."""
+    global _log_file
+    if _log_file:
+        _log_file.close()
+        _log_file = None
+
+
+def log_to_file(message: str) -> None:
+    """Write an untagged line to the log file (for banners/config).
+
+    Only writes if a log file is open and log level is INFO or lower.
+    """
+    if _log_file and _log_level <= LOG_LEVEL_INFO:
+        _log_file.write(message + "\n")
+
+
+def log_stderr(tag: str, message: str, newline_before: bool = False):
+    """Print a timestamped tagged message to stderr and optionally to a log file.
+
+    Stderr format: [YYYY-MM-DD HH:MM:SS] [TAG] message
+    Log file format: [YYYY-MM-DD HH:MM:SS TZ] [TAG] message
+
+    Args:
+        tag: Log level or category (e.g. ERROR, WARN, INFO, DEBUG)
+        message: The log message
+        newline_before: If True, print a blank line before the timestamped message
+
+    Not intended for ephemeral progress lines that use \\r overwriting.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prefix = "\n" if newline_before else ""
+    print(f"{prefix}[{timestamp}] [{tag}] {message}", file=sys.stderr, flush=True)
+
+    # Write to log file if open and tag meets level threshold
+    if _log_file:
+        tag_level = _TAG_TO_LEVEL.get(tag, LOG_LEVEL_INFO)
+        if tag_level >= _log_level:
+            now = datetime.now().astimezone()
+            tz_abbrev = now.strftime("%Z")
+            file_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            _log_file.write(f"[{file_timestamp} {tz_abbrev}] [{tag}] {message}\n")
 
 
 def format_http_error(status: int, url: str, path: Optional[str] = None, host: Optional[str] = None) -> str:

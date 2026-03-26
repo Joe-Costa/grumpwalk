@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.2.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 2.3.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
@@ -399,8 +399,17 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--csv-out FILE` - CSV output to file
 - `--all-attributes` - Include all file attributes in output
 - `--limit N` - Stop after N matches
-- `--progress` - Show real-time progress
-- `--verbose` - Detailed logging
+- `--progress` - Show real-time progress to the terminal (stderr)
+- `--log-file FILE` - Write log output to file with timezone-aware timestamps (independent of --verbose/--progress)
+- `--log-level LEVEL` - Minimum level for --log-file: DEBUG, INFO (default), or ERROR
+- **Log capture** - All status/error output goes to stderr. Capture with `2> logfile.txt`
+- `--verbose` - Detailed diagnostic output to the terminal (stderr). Shows:
+  - Identity resolution (trustee lookups, cache load/save)
+  - ACE manipulation details (matching, removal, replacement, cloning)
+  - Owner/group change per-file reporting
+  - Filter resolution (owner auth_ids, aggregate fetch warnings)
+  - Trustee mapping file loading
+  - Auto-tuning diagnostics
 
 ### Performance Options
 - `--max-concurrent N` - Concurrent operations (default: 100)

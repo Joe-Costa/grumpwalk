@@ -11,6 +11,8 @@ import sys
 import time
 from typing import Optional, Dict
 
+from .utils import log_stderr
+
 # Try to use ujson for faster parsing
 try:
     import ujson as json_parser
@@ -96,18 +98,12 @@ def load_identity_cache(verbose: bool = False) -> Dict:
                     save_identity_cache(cache, verbose=False)
 
             if verbose and cache:
-                print(
-                    f"[INFO] Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}",
-                    file=sys.stderr,
-                )
+                log_stderr("INFO", f"Loaded {len(cache)} cached identities from {IDENTITY_CACHE_FILE}")
                 if expired_count > 0:
-                    print(
-                        f"[INFO] Removed {expired_count} expired cache entries",
-                        file=sys.stderr,
-                    )
+                    log_stderr("INFO", f"Removed {expired_count} expired cache entries")
     except Exception as e:
         if verbose:
-            print(f"[WARN] Failed to load identity cache: {e}", file=sys.stderr)
+            log_stderr("WARN", f"Failed to load identity cache: {e}")
 
     return cache
 
@@ -125,10 +121,7 @@ def save_identity_cache(identity_cache: Dict, verbose: bool = False):
             json_parser.dump(cache_data, f, indent=2)
 
         if verbose:
-            print(
-                f"[INFO] Saved {len(identity_cache)} identities to cache file",
-                file=sys.stderr,
-            )
+            log_stderr("INFO", f"Saved {len(identity_cache)} identities to cache file")
     except Exception as e:
         if verbose:
-            print(f"[WARN] Failed to save identity cache: {e}", file=sys.stderr)
+            log_stderr("WARN", f"Failed to save identity cache: {e}")

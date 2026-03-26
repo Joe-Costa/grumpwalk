@@ -5,6 +5,34 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-03-26
+
+### Added
+
+- **Timestamped log entries** - All tagged stderr output ([ERROR], [WARN], [INFO], [DEBUG], etc.) now includes timestamps in format `[YYYY-MM-DD HH:MM:SS] [TAG] message`
+- **Scope header for propagation actions** - ACL cloning, ACE propagation, ACE restore propagation, and owner/group change modes now display directory aggregate counts (subdirectories and files) before the operation begins, matching the existing walk mode behavior
+- `--dry-run` support for ACL cloning mode (`--source-acl --acl-target --propagate-acls --dry-run`) - Walks the tree and reports what would change without calling any write APIs
+- `--log-file FILE` flag - Write log output to a file with timezone-aware timestamps (e.g. `[2026-03-26 11:09:38 PDT]`). Log file includes a header recording the local timezone. Config banner is included for context. Independent of `--verbose` and `--progress`.
+- `--log-level DEBUG|INFO|ERROR` flag - Control minimum log level written to `--log-file` (default: INFO). ERROR includes errors, warnings, and hints. INFO adds operational messages. DEBUG adds all diagnostic output.
+
+### Fixed
+
+- ACL cloning mode (`--source-acl --acl-target`) ignored `--dry-run` flag and would apply ACLs despite dry-run being specified
+
+### Documentation
+
+- Documented `--verbose` flag: what each category of additional output shows, when to use it vs `--progress`, with example output
+- Documented log file capture: `--log-file` usage and stderr redirection patterns
+- Clarified that `--verbose` and `--progress` control terminal (stderr) output, independent of `--log-file`
+
+### Changed
+
+- Walk mode refactored to use `display_scope_aggregates()` helper (no behavior change)
+- HTTP errors now route through `log_stderr` so they appear in log files
+- Ephemeral progress lines (`\r` overwrite lines) intentionally excluded from timestamps to preserve terminal display
+
+---
+
 ## [2.2.0] - 2026-03-02
 
 ### Added
