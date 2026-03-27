@@ -2,6 +2,8 @@
 
 **Version 2.3.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
+<img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
+
 High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 
 - **Find files by name, owner, size or timestamps**
