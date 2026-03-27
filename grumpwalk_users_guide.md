@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.3.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.4.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -205,6 +205,73 @@ A practical guide with recipes for common storage administration tasks using gru
   --omit-path /var/log \
   --omit-path /tmp \
   --omit-path /proc
+```
+
+### How do I find and manage files by DOS extended attributes?
+
+Qumulo tracks nine extended attributes on every file and directory: `read_only`, `hidden`, `system`, `archive`, `temporary`, `compressed`, `not_content_indexed`, `sparse_file`, and `offline`. Four of these (`read_only`, `hidden`, `system`, `archive`) are the classic DOS attributes and can be modified through grumpwalk.
+
+> **Note:** DOS attributes are only honored and interpreted by SMB clients. They have no impact on access through NFS, REST, FTP, or S3 protocols. Setting `read_only` via grumpwalk, for example, will prevent writes from Windows/SMB clients but will not restrict NFS users.
+
+**Find all files with the archive bit set:**
+```bash
+./grumpwalk.py --host cluster --path /data --find-attribute-true archive --type file --progress
+```
+
+**Find hidden files:**
+```bash
+./grumpwalk.py --host cluster --path /shares --find-attribute-true hidden --type file
+```
+
+**Find files that are NOT read-only:**
+```bash
+./grumpwalk.py --host cluster --path /finance --find-attribute-false read_only --type file
+```
+
+**Find sparse files (filter-only, not settable):**
+```bash
+./grumpwalk.py --host cluster --path /data --find-attribute-true sparse --type file
+```
+
+**Clear the archive bit on all files in a directory tree:**
+```bash
+./grumpwalk.py --host cluster --path /backups \
+  --find-attribute-true archive --set-attribute-false archive \
+  --propagate-changes --progress
+```
+
+**Set read-only on all PDF files:**
+```bash
+./grumpwalk.py --host cluster --path /legal \
+  --name '*.pdf' --type file \
+  --set-attribute-true read_only \
+  --propagate-changes --progress
+```
+
+**Preview changes before applying (dry run):**
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --find-attribute-true archive --set-attribute-false archive \
+  --propagate-changes --dry-run
+```
+
+**Combine both pairs in one command** -- find archived files and clear the bit, while also finding non-hidden files and marking them hidden:
+```bash
+./grumpwalk.py --host cluster --path /staging \
+  --find-attribute-true archive --set-attribute-false archive \
+  --find-attribute-false hidden --set-attribute-true hidden \
+  --propagate-changes --dry-run
+```
+
+A `--find-attribute` flag and its paired `--set-attribute` flag must use opposite booleans and appear next to each other on the command line. Inserting other flags between a find/set pair will produce an error.
+
+**Combine attribute filters with other filters:**
+```bash
+# Find archived files larger than 1GB that haven't been accessed in 90 days
+./grumpwalk.py --host cluster --path /data \
+  --find-attribute-true archive \
+  --larger-than 1GB --accessed --older-than 90 \
+  --type file --progress
 ```
 
 ---

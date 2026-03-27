@@ -564,6 +564,73 @@ class AsyncQumuloClient:
             except aiohttp.ClientError as e:
                 return (False, str(e))
 
+    async def set_file_extended_attributes(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        attributes: dict,
+        current_ext_attrs: Optional[dict] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Set extended (DOS) attributes on a file or directory.
+
+        The Qumulo API requires the full extended_attributes object on PATCH,
+        so this method reads the current attributes (unless provided), merges
+        the requested changes, and sends the complete object.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Path to the file/directory
+            attributes: Dict mapping attribute names to bool values,
+                        e.g. {"read_only": True, "archive": False}
+            current_ext_attrs: Optional pre-fetched extended_attributes dict
+                               from the file entry (avoids an extra GET)
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
+
+            # Build full extended_attributes object by merging changes into current state
+            if current_ext_attrs is not None:
+                full_attrs = dict(current_ext_attrs)
+            else:
+                # Fetch current attributes
+                try:
+                    async with session.get(url, ssl=self.ssl_context) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            full_attrs = dict(data.get("extended_attributes", {}))
+                        else:
+                            return (False, f"HTTP {response.status} reading current attributes")
+                except aiohttp.ClientError as e:
+                    return (False, f"Failed to read current attributes: {e}")
+
+            full_attrs.update(attributes)
+            payload = {"extended_attributes": full_attrs}
+
+            try:
+                async with session.patch(
+                    url, json=payload, ssl=self.ssl_context
+                ) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    else:
+                        error_msg = f"HTTP {response.status}"
+                        try:
+                            error_detail = await response.json()
+                            error_msg += f": {error_detail.get('description', '')}"
+                        except:
+                            pass
+                        return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
     async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
         """
         Read the target of a symlink.

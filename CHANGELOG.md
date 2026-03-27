@@ -5,6 +5,35 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-03-27
+
+### Added
+
+- **Extended attribute filtering** - Find files by any of the nine Qumulo extended attributes
+  - `--find-attribute-true ATTR[,ATTR,...]` - Find files where listed attributes are true
+  - `--find-attribute-false ATTR[,ATTR,...]` - Find files where listed attributes are false
+  - Findable attributes: `read_only`, `hidden`, `system`, `archive`, `temporary`, `compressed`, `not_content_indexed`, `sparse_file`, `offline`
+  - Short aliases supported: `sparse`, `readonly`, `nci`, `not_indexed`
+  - Typo detection with closest-match suggestions
+- **Extended attribute modification** - Set the four DOS attributes (`read_only`, `hidden`, `system`, `archive`) on matched files
+  - `--set-attribute-true ATTR[,ATTR,...]` - Set listed DOS attributes to true
+  - `--set-attribute-false ATTR[,ATTR,...]` - Set listed DOS attributes to false
+  - Works with `--propagate-changes` for recursive application
+  - Supports `--dry-run` to preview changes before applying
+  - Supports `--continue-on-error` to skip failures during propagation
+  - Composable with all existing filters (time, size, name, owner, type)
+- **Find/set pairing validation** - Positional pairing rules enforce correct usage
+  - A find/set pair must use opposite booleans and appear adjacent on the command line
+  - Both opposite-boolean pairs may appear in a single command
+  - Same-boolean pairs and non-adjacent pairs produce clear error messages
+
+### Documentation
+
+- Added "How do I find and manage files by DOS extended attributes?" section to user guide with usage examples
+- Noted that DOS attributes are only honored by SMB clients and have no impact on NFS, REST, FTP, or S3 access
+
+---
+
 ## [2.3.0] - 2026-03-26
 
 ### Added

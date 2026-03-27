@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 import argparse
 import asyncio
@@ -63,6 +63,9 @@ from modules import (
     resolve_owner_filters,
     glob_to_regex,
     create_file_filter,
+    FINDABLE_ATTRIBUTES,
+    SETTABLE_ATTRIBUTES,
+    parse_attribute_list,
 )
 from modules.tuning import (
     load_tuning_profile,
@@ -2958,6 +2961,149 @@ async def generate_owner_report(
     print("=" * 80, file=sys.stderr)
 
 
+def validate_attribute_args(args):
+    """
+    Validate --find-attribute-* and --set-attribute-* arguments.
+
+    Parses comma-separated lists, resolves aliases, validates attribute names,
+    enforces pairing rules (same-boolean = error, opposite pairs must be
+    positionally adjacent in sys.argv), and stores parsed results on args.
+    """
+    has_find_true = bool(args.find_attribute_true)
+    has_find_false = bool(args.find_attribute_false)
+    has_set_true = bool(args.set_attribute_true)
+    has_set_false = bool(args.set_attribute_false)
+
+    # Nothing to validate
+    if not any([has_find_true, has_find_false, has_set_true, has_set_false]):
+        args.find_attribute_true_parsed = None
+        args.find_attribute_false_parsed = None
+        args.set_attribute_true_parsed = None
+        args.set_attribute_false_parsed = None
+        return
+
+    # Parse and validate attribute names
+    args.find_attribute_true_parsed = None
+    args.find_attribute_false_parsed = None
+    args.set_attribute_true_parsed = None
+    args.set_attribute_false_parsed = None
+
+    if has_find_true:
+        merged = ",".join(args.find_attribute_true)
+        args.find_attribute_true_parsed = parse_attribute_list(
+            merged, FINDABLE_ATTRIBUTES, "--find-attribute-true")
+
+    if has_find_false:
+        merged = ",".join(args.find_attribute_false)
+        args.find_attribute_false_parsed = parse_attribute_list(
+            merged, FINDABLE_ATTRIBUTES, "--find-attribute-false")
+
+    if has_set_true:
+        merged = ",".join(args.set_attribute_true)
+        args.set_attribute_true_parsed = parse_attribute_list(
+            merged, SETTABLE_ATTRIBUTES, "--set-attribute-true")
+
+    if has_set_false:
+        merged = ",".join(args.set_attribute_false)
+        args.set_attribute_false_parsed = parse_attribute_list(
+            merged, SETTABLE_ATTRIBUTES, "--set-attribute-false")
+
+    # Positional pairing validation via sys.argv scan.
+    # Rules:
+    #   - A find/set pair with the SAME boolean that are adjacent = error
+    #   - A find/set pair with OPPOSITE booleans must be adjacent (no flags between)
+    #   - Both opposite-boolean pairs may coexist in one command
+    attr_flags = {
+        "--find-attribute-true", "--find-attribute-false",
+        "--set-attribute-true", "--set-attribute-false",
+    }
+
+    has_any_set = has_set_true or has_set_false
+    has_any_find = has_find_true or has_find_false
+
+    if has_any_find and has_any_set:
+        # Build ordered list of (position, flag_name) from sys.argv
+        flag_positions = []
+        argv = sys.argv
+        for i, arg in enumerate(argv):
+            bare_arg = arg.split("=", 1)[0] if "=" in arg else arg
+            if bare_arg in attr_flags:
+                flag_positions.append((i, bare_arg))
+
+        # Walk through flag_positions looking for find->set adjacency
+        for idx, (pos, name) in enumerate(flag_positions):
+            if not name.startswith("--find-attribute-"):
+                continue
+
+            # Check if the next attribute flag is a --set-attribute-*
+            if idx + 1 < len(flag_positions):
+                next_pos, next_name = flag_positions[idx + 1]
+                if next_name.startswith("--set-attribute-"):
+                    find_bool = "true" if name.endswith("-true") else "false"
+                    set_bool = "true" if next_name.endswith("-true") else "false"
+
+                    # Same-boolean pair = error
+                    if find_bool == set_bool:
+                        print(
+                            f"Error: {name} and {next_name} cannot be paired (same boolean).\n"
+                            f"  A find/set pair must use opposite booleans.\n"
+                            f"  Use --find-attribute-true with --set-attribute-false, or\n"
+                            f"  use --find-attribute-false with --set-attribute-true.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+
+                    # Opposite-boolean pair: check no other flags between them
+                    find_value_end = pos + 1
+                    if "=" in argv[pos]:
+                        find_value_end = pos  # value embedded in flag
+
+                    for j in range(find_value_end + 1, next_pos):
+                        candidate = argv[j]
+                        bare = candidate.split("=", 1)[0] if "=" in candidate else candidate
+                        if bare.startswith("--") and bare not in attr_flags:
+                            print(
+                                f"Error: {name} and {next_name} must be positionally adjacent.\n"
+                                f"  Found '{bare}' between them.\n"
+                                f"  Place {next_name} immediately after {name} and its value.",
+                                file=sys.stderr,
+                            )
+                            sys.exit(1)
+
+        # Also reject same-boolean pairs that are not adjacent but where no
+        # opposite pair accounts for them. If find-true and set-true both
+        # exist, they must each be part of a separate opposite-boolean pair.
+        # The only way that works is if find-false and set-false also exist
+        # (i.e., both dual pairs are present). If not, it's an error.
+        if has_find_true and has_set_true and not (has_find_false and has_set_false):
+            print(
+                "Error: --find-attribute-true and --set-attribute-true cannot be used together (same boolean).\n"
+                "  A find/set pair must use opposite booleans.\n"
+                "  Use --find-attribute-true with --set-attribute-false, or\n"
+                "  use --find-attribute-false with --set-attribute-true.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if has_find_false and has_set_false and not (has_find_true and has_set_true):
+            print(
+                "Error: --find-attribute-false and --set-attribute-false cannot be used together (same boolean).\n"
+                "  A find/set pair must use opposite booleans.\n"
+                "  Use --find-attribute-false with --set-attribute-true, or\n"
+                "  use --find-attribute-true with --set-attribute-false.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Require --path when using attribute flags
+    if not args.path:
+        print(
+            "Error: --find-attribute-* and --set-attribute-* require --path",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 async def main_async(args):
     """Main async function."""
     # Backward compatibility: consolidate old propagation flags into unified flag
@@ -4347,6 +4493,208 @@ async def main_async(args):
             sys.exit(1)
 
         return  # Exit after owner/group change mode
+
+    # ========================================================================
+    # EXTENDED ATTRIBUTE MODIFICATION MODE
+    # ========================================================================
+    set_attribute_mode = (args.set_attribute_true_parsed or args.set_attribute_false_parsed)
+
+    if set_attribute_mode:
+        if args.verbose:
+            log_stderr("INFO", "Extended Attribute Modification Mode", newline_before=True)
+            print("=" * 70, file=sys.stderr)
+
+        # Build the attributes dict to PATCH
+        attrs_to_set = {}
+        if args.set_attribute_true_parsed:
+            for attr in args.set_attribute_true_parsed:
+                attrs_to_set[attr] = True
+        if args.set_attribute_false_parsed:
+            for attr in args.set_attribute_false_parsed:
+                attrs_to_set[attr] = False
+
+        if args.verbose:
+            for attr, val in attrs_to_set.items():
+                log_stderr("INFO", f"  Will set {attr} = {val}")
+
+        if args.dry_run:
+            log_stderr("DRY RUN", "Preview mode - no changes will be made")
+
+        if args.verbose:
+            print("=" * 70, file=sys.stderr)
+
+        # Statistics
+        attr_stats = {
+            'files_scanned': 0,
+            'attributes_changed': 0,
+            'change_failed': 0,
+            'errors': [],
+        }
+
+        # Resolve owner filters if needed
+        owner_auth_ids = None
+        async with client.create_session() as session:
+            if args.owners:
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+
+        # Create file filter (attribute find filters are already embedded)
+        file_filter = create_file_filter(args, owner_auth_ids)
+
+        # Build filter info for smart directory skipping
+        time_filter_info = None
+        if args.older_than or args.newer_than:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            time_filter_info = {
+                "time_field": args.time_field,
+                "older_than": (
+                    now_utc - timedelta(days=args.older_than) if args.older_than else None
+                ),
+                "newer_than": (
+                    now_utc - timedelta(days=args.newer_than) if args.newer_than else None
+                ),
+            }
+
+        size_filter_info = None
+        if args.larger_than:
+            size_filter_info = {"min_size": parse_size_to_bytes(args.larger_than)}
+
+        owner_filter_info = None
+        if owner_auth_ids:
+            owner_filter_info = {"auth_ids": owner_auth_ids}
+
+        # Create progress tracker
+        progress = (
+            ProgressTracker(verbose=args.progress)
+            if args.progress
+            else None
+        )
+
+        if args.verbose:
+            if args.propagate_changes:
+                log_stderr("INFO", f"Processing {args.path} and all children...", newline_before=True)
+            else:
+                log_stderr("INFO", f"Processing {args.path} only (use --propagate-changes for children)...", newline_before=True)
+        start_time = time.time()
+
+        async def process_file_for_attribute_change(session, entry):
+            attr_stats['files_scanned'] += 1
+            file_path = entry.get('path')
+
+            if args.dry_run:
+                log_stderr("DRY RUN", f"Would set attributes on: {file_path}")
+                for attr, val in attrs_to_set.items():
+                    current = entry.get('extended_attributes', {}).get(attr)
+                    if current is not None and current != val:
+                        print(f"          {attr}: {current} -> {val}", file=sys.stderr)
+                    elif current == val:
+                        print(f"          {attr}: {current} (no change)", file=sys.stderr)
+                attr_stats['attributes_changed'] += 1
+                return
+
+            success, error_msg = await client.set_file_extended_attributes(
+                session, file_path, attrs_to_set,
+                current_ext_attrs=entry.get('extended_attributes'),
+            )
+
+            if success:
+                attr_stats['attributes_changed'] += 1
+                if args.verbose:
+                    log_stderr("INFO", f"Set attributes: {file_path}")
+            else:
+                attr_stats['change_failed'] += 1
+                attr_stats['errors'].append({
+                    'path': file_path,
+                    'error': error_msg,
+                })
+                if args.verbose:
+                    log_stderr("ERROR", f"Failed to set attributes: {file_path}: {error_msg}")
+
+                if not args.continue_on_error:
+                    print(f"\nError setting attributes on: {file_path}", file=sys.stderr)
+                    print(f"  {error_msg}", file=sys.stderr)
+                    print("  Use --continue-on-error to skip failures", file=sys.stderr)
+
+        async with client.create_session() as session:
+            if args.propagate_changes:
+                await display_scope_aggregates(
+                    client, session, args.path,
+                    label="Setting attributes in",
+                    verbose=args.verbose,
+                    max_depth=args.max_depth,
+                    omit_subdirs=args.omit_subdirs,
+                )
+
+                async def tree_walk_callback(entry):
+                    await process_file_for_attribute_change(session, entry)
+
+                await client.walk_tree_async(
+                    session,
+                    args.path,
+                    args.max_depth,
+                    progress=progress,
+                    file_filter=file_filter,
+                    omit_subdirs=args.omit_subdirs,
+                    omit_paths=args.omit_path,
+                    collect_results=False,
+                    verbose=args.verbose,
+                    max_entries_per_dir=args.max_entries_per_dir,
+                    time_filter_info=time_filter_info,
+                    size_filter_info=size_filter_info,
+                    owner_filter_info=owner_filter_info,
+                    output_callback=tree_walk_callback,
+                )
+            else:
+                # Only process the target path itself
+                file_attr = await client.get_file_attr(session, args.path)
+                if file_attr:
+                    file_attr['path'] = args.path
+                    if file_filter(file_attr):
+                        await process_file_for_attribute_change(session, file_attr)
+                    else:
+                        log_stderr("INFO", f"Target path does not match filters: {args.path}")
+                else:
+                    log_stderr("ERROR", f"Could not get file attributes for: {args.path}")
+                    attr_stats['errors'].append({
+                        'path': args.path,
+                        'error': 'Could not get file attributes',
+                    })
+
+        elapsed = time.time() - start_time
+
+        if progress:
+            progress.final_report()
+
+        # Display summary
+        print("\n" + "=" * 70, file=sys.stderr)
+        if args.dry_run:
+            print("EXTENDED ATTRIBUTE CHANGE PREVIEW (DRY RUN)", file=sys.stderr)
+        else:
+            print("EXTENDED ATTRIBUTE CHANGE SUMMARY", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print(f"Path:               {args.path}", file=sys.stderr)
+        print(f"Attributes set:     {', '.join(f'{k}={v}' for k, v in attrs_to_set.items())}", file=sys.stderr)
+        print(f"Files scanned:      {attr_stats['files_scanned']:,}", file=sys.stderr)
+        print(f"Files changed:      {attr_stats['attributes_changed']:,}", file=sys.stderr)
+        if attr_stats['change_failed'] > 0:
+            print(f"Changes failed:     {attr_stats['change_failed']:,}", file=sys.stderr)
+        print(f"Elapsed time:       {elapsed:.2f}s", file=sys.stderr)
+        if attr_stats['files_scanned'] > 0:
+            rate = attr_stats['files_scanned'] / elapsed if elapsed > 0 else 0
+            print(f"Processing rate:    {rate:.0f} files/sec", file=sys.stderr)
+
+        if attr_stats['errors']:
+            print("\nErrors encountered:", file=sys.stderr)
+            for error in attr_stats['errors'][:10]:
+                print(f"  {error['path']}: {error['error']}", file=sys.stderr)
+            if len(attr_stats['errors']) > 10:
+                print(f"  ... and {len(attr_stats['errors']) - 10} more", file=sys.stderr)
+
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+
+        if attr_stats['change_failed'] > 0:
+            sys.exit(1)
+
+        return  # Exit after attribute modification mode
 
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
@@ -5942,6 +6290,50 @@ Examples:
     )
 
     # ============================================================================
+    # FEATURE: EXTENDED ATTRIBUTE MANAGEMENT
+    # ============================================================================
+    attr_management = parser.add_argument_group('Feature: Extended Attribute Management',
+        'Find files by DOS extended attributes and optionally modify them. '
+        'Findable: read_only, hidden, system, archive, temporary, compressed, '
+        'not_content_indexed, sparse_file, offline. '
+        'Settable (DOS): read_only, hidden, system, archive.')
+
+    attr_management.add_argument(
+        "--find-attribute-true",
+        action="append",
+        metavar="ATTR[,ATTR,...]",
+        help="Find files where listed attributes are true. "
+             "Comma-separated list. Repeatable; values are merged. "
+             "Aliases: sparse=sparse_file, readonly=read_only, nci=not_content_indexed."
+    )
+
+    attr_management.add_argument(
+        "--find-attribute-false",
+        action="append",
+        metavar="ATTR[,ATTR,...]",
+        help="Find files where listed attributes are false. "
+             "Same attribute names as --find-attribute-true. Repeatable."
+    )
+
+    attr_management.add_argument(
+        "--set-attribute-true",
+        action="append",
+        metavar="ATTR[,ATTR,...]",
+        help="Set listed DOS attributes to true (read_only, hidden, system, archive only). "
+             "Must be positionally adjacent to --find-attribute-false (opposite boolean) "
+             "or used standalone. Use --propagate-changes for recursive application."
+    )
+
+    attr_management.add_argument(
+        "--set-attribute-false",
+        action="append",
+        metavar="ATTR[,ATTR,...]",
+        help="Set listed DOS attributes to false (read_only, hidden, system, archive only). "
+             "Must be positionally adjacent to --find-attribute-true (opposite boolean) "
+             "or used standalone. Use --propagate-changes for recursive application."
+    )
+
+    # ============================================================================
     # FEATURE: ACE MANIPULATION
     # ============================================================================
     ace_manipulation = parser.add_argument_group('Feature: ACE Manipulation',
@@ -6247,6 +6639,9 @@ Examples:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # Validate extended attribute arguments
+    validate_attribute_args(args)
 
     if args.older_than and args.newer_than and args.newer_than >= args.older_than:
         print(

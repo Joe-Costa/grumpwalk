@@ -56,6 +56,9 @@ from .filters import (
     resolve_owner_filters,
     glob_to_regex,
     create_file_filter,
+    FINDABLE_ATTRIBUTES,
+    SETTABLE_ATTRIBUTES,
+    parse_attribute_list,
 )
 
 __all__ = [
@@ -95,4 +98,7 @@ __all__ = [
     "resolve_owner_filters",
     "glob_to_regex",
     "create_file_filter",
+    "FINDABLE_ATTRIBUTES",
+    "SETTABLE_ATTRIBUTES",
+    "parse_attribute_list",
 ]

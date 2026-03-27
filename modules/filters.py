@@ -2,14 +2,15 @@
 Filtering logic for grumpwalk.
 
 This module contains functions for creating and applying file filters
-based on name patterns, time, size, owner, and type criteria.
+based on name patterns, time, size, owner, type, and extended attribute criteria.
 """
 
+import difflib
 import fnmatch
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Set, TYPE_CHECKING, Callable
+from typing import Optional, Set, List, TYPE_CHECKING, Callable
 
 from .utils import log_stderr
 
@@ -25,6 +26,67 @@ except ImportError:
 
 # Import from other modules
 from .utils import parse_size_to_bytes
+
+# ---------------------------------------------------------------------------
+# Extended attribute constants
+# ---------------------------------------------------------------------------
+
+FINDABLE_ATTRIBUTES = frozenset({
+    "read_only", "hidden", "system", "archive",
+    "temporary", "compressed", "not_content_indexed",
+    "sparse_file", "offline",
+})
+
+SETTABLE_ATTRIBUTES = frozenset({
+    "read_only", "hidden", "system", "archive",
+})
+
+ATTRIBUTE_ALIASES = {
+    "sparse": "sparse_file",
+    "readonly": "read_only",
+    "nci": "not_content_indexed",
+    "not_indexed": "not_content_indexed",
+}
+
+
+def parse_attribute_list(
+    comma_str: str,
+    allowed: frozenset,
+    flag_name: str,
+) -> List[str]:
+    """
+    Parse a comma-separated attribute list, resolve aliases, and validate.
+
+    Args:
+        comma_str: Comma-separated attribute names (e.g. "read_only,hidden,sparse")
+        allowed: Set of valid canonical attribute names
+        flag_name: CLI flag name for error messages
+
+    Returns:
+        Deduplicated list of canonical attribute names
+    """
+    seen = []
+    for raw in comma_str.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+
+        canonical = ATTRIBUTE_ALIASES.get(name, name)
+
+        if canonical not in allowed:
+            close = difflib.get_close_matches(canonical, sorted(allowed), n=1, cutoff=0.5)
+            hint = f" Did you mean '{close[0]}'?" if close else ""
+            print(
+                f"Error: Unknown attribute '{raw.strip()}' for {flag_name}.{hint}\n"
+                f"  Valid attributes: {', '.join(sorted(allowed))}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if canonical not in seen:
+            seen.append(canonical)
+
+    return seen
 
 # TYPE_CHECKING imports to avoid circular dependencies
 if TYPE_CHECKING:
@@ -288,6 +350,10 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
                 log_stderr("ERROR", f"Invalid pattern '{pattern}': {e}")
                 sys.exit(1)
 
+    # Extended attribute filters
+    find_attr_true = getattr(args, 'find_attribute_true_parsed', None)
+    find_attr_false = getattr(args, 'find_attribute_false_parsed', None)
+
     # Map type argument to Qumulo API type
     target_type = None
     if args.type:
@@ -415,6 +481,17 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
                     return False
             except (ValueError, AttributeError):
                 return False  # If parsing fails, reject the file
+
+        # Extended attribute filters
+        if find_attr_true:
+            ext_attrs = entry.get("extended_attributes", {})
+            if not all(ext_attrs.get(attr) is True for attr in find_attr_true):
+                return False
+
+        if find_attr_false:
+            ext_attrs = entry.get("extended_attributes", {})
+            if not all(ext_attrs.get(attr) is False for attr in find_attr_false):
+                return False
 
         return True
 
