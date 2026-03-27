@@ -34,6 +34,7 @@ Don't forget to check out the [Grumwalk User's Guide](grumpwalk_users_guide.md) 
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
 - **ACE manipulation** - Surgically add, remove, or modify individual ACEs within ACLs
+- **Extended attribute management** - Find and set DOS attributes (read_only, hidden, system, archive)
 - **Similarity detection** - Find similar files using adaptive sampling
 - **Auto-tuning** - Automatic performance tuning based on system resources
 
@@ -273,6 +274,38 @@ OLDDOMAIN\user,NEWDOMAIN\user
 ```
 
 **Important:** Always use `--dry-run` first to preview changes before applying.
+
+### Extended Attribute Options
+
+Find files by DOS extended attributes and optionally modify them. DOS attributes (`read_only`, `hidden`, `system`, `archive`) are only honored by SMB clients -- they have no impact on NFS, REST, FTP, or S3 access.
+
+- `--find-attribute-true ATTR[,ATTR,...]` - Find files where listed attributes are true
+- `--find-attribute-false ATTR[,ATTR,...]` - Find files where listed attributes are false
+- `--set-attribute-true ATTR[,ATTR,...]` - Set listed DOS attributes to true
+- `--set-attribute-false ATTR[,ATTR,...]` - Set listed DOS attributes to false
+
+**Findable attributes:** `read_only`, `hidden`, `system`, `archive`, `temporary`, `compressed`, `not_content_indexed`, `sparse_file`, `offline`
+
+**Settable attributes (DOS only):** `read_only`, `hidden`, `system`, `archive`
+
+**Aliases:** `sparse` = `sparse_file`, `readonly` = `read_only`, `nci` / `not_indexed` = `not_content_indexed`
+
+**Pairing rules:** A `--find-attribute-*` and `--set-attribute-*` pair must use opposite booleans and appear adjacent on the command line. Both pairs may appear in one command. Use `--propagate-changes` for recursive application.
+
+```bash
+# Find all files with the archive bit set
+./grumpwalk.py --host cluster --path /data --find-attribute-true archive --type file
+
+# Clear archive on matching files, preview first
+./grumpwalk.py --host cluster --path /backups \
+  --find-attribute-true archive --set-attribute-false archive \
+  --propagate-changes --dry-run
+
+# Set read-only on all PDFs
+./grumpwalk.py --host cluster --path /legal \
+  --name '*.pdf' --type file --set-attribute-true read_only \
+  --propagate-changes
+```
 
 ### ACE Manipulation Options
 
