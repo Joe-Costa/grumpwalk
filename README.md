@@ -15,8 +15,23 @@ High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 I've observed performance as high as 12k objects per second processed against an old QC24 Qumulo cluster.<br>The lower the latency you have between where this code is running and the Qumulo cluster the better your performance
 will be.<br>Keep in mind that some operations will read contents of files, which might be slower over low bandwidth public internet & VPN connections.
 
-Don't forget to check out the [Grumwalk User's Guide](grumpwalk_users_guide.md) for many real world usage examples.
+Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md) for many real world usage examples.
 
+## Table of Contents
+
+1. [Features](#features)
+2. [Requirements](#requirements)
+3. [Installation](#installation)
+4. [Logging into a cluster](#logging-into-a-cluster)
+5. [An important note about access_time](#an-important-note-about-access_time)
+6. [Helpful Qumulo Care Articles](#helpful-qumulo-care-articles)
+7. [Quick Examples](#quick-examples)
+8. [Output Formats](#output-formats)
+9. [Command Reference](#command-reference)
+10. [Pattern Matching](#pattern-matching)
+11. [Auto-Tuning](#auto-tuning)
+12. [Performance Tips](#performance-tips)
+13. [Architecture](#architecture)
 
 ## Features
 
@@ -139,7 +154,7 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 
 
 
-## Helpful Qumulo Care Articles:
+## Helpful Qumulo Care Articles
 
 [How to get an Access Token](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
 
@@ -179,11 +194,82 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
 ```
 
+## Output Formats
+
+### Plain Text (default)
+```
+/home/joe/file1.txt
+/home/jane/file2.log
+```
+
+### With --show-owner
+```
+/home/joe/file1.txt    joe (UID 1000)
+/home/jane/file2.log   AD\jane
+```
+
+### With --show-owner --dont-resolve-ids
+```
+/home/joe/file1.txt    UID:1000
+/home/jane/file2.log   SID:S-1-5-21-3192274952-881459882-370606532-1352
+```
+
+### With --fields (tab-separated)
+```
+/home/joe/file1.txt	1048576	2024-01-15T10:30:00Z
+/home/jane/file2.log	2048	2024-02-20T14:15:00Z
+```
+
+### With --resolve-links
+```
+/home/joe/link_to_docs → /shared/documentation
+```
+
+### CSV
+```csv
+path,modification_time,size
+/home/joe/file1.txt,2024-01-15T10:30:00Z,1024
+```
+
+### JSON
+```json
+{"path":"/home/joe/file1.txt","modification_time":"2024-01-15T10:30:00Z"}
+```
+
+### JSON with --fields
+```json
+{"path":"/home/joe/file1.txt","size":"1024","owner_id":"S-1-5-21-123456-1109"}
+```
+
+### ACL Reports
+ACL reports export per-file permissions in CSV or JSON format:
+
+**CSV format** (one row per file):
+```csv
+path,owner,group,ace_count,inherited_count,explicit_count,trustee_1,trustee_2
+/shared/file.txt,AD\joe,AD\Domain Users,2,0,2,Allow::admin:rwx,Allow:g:users:rx
+```
+
+**JSON format** (one object per file):
+```json
+{"path":"/shared/file.txt","owner":"AD\\joe","group":"AD\\Domain Users","ace_count":2,"inherited_count":0,"explicit_count":2,"trustees":["Allow::admin:rwx","Allow:g:users:rx"]}
+```
+
+Use `--acl-resolve-names` to convert auth IDs to readable names (e.g., `joe` instead of `auth_id:1234`).
+Use `--show-owner` and `--show-group` to include owner and group columns in the output.
+
 ## Command Reference
 
-### Required
-- `--host` - Qumulo cluster hostname or IP
-- `--path` - Path to search
+### General
+- `--help` - Show help message and exit
+- `--version` - Display version and exit
+- `--dry-run` - Preview changes without applying them (works with ACL, ACE, owner, and attribute operations)
+
+### Connection
+- `--host HOST` - Qumulo cluster hostname or IP (required)
+- `--path PATH` - Path to search (required for walk mode)
+- `--port PORT` - API port (default: 8000)
+- `--credentials-store PATH` - Credentials file path
 
 ### Name/Type Filters
 - `--name PATTERN` - Match by name (glob/regex, OR logic, repeatable)
@@ -433,27 +519,24 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--json-out FILE` - JSON output to file
 - `--csv-out FILE` - CSV output to file
 - `--all-attributes` - Include all file attributes in output
+- `--fields FIELD[,FIELD,...]` - Select specific output fields (aliases: `owner_id`, `group_id`, `attr.*`; dot notation supported). Use `--fields-list` to see all available fields
+- `--fields-list` - List all available field names and exit
+- `--unix-time` - Output timestamps as unix epoch seconds instead of ISO 8601
 - `--limit N` - Stop after N matches
 - `--progress` - Show real-time progress to the terminal (stderr)
+- `--verbose` - Detailed diagnostic output to the terminal (stderr)
 - `--log-file FILE` - Write log output to file with timezone-aware timestamps (independent of --verbose/--progress)
 - `--log-level LEVEL` - Minimum level for --log-file: DEBUG, INFO (default), or ERROR
 - **Log capture** - All status/error output goes to stderr. Capture with `2> logfile.txt`
-- `--verbose` - Detailed diagnostic output to the terminal (stderr). Shows:
-  - Identity resolution (trustee lookups, cache load/save)
-  - ACE manipulation details (matching, removal, replacement, cloning)
-  - Owner/group change per-file reporting
-  - Filter resolution (owner auth_ids, aggregate fetch warnings)
-  - Trustee mapping file loading
-  - Auto-tuning diagnostics
 
 ### Performance Options
-- `--max-concurrent N` - Concurrent operations (default: 100)
-- `--connector-limit N` - HTTP connection pool size (default: 100)
-- `--profile` - Performance profiling for user lookup operations (Useful to detect AD or LDAP latency)
-
-### Connection Options
-- `--port PORT` - API port (default: 8000)
-- `--credentials-store PATH` - Credentials file path
+- `--max-concurrent N` - Concurrent operations (default: auto-tuned)
+- `--connector-limit N` - HTTP connection pool size (default: auto-tuned)
+- `--profile` - Performance profiling for user lookup operations
+- `--retune` - Regenerate auto-tuning profile
+- `--show-tuning` - Display current tuning profile
+- `--tuning-profile {conservative,balanced,aggressive}` - Select tuning profile
+- `--benchmark` - Test optimal concurrency for your cluster
 
 ## Pattern Matching
 
@@ -506,211 +589,6 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--omit-path` requires exact absolute paths starting with `/`
 - Both flags can be used multiple times
 - Both increment the Smart Skip counter for progress tracking
-
-## Advanced Examples
-
-### Complex time range query
-```bash
-./grumpwalk.py --host cluster.example.com --path /data \
-  --accessed-newer-than 30 --accessed-older-than 90 \
-  --modified-older-than 180 \
-  --larger-than 1GB --progress
-```
-
-### Find stale backups, exclude specific paths
-```bash
-./grumpwalk.py --host cluster.example.com --path /backups \
-  --name '*backup*' --name-and '*2024*' \
-  --older-than 365 --larger-than 100MB \
-  --omit-path /backups/alice --omit-path /backups/bob \
-  --csv-out stale-backups.csv
-```
-
-### Capacity report for specific owners
-```bash
-./grumpwalk.py --host cluster.example.com --path /projects \
-  --owner joe --owner jane --expand-identity \
-  --owner-report --csv-out capacity.csv
-```
-
-### Find all symlinks and their targets
-```bash
-./grumpwalk.py --host cluster.example.com --path /home \
-  --type symlink --resolve-links --max-depth 2 \
-  --csv-out symlinks.csv
-```
-
-### Generate ACL report with name resolution
-```bash
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --acl-report --acl-csv permissions.csv \
-  --acl-resolve-names --show-owner --show-group --progress
-```
-
-### Copy ACL to directory and all children
-```bash
-./grumpwalk.py --host cluster.example.com \
-  --source-acl /source/dir --acl-target /target/dir \
-  --propagate-acls --progress
-```
-
-### Copy ACL with owner and group
-```bash
-./grumpwalk.py --host cluster.example.com \
-  --source-acl /source/dir --acl-target /target/dir \
-  --copy-owner --copy-group --propagate-acls --progress
-```
-
-### Copy only owner and group (no ACL)
-```bash
-./grumpwalk.py --host cluster.example.com \
-  --source-acl /source/dir --acl-target /target/dir \
-  --copy-owner --copy-group --owner-group-only \
-  --propagate-acls --progress
-```
-
-### Copy ACL to filtered files only
-```bash
-./grumpwalk.py --host cluster.example.com \
-  --source-acl /source/dir --acl-target /target/dir \
-  --propagate-acls --older-than 30 --type file --progress
-```
-
-### Owner/Group Change Examples
-
-```bash
-# Change owner of a single file/directory
-./grumpwalk.py --host cluster.example.com --path /data/file.txt \
-  --change-owner 'olduser:newuser'
-
-# Preview recursive owner changes (ALWAYS do this first!)
-./grumpwalk.py --host cluster.example.com --path /data \
-  --change-owner 'departed_user:manager' \
-  --propagate-changes --dry-run
-
-# Change owner recursively for all matching files
-./grumpwalk.py --host cluster.example.com --path /home/olduser \
-  --change-owner 'olduser:newuser' \
-  --propagate-changes --progress
-
-# Change owner using UIDs (NFS environments)
-./grumpwalk.py --host cluster.example.com --path /nfs-data \
-  --change-owner 'uid:1001:uid:2001' \
-  --propagate-changes --progress
-
-# Change both owner and group recursively
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --change-owner 'olduser:newuser' \
-  --change-group 'oldgroup:newgroup' \
-  --propagate-changes --progress
-
-# Change ownership with filters (only old files)
-./grumpwalk.py --host cluster.example.com --path /archive \
-  --change-owner 'departed_user:manager' \
-  --propagate-changes --older-than 30 --type file --progress
-
-# Bulk ownership changes from CSV (preview first)
-./grumpwalk.py --host cluster.example.com --path /data \
-  --change-owners-file owner_migration.csv \
-  --propagate-changes --dry-run
-
-# Domain migration (AD to AD)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --change-owner 'OLDDOMAIN\jsmith:NEWDOMAIN\jsmith' \
-  --change-group 'OLDDOMAIN\Engineering:NEWDOMAIN\Engineering' \
-  --propagate-changes --progress
-```
-
-### ACE Manipulation Examples
-
-```bash
-# Remove an ACE (e.g., revoke Everyone access)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --remove-ace 'Allow:Everyone' --dry-run
-
-# Add a new ACE with file+directory inheritance
-./grumpwalk.py --host cluster.example.com --path /projects \
-  --add-ace 'Allow:fd:jsmith:Modify' --propagate-changes --progress
-
-# Replace an existing ACE (change FullControl to Read, same type)
-./grumpwalk.py --host cluster.example.com --path /data \
-  --replace-ace 'Allow:fd:contractors:Read' --propagate-changes
-
-# Change ACE type from Allow to Deny (using --new-ace)
-./grumpwalk.py --host cluster.example.com --path /restricted \
-  --replace-ace 'Allow:contractors' --new-ace 'Deny:fd:contractors:rw'
-
-# Add execute permission to an existing ACE
-./grumpwalk.py --host cluster.example.com --path /scripts \
-  --add-rights 'Allow:developers:x'
-
-# Remove write permission while keeping other rights
-./grumpwalk.py --host cluster.example.com --path /archive \
-  --remove-rights 'Allow:Everyone:w' --propagate-changes
-
-# Backup ACLs before making changes
-./grumpwalk.py --host cluster.example.com --path /important \
-  --remove-ace 'Allow:tempuser' --ace-backup acl-backup.json
-
-# Restore ACLs from backup (verifies file_id for safety)
-./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --dry-run
-
-# Restore and propagate to children
-./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --propagate-changes
-
-# Force restore even if file was renamed (file_id mismatch)
-./grumpwalk.py --host cluster.example.com --ace-restore acl-backup.json --force-restore
-
-# Clone ACEs from one user to another (copies all Allow and Deny ACEs)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-source 'bob' --clone-ace-target 'joe' --propagate-changes
-
-# Clone ACEs using UID numbers
-./grumpwalk.py --host cluster.example.com --path /data \
-  --clone-ace-source 'uid:1001' --clone-ace-target 'uid:1002'
-
-# Clone ACEs from AD user to another
-./grumpwalk.py --host cluster.example.com --path /projects \
-  --clone-ace-source 'DOMAIN\\olduser' --clone-ace-target 'DOMAIN\\newuser' --dry-run
-
-# Sync target ACEs to match source rights (updates existing target ACEs)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-source 'bob' --clone-ace-target 'joe' --sync-cloned-aces --propagate-changes
-
-# Domain migration - replace all OLDDOMAIN trustees with NEWDOMAIN (from CSV)
-./grumpwalk.py --host cluster.example.com --path /data \
-  --migrate-trustees domain_migration.csv --propagate-changes --progress
-
-# Dry run domain migration first
-./grumpwalk.py --host cluster.example.com --path /data \
-  --migrate-trustees domain_migration.csv --dry-run
-
-# Bulk clone from CSV file (multiple source:target pairs)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-map team_permissions.csv --propagate-changes
-
-# Bulk clone with sync (updates existing target ACEs to match source)
-./grumpwalk.py --host cluster.example.com --path /shared \
-  --clone-ace-map team_permissions.csv --sync-cloned-aces --propagate-changes
-```
-
-### Find similar files with custom sampling
-
-**IMPORTANT NOTE!  `--find-similar` provides a list of files that might be similar, but is not built to perfom this operation**
-**with 100% accuracy! You should perform your own checksumming of any returned files before deleting anything!**
-
-**USE THIS FEATURE AT YOUR OWN RISK!**
-
-```bash
-# Estimate data transfer before running
-./grumpwalk.py --host cluster.example.com --path /backups \
-  --find-similar --estimate-size --sample-size 256KB --sample-points 11
-
-# Find similar files with higher accuracy (more data transfer)
-./grumpwalk.py --host cluster.example.com --path /backups \
-  --find-similar --sample-size 256KB --sample-points 11 \
-  --csv-out similar.csv --progress
-```
 
 ## Auto-Tuning
 
@@ -767,59 +645,6 @@ Suggested settings:
 4. **Combine filters** - More filters = fewer results to process
 5. **Use --limit** for testing before full runs
 6. **Smart skipping** automatically avoids directories that can't match your filters
-
-## Output Formats
-
-### Plain Text (default)
-```
-/home/joe/file1.txt
-/home/jane/file2.log
-```
-
-### With --show-owner
-```
-/home/joe/file1.txt    joe (UID 1000)
-/home/jane/file2.log   AD\jane
-```
-
-### With --show-owner --dont-resolve-ids
-```
-/home/joe/file1.txt    UID:1000
-/home/jane/file2.log   SID:S-1-5-21-3192274952-881459882-370606532-1352
-```
-
-### With --resolve-links
-```
-/home/joe/link_to_docs → /shared/documentation
-```
-
-### CSV
-```csv
-path,modification_time,size
-/home/joe/file1.txt,2024-01-15T10:30:00Z,1024
-```
-
-### JSON
-```json
-{"path":"/home/joe/file1.txt","modification_time":"2024-01-15T10:30:00Z"}
-```
-
-### ACL Reports
-ACL reports export per-file permissions in CSV or JSON format:
-
-**CSV format** (one row per file):
-```csv
-path,owner,group,ace_count,inherited_count,explicit_count,trustee_1,trustee_2
-/shared/file.txt,AD\joe,AD\Domain Users,2,0,2,Allow::admin:rwx,Allow:g:users:rx
-```
-
-**JSON format** (one object per file):
-```json
-{"path":"/shared/file.txt","owner":"AD\\joe","group":"AD\\Domain Users","ace_count":2,"inherited_count":0,"explicit_count":2,"trustees":["Allow::admin:rwx","Allow:g:users:rx"]}
-```
-
-Use `--acl-resolve-names` to convert auth IDs to readable names (e.g., `joe` instead of `auth_id:1234`).
-Use `--show-owner` and `--show-group` to include owner and group columns in the output.
 
 ## Architecture
 

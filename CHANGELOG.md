@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Applies to stdout and file output only; stderr/logging timestamps are unaffected
   - Works with all output modes and composable with `--fields`
 
+### Documentation
+
+- **README restructure**
+  - Added table of contents with section links
+  - Moved Output Formats section up (now appears after Quick Examples)
+  - Removed Advanced Examples section (all examples already covered in User Guide)
+  - Reorganized Command Reference: General and Connection sections at top, added missing flags (`--fields`, `--fields-list`, `--unix-time`, `--dry-run`, `--version`, `--retune`, `--show-tuning`, `--tuning-profile`, `--benchmark`)
+  - Added `--fields` and `--fields` + `--json` examples to Output Formats
+- **User Guide**
+  - Added "How do I select specific output fields?" section with `--fields` usage, aliases, dot notation, and `--fields-list`
+  - Added "How do I output timestamps as unix epoch seconds?" section with `--unix-time` usage
+
 ---
 
 ## [2.4.0] - 2026-03-27

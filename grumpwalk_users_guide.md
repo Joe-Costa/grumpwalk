@@ -1342,6 +1342,94 @@ Output format reference:
 | SMB SID | `SID:<value>` | `SID:S-1-5-21-...` |
 | Local account | `auth_id:<value>` | `auth_id:admin` |
 
+### How do I select specific output fields?
+
+Use `--fields` to choose exactly which columns appear in output. This reduces file size and avoids post-processing to strip unwanted columns.
+
+**Output only path, size, and owner SID:**
+```bash
+./grumpwalk.py --host cluster --path /data --json \
+  --fields path,size,owner_id --type file --limit 10
+```
+
+Output:
+```json
+{"path": "/data/report.pdf", "size": "1048576", "owner_id": "S-1-5-21-123456-1109"}
+```
+
+**CSV with selected fields:**
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --fields path,size,modification_time,owner_id \
+  --csv-out inventory.csv --progress
+```
+
+**Include resolved owner names** (identity resolution runs automatically):
+```bash
+./grumpwalk.py --host cluster --path /home --json \
+  --fields path,size,owner_name,group_name
+```
+
+**Extract individual extended attributes:**
+```bash
+./grumpwalk.py --host cluster --path /data --json \
+  --fields path,attr.archive,attr.read_only --type file
+```
+
+**Plain text with multiple fields** (tab-separated):
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --fields path,size,modification_time --type file
+```
+
+Full dot notation also works for any nested field:
+```bash
+./grumpwalk.py --host cluster --path /data --json \
+  --fields path,owner_details.id_type,owner_details.id_value
+```
+
+Use `--fields-list` to see all available field names and descriptions:
+```bash
+./grumpwalk.py --fields-list
+```
+
+**Available aliases:**
+
+| Alias | Resolves to | Description |
+|-------|-------------|-------------|
+| `owner_id` | `owner_details.id_value` | Owner SID or UID |
+| `owner_type` | `owner_details.id_type` | NFS_UID, SMB_SID, etc. |
+| `group_id` | `group_details.id_value` | Group SID or GID |
+| `group_type` | `group_details.id_type` | NFS_GID, SMB_SID, etc. |
+| `attr.<name>` | `extended_attributes.<name>` | Individual attribute flag |
+
+### How do I output timestamps as unix epoch seconds?
+
+Use `--unix-time` to convert all timestamp fields to integer epoch seconds. This is useful when feeding output into databases or tools that expect numeric timestamps.
+
+```bash
+./grumpwalk.py --host cluster --path /data --json \
+  --fields path,modification_time --unix-time --type file --limit 3
+```
+
+Output:
+```json
+{"path": "/data/file.txt", "modification_time": 1730927563}
+```
+
+Works with any output mode and combines with `--fields`:
+```bash
+# CSV with epoch timestamps
+./grumpwalk.py --host cluster --path /data \
+  --fields path,size,creation_time,modification_time \
+  --unix-time --csv-out data.csv
+
+# Full inventory with epoch timestamps
+./grumpwalk.py --host cluster --path / --json --all-attributes --unix-time > inventory.ndjson
+```
+
+Stderr and logging timestamps are not affected by this flag.
+
 ### How do I analyze with DuckDB?
 
 ```sql
