@@ -27,6 +27,8 @@ from .output import (
     StreamingFileOutputHandler,
     CANONICAL_FILE_FIELDS,
     Profiler,
+    parse_field_specs,
+    extract_fields,
 )
 
 # Import credentials and cache handling
@@ -81,6 +83,8 @@ __all__ = [
     "StreamingFileOutputHandler",
     "CANONICAL_FILE_FIELDS",
     "Profiler",
+    "parse_field_specs",
+    "extract_fields",
     # Credentials
     "CREDENTIALS_FILENAME",
     "CREDENTIALS_VERSION",

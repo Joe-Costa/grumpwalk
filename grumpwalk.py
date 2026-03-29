@@ -66,6 +66,8 @@ from modules import (
     FINDABLE_ATTRIBUTES,
     SETTABLE_ATTRIBUTES,
     parse_attribute_list,
+    parse_field_specs,
+    extract_fields,
 )
 from modules.tuning import (
     load_tuning_profile,
@@ -4839,6 +4841,7 @@ async def main_async(args):
             progress=progress,
             args=args,
             dont_resolve_ids=args.dont_resolve_ids,
+            field_specs=args.parsed_fields,
         )
 
         async def output_callback(entry):
@@ -4875,6 +4878,7 @@ async def main_async(args):
                 progress=progress,
                 all_attributes=args.all_attributes,
                 dont_resolve_ids=args.dont_resolve_ids,
+                field_specs=args.parsed_fields,
             )
 
             async def output_callback(entry):
@@ -4882,7 +4886,28 @@ async def main_async(args):
 
         else:
             # Direct streaming output (no owner resolution needed)
-            if args.json:
+            if args.parsed_fields:
+                # --fields mode: extract only requested fields
+                if args.json:
+                    async def output_callback(entry):
+                        row = extract_fields(entry, args.parsed_fields)
+                        try:
+                            print(json_parser.dumps(row, escape_forward_slashes=False))
+                        except TypeError:
+                            print(json_parser.dumps(row))
+                        sys.stdout.flush()
+                        if progress:
+                            await progress.increment_output()
+                else:
+                    async def output_callback(entry):
+                        row = extract_fields(entry, args.parsed_fields)
+                        values = [str(v) if v is not None else "" for v in row.values()]
+                        print("\t".join(values))
+                        sys.stdout.flush()
+                        if progress:
+                            await progress.increment_output()
+
+            elif args.json:
                 # JSON to stdout
                 if args.all_attributes:
                     # Output full entry with all attributes
@@ -5457,7 +5482,22 @@ async def main_async(args):
         # CSV output
         import csv
 
-        with open(args.csv_out, "w", newline="") as csv_file:
+        # --fields mode for collected results CSV
+        if args.parsed_fields and matching_files:
+            fieldnames = [name for name, _ in args.parsed_fields]
+            with open(args.csv_out, "w", newline="") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for entry in matching_files:
+                    row = extract_fields(entry, args.parsed_fields)
+                    for k, v in row.items():
+                        if isinstance(v, (dict, list)):
+                            row[k] = json_parser.dumps(v)
+                    writer.writerow(row)
+            if args.verbose:
+                log_stderr("INFO", f"Wrote {len(matching_files)} results to {args.csv_out}", newline_before=True)
+        else:
+          with open(args.csv_out, "w", newline="") as csv_file:
             if not matching_files:
                 if args.verbose:
                     log_stderr("INFO", "No matching files found, CSV file will be empty")
@@ -5577,6 +5617,19 @@ async def main_async(args):
         # Skip if batched_handler was used (already output via streaming)
         if batched_handler:
             pass  # Already handled by batched streaming
+        elif args.parsed_fields and matching_files:
+            output_handle = sys.stdout
+            if args.json_out:
+                output_handle = open(args.json_out, "w")
+            for entry in matching_files:
+                row = extract_fields(entry, args.parsed_fields)
+                try:
+                    output_handle.write(json_parser.dumps(row, escape_forward_slashes=False) + "\n")
+                except TypeError:
+                    output_handle.write(json_parser.dumps(row) + "\n")
+            if args.json_out:
+                output_handle.close()
+                log_stderr("INFO", f"Results written to {args.json_out}", newline_before=True)
         else:
             output_handle = sys.stdout
             if args.json_out:
@@ -5662,7 +5715,12 @@ async def main_async(args):
     else:
         # Plain text output
         # Only output if we didn't use streaming callback (which already printed results)
-        if output_callback is None:
+        if output_callback is None and args.parsed_fields:
+            for entry in matching_files:
+                row = extract_fields(entry, args.parsed_fields)
+                values = [str(v) if v is not None else "" for v in row.values()]
+                print("\t".join(values))
+        elif output_callback is None:
             for entry in matching_files:
                 output_line = entry["path"]
 
@@ -6072,6 +6130,28 @@ Examples:
         "--all-attributes",
         action="store_true",
         help="Include all file attributes in JSON output",
+    )
+    output.add_argument(
+        "--fields",
+        metavar="FIELD[,FIELD,...]",
+        help="Comma-separated list of fields to include in output. "
+             "Supports dot notation (owner_details.id_value) and aliases: "
+             "owner_id, owner_type, group_id, group_type, attr.<name>. "
+             "Cannot be combined with --all-attributes. "
+             "Use --fields-list to see all available fields.",
+    )
+    class _FieldsListAction(argparse.Action):
+        def __init__(self, option_strings, dest, **kwargs):
+            super().__init__(option_strings, dest, nargs=0, default=False, **kwargs)
+        def __call__(self, parser, namespace, values, option_string=None):
+            from modules.output import print_field_list
+            print_field_list()
+            sys.exit(0)
+
+    output.add_argument(
+        "--fields-list",
+        action=_FieldsListAction,
+        help="List all available field names for --fields and exit",
     )
     output.add_argument(
         "--verbose",
@@ -6639,6 +6719,27 @@ Examples:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # Validate and parse --fields
+    if args.fields:
+        args.parsed_fields = parse_field_specs(args.fields)
+
+        if args.all_attributes:
+            print("Error: --fields cannot be combined with --all-attributes", file=sys.stderr)
+            sys.exit(1)
+
+        if args.owner_report or args.acl_report:
+            print("Error: --fields does not apply to --owner-report or --acl-report", file=sys.stderr)
+            sys.exit(1)
+
+        # Implicit identity resolution when field list includes resolved names
+        display_names = {name for name, _ in args.parsed_fields}
+        if "owner_name" in display_names:
+            args.show_owner = True
+        if "group_name" in display_names:
+            args.show_group = True
+    else:
+        args.parsed_fields = None
 
     # Validate extended attribute arguments
     validate_attribute_args(args)

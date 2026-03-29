@@ -142,6 +142,7 @@ class BatchedOutputHandler:
         progress: Optional["ProgressTracker"] = None,
         all_attributes: bool = False,
         dont_resolve_ids: bool = False,
+        field_specs=None,
     ):
         self.client = client
         self.batch_size = batch_size
@@ -153,6 +154,7 @@ class BatchedOutputHandler:
         self.progress = progress
         self.all_attributes = all_attributes
         self.dont_resolve_ids = dont_resolve_ids
+        self.field_specs = field_specs
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -200,6 +202,44 @@ class BatchedOutputHandler:
             # Check if we can output more results (respects --limit)
             if self.progress and not self.progress.can_output():
                 break
+
+            # Inject resolved names into entry for --fields access
+            if self.show_owner and not self.dont_resolve_ids:
+                owner_details = entry.get("owner_details", {})
+                owner_auth_id = owner_details.get("auth_id") or entry.get("owner")
+                if owner_auth_id and owner_auth_id in identity_cache:
+                    entry["owner_name"] = format_owner_name(identity_cache[owner_auth_id])
+                else:
+                    entry["owner_name"] = "Unknown"
+            elif self.show_owner:
+                owner_details = entry.get("owner_details", {})
+                entry["owner_name"] = format_raw_id(owner_details, entry.get("owner", ""))
+
+            if self.show_group and not self.dont_resolve_ids:
+                group_details = entry.get("group_details", {})
+                group_auth_id = group_details.get("auth_id") or entry.get("group")
+                if group_auth_id and group_auth_id in identity_cache:
+                    entry["group_name"] = format_owner_name(identity_cache[group_auth_id])
+                else:
+                    entry["group_name"] = "Unknown"
+            elif self.show_group:
+                group_details = entry.get("group_details", {})
+                entry["group_name"] = format_raw_id(group_details, entry.get("group", ""))
+
+            if self.field_specs:
+                row = extract_fields(entry, self.field_specs)
+                if self.output_format == "json":
+                    try:
+                        print(json_parser.dumps(row, escape_forward_slashes=False))
+                    except TypeError:
+                        print(json_parser.dumps(row))
+                else:
+                    values = [str(v) if v is not None else "" for v in row.values()]
+                    print("\t".join(values))
+                sys.stdout.flush()
+                if self.progress:
+                    await self.progress.increment_output()
+                continue
 
             if self.output_format == "json":
                 if self.all_attributes:
@@ -326,6 +366,158 @@ CANONICAL_FILE_FIELDS = [
     "user_metadata_revision",
 ]
 
+# ---------------------------------------------------------------------------
+# Field selection for --fields
+# ---------------------------------------------------------------------------
+
+FIELD_ALIASES = {
+    "owner_id": "owner_details.id_value",
+    "owner_type": "owner_details.id_type",
+    "group_id": "group_details.id_value",
+    "group_type": "group_details.id_type",
+}
+
+FIELD_DESCRIPTIONS = [
+    # Core identity
+    ("path",              "Full path to the file or directory"),
+    ("name",              "Filename or directory name"),
+    ("type",              "Object type (FS_FILE_TYPE_FILE, FS_FILE_TYPE_DIRECTORY, FS_FILE_TYPE_SYMLINK)"),
+    ("id",                "Qumulo internal file ID"),
+    ("file_number",       "Qumulo file number"),
+    # Size and blocks
+    ("size",              "Logical file size in bytes"),
+    ("blocks",            "Total 4KB blocks (data + metadata)"),
+    ("datablocks",        "Data blocks consumed on disk"),
+    ("metablocks",        "Metadata blocks consumed on disk"),
+    # Ownership - top level
+    ("owner",             "Owner auth_id (raw identifier string)"),
+    ("group",             "Group auth_id (raw identifier string)"),
+    # Ownership - aliases for nested fields
+    ("owner_id",          "Owner SID or UID value (alias for owner_details.id_value)"),
+    ("owner_type",        "Owner identity type: NFS_UID, SMB_SID, etc. (alias for owner_details.id_type)"),
+    ("group_id",          "Group SID or GID value (alias for group_details.id_value)"),
+    ("group_type",        "Group identity type: NFS_GID, SMB_SID, etc. (alias for group_details.id_type)"),
+    # Ownership - resolved names (require identity resolution)
+    ("owner_name",        "Resolved owner name (triggers identity resolution)"),
+    ("group_name",        "Resolved group name (triggers identity resolution)"),
+    # Ownership - full nested dicts
+    ("owner_details",     "Full owner dict: {id_type, id_value, auth_id}"),
+    ("group_details",     "Full group dict: {id_type, id_value, auth_id}"),
+    # Timestamps
+    ("creation_time",     "File creation timestamp (ISO 8601)"),
+    ("modification_time", "Last data modification timestamp"),
+    ("access_time",       "Last access timestamp (requires atime enabled on cluster)"),
+    ("change_time",       "Last metadata change timestamp"),
+    # Permissions and links
+    ("mode",              "POSIX permission mode (e.g., 0644)"),
+    ("num_links",         "Number of hard links"),
+    # Extended info
+    ("child_count",       "Number of children (directories only)"),
+    ("symlink_target_type", "Symlink target type"),
+    ("major_minor_numbers", "Device major/minor numbers (dict)"),
+    ("extended_attributes", "Full DOS extended attributes dict"),
+    ("directory_entry_hash_policy", "Directory entry hash policy"),
+    ("data_revision",     "Data revision counter"),
+    ("user_metadata_revision", "User metadata revision counter"),
+    # Extended attribute aliases
+    ("attr.<name>",       "Individual extended attribute (alias for extended_attributes.<name>). "
+                          "Names: read_only, hidden, system, archive, temporary, compressed, "
+                          "not_content_indexed, sparse_file, offline"),
+]
+
+
+def print_field_list():
+    """Print available field names and descriptions for --fields-list."""
+    print("Available fields for --fields:\n")
+    max_name = max(len(name) for name, _ in FIELD_DESCRIPTIONS)
+    for name, desc in FIELD_DESCRIPTIONS:
+        print(f"  {name:<{max_name}}  {desc}")
+    print(f"\nDot notation is also supported for nested fields (e.g., owner_details.id_value).")
+    print(f"Example: --fields path,size,owner_id,group_id,modification_time")
+
+
+def parse_field_specs(fields_str):
+    """
+    Parse a comma-separated field spec string into a list of (display_name, resolve_path) tuples.
+
+    Supports:
+    - Simple fields: "path", "size", "modification_time"
+    - Aliases: "owner_id" -> resolves to "owner_details.id_value"
+    - Dynamic attr alias: "attr.archive" -> resolves to "extended_attributes.archive"
+    - Dot notation: "owner_details.id_value" (max 2 segments)
+
+    Returns:
+        List of (display_name, resolve_path) tuples.
+        display_name is the alias or user-provided name (used as column header).
+        resolve_path is the dotted path into the entry dict.
+    """
+    seen = set()
+    specs = []
+
+    for raw in fields_str.split(","):
+        name = raw.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        # Check static aliases
+        if name in FIELD_ALIASES:
+            specs.append((name, FIELD_ALIASES[name]))
+            continue
+
+        # Check dynamic attr.* alias
+        if name.startswith("attr."):
+            attr_name = name[5:]
+            if not attr_name:
+                print(
+                    f"Error: Empty attribute name in 'attr.' for --fields",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            specs.append((name, f"extended_attributes.{attr_name}"))
+            continue
+
+        # Validate dot notation depth
+        parts = name.split(".")
+        if len(parts) > 2:
+            print(
+                f"Error: Field '{name}' has too many segments for --fields.\n"
+                f"  Dot notation supports at most two segments (e.g., owner_details.id_value).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Plain field or explicit dot notation
+        specs.append((name, name))
+
+    return specs
+
+
+def extract_fields(entry, field_specs):
+    """
+    Extract specified fields from an entry dict.
+
+    Args:
+        entry: File entry dict from the Qumulo API
+        field_specs: List of (display_name, resolve_path) tuples from parse_field_specs
+
+    Returns:
+        Ordered dict with display_name keys and extracted values.
+        Missing fields or dot-notation into non-dict values produce None.
+    """
+    result = {}
+    for display_name, resolve_path in field_specs:
+        if "." in resolve_path:
+            parent, child = resolve_path.split(".", 1)
+            parent_val = entry.get(parent)
+            if isinstance(parent_val, dict):
+                result[display_name] = parent_val.get(child)
+            else:
+                result[display_name] = None
+        else:
+            result[display_name] = entry.get(resolve_path)
+    return result
+
 
 class StreamingFileOutputHandler:
     """
@@ -350,6 +542,7 @@ class StreamingFileOutputHandler:
         progress: Optional["ProgressTracker"] = None,
         args=None,
         dont_resolve_ids: bool = False,
+        field_specs=None,
     ):
         """
         Initialize streaming file output handler.
@@ -365,6 +558,7 @@ class StreamingFileOutputHandler:
             progress: Optional ProgressTracker
             args: Command-line args for determining which fields to include
             dont_resolve_ids: Skip identity resolution and output raw IDs
+            field_specs: Optional list of (display_name, resolve_path) tuples from parse_field_specs
         """
         self.client = client
         self.output_path = output_path
@@ -376,6 +570,7 @@ class StreamingFileOutputHandler:
         self.progress = progress
         self.args = args
         self.dont_resolve_ids = dont_resolve_ids
+        self.field_specs = field_specs
 
         self.batch = []
         self.lock = asyncio.Lock()
@@ -386,6 +581,8 @@ class StreamingFileOutputHandler:
 
     def _get_fieldnames(self) -> list:
         """Determine CSV fieldnames based on configuration."""
+        if self.field_specs:
+            return [display_name for display_name, _ in self.field_specs]
         if self.all_attributes:
             # Use canonical field list plus any resolved name fields
             fieldnames = list(CANONICAL_FILE_FIELDS)
@@ -527,7 +724,23 @@ class StreamingFileOutputHandler:
                     else:
                         entry["group_name"] = "Unknown"
 
-            if self.output_format == "csv":
+            if self.field_specs:
+                # --fields mode: extract only requested fields
+                row = extract_fields(entry, self.field_specs)
+                if self.output_format == "csv":
+                    # Flatten any remaining dict/list values for CSV
+                    for k, v in row.items():
+                        if isinstance(v, (dict, list)):
+                            row[k] = json_parser.dumps(v)
+                    self.csv_writer.writerow(row)
+                else:
+                    try:
+                        self.file_handle.write(
+                            json_parser.dumps(row, escape_forward_slashes=False) + "\n"
+                        )
+                    except TypeError:
+                        self.file_handle.write(json_parser.dumps(row) + "\n")
+            elif self.output_format == "csv":
                 if self.all_attributes:
                     # Flatten nested dicts and write all fields
                     flat_entry = self._flatten_entry(entry)
