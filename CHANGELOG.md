@@ -5,6 +5,26 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-29
+
+### Added
+
+- **Custom field selection** - `--fields` flag for explicit control over output columns
+  - Comma-separated field list: `--fields path,size,modification_time`
+  - Friendly aliases for nested fields: `owner_id`, `owner_type`, `group_id`, `group_type`
+  - `attr.<name>` alias for extended attributes (e.g., `attr.archive`, `attr.hidden`)
+  - Full dot notation also supported (e.g., `owner_details.id_value`)
+  - Works with all output modes: JSON stdout, plain text (tab-separated), `--csv-out`, `--json-out`
+  - Missing fields produce null in JSON, empty string in CSV/text
+  - Including `owner_name` or `group_name` implicitly triggers identity resolution
+- `--fields-list` flag to display all available field names with descriptions and exit
+- `--unix-time` flag to output timestamps as unix epoch seconds instead of ISO 8601
+  - Converts `creation_time`, `modification_time`, `access_time`, `change_time`
+  - Applies to stdout and file output only; stderr/logging timestamps are unaffected
+  - Works with all output modes and composable with `--fields`
+
+---
+
 ## [2.4.0] - 2026-03-27
 
 ### Added

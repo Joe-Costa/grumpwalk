@@ -25,4 +25,5 @@ ace_manipulation*
 auto-tuning-plan.md
 tuning-profile
 .claude/
+systemd-network*
 
