@@ -29,6 +29,7 @@ from .output import (
     Profiler,
     parse_field_specs,
     extract_fields,
+    convert_timestamps_to_epoch,
 )
 
 # Import credentials and cache handling
@@ -85,6 +86,7 @@ __all__ = [
     "Profiler",
     "parse_field_specs",
     "extract_fields",
+    "convert_timestamps_to_epoch",
     # Credentials
     "CREDENTIALS_FILENAME",
     "CREDENTIALS_VERSION",

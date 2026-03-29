@@ -68,6 +68,7 @@ from modules import (
     parse_attribute_list,
     parse_field_specs,
     extract_fields,
+    convert_timestamps_to_epoch,
 )
 from modules.tuning import (
     load_tuning_profile,
@@ -4842,6 +4843,7 @@ async def main_async(args):
             args=args,
             dont_resolve_ids=args.dont_resolve_ids,
             field_specs=args.parsed_fields,
+            unix_time=args.unix_time,
         )
 
         async def output_callback(entry):
@@ -4890,6 +4892,8 @@ async def main_async(args):
                 # --fields mode: extract only requested fields
                 if args.json:
                     async def output_callback(entry):
+                        if args.unix_time:
+                            convert_timestamps_to_epoch(entry)
                         row = extract_fields(entry, args.parsed_fields)
                         try:
                             print(json_parser.dumps(row, escape_forward_slashes=False))
@@ -4900,6 +4904,8 @@ async def main_async(args):
                             await progress.increment_output()
                 else:
                     async def output_callback(entry):
+                        if args.unix_time:
+                            convert_timestamps_to_epoch(entry)
                         row = extract_fields(entry, args.parsed_fields)
                         values = [str(v) if v is not None else "" for v in row.values()]
                         print("\t".join(values))
@@ -4912,6 +4918,8 @@ async def main_async(args):
                 if args.all_attributes:
                     # Output full entry with all attributes
                     async def output_callback(entry):
+                        if args.unix_time:
+                            convert_timestamps_to_epoch(entry)
                         # Use escape_forward_slashes=False for ujson to avoid \/
                         try:
                             print(json_parser.dumps(entry, escape_forward_slashes=False))
@@ -4930,6 +4938,8 @@ async def main_async(args):
                             minimal_entry[args.time_field] = entry.get(args.time_field)
                         if args.larger_than or args.smaller_than:
                             minimal_entry["size"] = entry.get("size")
+                        if args.unix_time:
+                            convert_timestamps_to_epoch(minimal_entry)
                         # Use escape_forward_slashes=False for ujson to avoid \/
                         try:
                             print(json_parser.dumps(minimal_entry, escape_forward_slashes=False))
@@ -5489,6 +5499,8 @@ async def main_async(args):
                 writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
                 writer.writeheader()
                 for entry in matching_files:
+                    if args.unix_time:
+                        convert_timestamps_to_epoch(entry)
                     row = extract_fields(entry, args.parsed_fields)
                     for k, v in row.items():
                         if isinstance(v, (dict, list)):
@@ -5622,6 +5634,8 @@ async def main_async(args):
             if args.json_out:
                 output_handle = open(args.json_out, "w")
             for entry in matching_files:
+                if args.unix_time:
+                    convert_timestamps_to_epoch(entry)
                 row = extract_fields(entry, args.parsed_fields)
                 try:
                     output_handle.write(json_parser.dumps(row, escape_forward_slashes=False) + "\n")
@@ -5636,6 +5650,8 @@ async def main_async(args):
                 output_handle = open(args.json_out, "w")
 
             for entry in matching_files:
+                if args.unix_time:
+                    convert_timestamps_to_epoch(entry)
                 if args.all_attributes:
                     # Add owner name to entry if --show-owner is enabled
                     if args.show_owner:
@@ -5717,6 +5733,8 @@ async def main_async(args):
         # Only output if we didn't use streaming callback (which already printed results)
         if output_callback is None and args.parsed_fields:
             for entry in matching_files:
+                if args.unix_time:
+                    convert_timestamps_to_epoch(entry)
                 row = extract_fields(entry, args.parsed_fields)
                 values = [str(v) if v is not None else "" for v in row.values()]
                 print("\t".join(values))
@@ -6152,6 +6170,13 @@ Examples:
         "--fields-list",
         action=_FieldsListAction,
         help="List all available field names for --fields and exit",
+    )
+    output.add_argument(
+        "--unix-time",
+        action="store_true",
+        help="Output timestamps as unix epoch seconds instead of ISO 8601. "
+             "Applies to creation_time, modification_time, access_time, change_time. "
+             "Only affects stdout and file output, not stderr/logging.",
     )
     output.add_argument(
         "--verbose",

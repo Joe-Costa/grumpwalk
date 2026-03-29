@@ -8,6 +8,7 @@ and performance profiling.
 import asyncio
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 # Import utility functions from the utils module
@@ -143,6 +144,7 @@ class BatchedOutputHandler:
         all_attributes: bool = False,
         dont_resolve_ids: bool = False,
         field_specs=None,
+        unix_time: bool = False,
     ):
         self.client = client
         self.batch_size = batch_size
@@ -155,6 +157,7 @@ class BatchedOutputHandler:
         self.all_attributes = all_attributes
         self.dont_resolve_ids = dont_resolve_ids
         self.field_specs = field_specs
+        self.unix_time = unix_time
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -225,6 +228,9 @@ class BatchedOutputHandler:
             elif self.show_group:
                 group_details = entry.get("group_details", {})
                 entry["group_name"] = format_raw_id(group_details, entry.get("group", ""))
+
+            if self.unix_time:
+                convert_timestamps_to_epoch(entry)
 
             if self.field_specs:
                 row = extract_fields(entry, self.field_specs)
@@ -519,6 +525,37 @@ def extract_fields(entry, field_specs):
     return result
 
 
+TIMESTAMP_FIELDS = {"creation_time", "modification_time", "access_time", "change_time"}
+
+
+def convert_timestamps_to_epoch(row):
+    """
+    Convert ISO 8601 timestamp strings to unix epoch seconds (int) in place.
+
+    Operates on any dict key that is in TIMESTAMP_FIELDS. Handles the Qumulo
+    timestamp format: "2025-11-06T21:02:43.123368885Z".
+
+    Args:
+        row: Dict with string timestamp values to convert
+
+    Returns:
+        The same dict with timestamp values replaced by int epoch seconds.
+    """
+    for key in row:
+        if key not in TIMESTAMP_FIELDS:
+            continue
+        val = row[key]
+        if not isinstance(val, str):
+            continue
+        try:
+            clean = val.rstrip("Z").split(".")[0]
+            dt = datetime.fromisoformat(clean).replace(tzinfo=timezone.utc)
+            row[key] = int(dt.timestamp())
+        except (ValueError, AttributeError):
+            pass  # Leave unconvertible values as-is
+    return row
+
+
 class StreamingFileOutputHandler:
     """
     Memory-efficient streaming output handler for CSV and JSON file output.
@@ -543,6 +580,7 @@ class StreamingFileOutputHandler:
         args=None,
         dont_resolve_ids: bool = False,
         field_specs=None,
+        unix_time: bool = False,
     ):
         """
         Initialize streaming file output handler.
@@ -559,6 +597,7 @@ class StreamingFileOutputHandler:
             args: Command-line args for determining which fields to include
             dont_resolve_ids: Skip identity resolution and output raw IDs
             field_specs: Optional list of (display_name, resolve_path) tuples from parse_field_specs
+            unix_time: Convert timestamps to epoch seconds
         """
         self.client = client
         self.output_path = output_path
@@ -571,6 +610,7 @@ class StreamingFileOutputHandler:
         self.args = args
         self.dont_resolve_ids = dont_resolve_ids
         self.field_specs = field_specs
+        self.unix_time = unix_time
 
         self.batch = []
         self.lock = asyncio.Lock()
@@ -723,6 +763,9 @@ class StreamingFileOutputHandler:
                         entry["group_name"] = format_owner_name(identity)
                     else:
                         entry["group_name"] = "Unknown"
+
+            if self.unix_time:
+                convert_timestamps_to_epoch(entry)
 
             if self.field_specs:
                 # --fields mode: extract only requested fields
