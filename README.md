@@ -142,7 +142,20 @@ Since we've installed the `qq` CLI you can login with:
 
 `qq --host cluster.example.com login -u "DOMAIN\user"`
 
-This will save a `.qfsd_cred` file in your current user's home directory. 
+This will save a `.qfsd_cred` file in your current user's home directory. Note that these keys auto expire after 10 hours.
+
+## Logging in wih a long lived API access key
+
+Save your access key to a file and use the `--credentials-store` option:
+
+
+`qq --host cluster.example.com --credentials-store /path/to/keyfile`
+
+## Helpful Qumulo Care Articles
+
+[How to get an Access Token](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
+
+[Qumulo Role Based Access Control](https://care.qumulo.com/hc/en-us/articles/360036591633-Role-Based-Access-Control-RBAC-with-Qumulo-Core#managing-roles-by-using-the-web-ui-0-7)
 
 ## An important note about access_time
 
@@ -152,13 +165,6 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 <br><br>
 [Enabling Access Time Updates for File and Directory Reads in Qumulo Core](https://care.qumulo.com/s/article/Enabling-Access-Time-Updates-for-File-and-Directory-Reads-in-Qumulo-Core?)
 
-
-
-## Helpful Qumulo Care Articles
-
-[How to get an Access Token](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
-
-[Qumulo Role Based Access Control](https://care.qumulo.com/hc/en-us/articles/360036591633-Role-Based-Access-Control-RBAC-with-Qumulo-Core#managing-roles-by-using-the-web-ui-0-7)
 
 ## Quick Examples
 
