@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.5.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.6.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -10,18 +10,19 @@ A practical guide with recipes for common storage administration tasks using gru
 
 1. [Getting Started](#getting-started)
 2. [Finding Files](#finding-files)
-3. [Storage Capacity Planning](#storage-capacity-planning)
-4. [Data Lifecycle Management](#data-lifecycle-management)
-5. [User and Access Management](#user-and-access-management)
-6. [Domain Migration](#domain-migration)
-7. [Compliance and Auditing](#compliance-and-auditing)
-8. [Security and Incident Response](#security-and-incident-response)
-9. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
-10. [Media and Creative Workflows](#media-and-creative-workflows)
-11. [Reporting and Analytics](#reporting-and-analytics)
-12. [Performance Optimization](#performance-optimization)
-13. [Scripting and Automation](#scripting-and-automation)
-14. [Combining Filters with Actions](#combining-filters-with-actions)
+3. [Directory Statistics](#directory-statistics)
+4. [Storage Capacity Planning](#storage-capacity-planning)
+5. [Data Lifecycle Management](#data-lifecycle-management)
+6. [User and Access Management](#user-and-access-management)
+7. [Domain Migration](#domain-migration)
+8. [Compliance and Auditing](#compliance-and-auditing)
+9. [Security and Incident Response](#security-and-incident-response)
+10. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
+11. [Media and Creative Workflows](#media-and-creative-workflows)
+12. [Reporting and Analytics](#reporting-and-analytics)
+13. [Performance Optimization](#performance-optimization)
+14. [Scripting and Automation](#scripting-and-automation)
+15. [Combining Filters with Actions](#combining-filters-with-actions)
 
 ---
 
@@ -273,6 +274,64 @@ A `--find-attribute` flag and its paired `--set-attribute` flag must use opposit
   --larger-than 1GB --accessed --older-than 90 \
   --type file --progress
 ```
+
+---
+
+## Directory Statistics
+
+The `--stats` flag retrieves directory aggregate counts directly from the cluster and exits -- no tree walk required. This is the fastest way to get file counts, directory counts, and total size for a path.
+
+### How do I get a quick summary of a directory?
+
+```bash
+./grumpwalk.py --host cluster --path /data --stats
+```
+
+**Sample output:**
+```
+Path                          Files  Subdirectories  Total Size
+----------------------------  -----  --------------  ----------
+/data                     2,271,601              42     1.5 TiB
+```
+
+### How do I see a breakdown by subdirectory?
+
+Use `--max-depth` to recurse into subdirectories:
+
+```bash
+# One level deep
+./grumpwalk.py --host cluster --path /home --stats --max-depth 1
+
+# Two levels deep, skipping snapshots
+./grumpwalk.py --host cluster --path /home --stats --max-depth 2 --omit-subdirs '.snapshot'
+```
+
+### How do I skip specific directories?
+
+```bash
+# Skip by name pattern
+./grumpwalk.py --host cluster --path /data --stats --max-depth 2 \
+  --omit-subdirs '.snapshot' --omit-subdirs 'tmp'
+
+# Skip by exact path
+./grumpwalk.py --host cluster --path / --stats --max-depth 1 \
+  --omit-path /var/log --omit-path /tmp
+```
+
+### How do I export directory statistics?
+
+```bash
+# JSON to stdout (pipeable to jq)
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --json
+
+# JSON to file
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --json-out stats.json
+
+# CSV for spreadsheets
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --csv-out stats.csv
+```
+
+The CSV and JSON output include raw byte values for `total_size`, suitable for further processing.
 
 ---
 
@@ -1800,6 +1859,8 @@ done
 
 | Task | Command |
 |------|---------|
+| Directory stats | `--path /data --stats` |
+| Subdirectory breakdown | `--path /data --stats --max-depth 1` |
 | Full inventory | `--path / --progress > inventory.ndjson` |
 | Find large files | `--larger-than 1GB --type file` |
 | Find old files | `--older-than 365 --type file` |

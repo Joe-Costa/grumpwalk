@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import argparse
 import asyncio
@@ -1672,6 +1672,101 @@ async def display_scope_aggregates(
             log_stderr("WARN", f"Could not fetch directory aggregates: {e}")
 
 
+async def collect_stats(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    path: str,
+    results: list,
+    max_depth: int = None,
+    omit_subdirs: list = None,
+    omit_paths: list = None,
+    _current_depth: int = 0,
+):
+    """Collect directory aggregate statistics without performing a tree walk.
+
+    Fetches aggregates from the Qumulo API for the given path and appends
+    a stats dict to the results list. Optionally recurses into subdirectories
+    up to max_depth levels, respecting omit patterns.
+
+    Uses streaming enumeration to find subdirectories without loading all
+    entries into memory -- safe for directories with millions of files.
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp ClientSession
+        path: Directory path to query
+        results: List to append stat dicts to
+        max_depth: Maximum recursion depth (None = no recursion)
+        omit_subdirs: Glob patterns for subdirectory names to skip
+        omit_paths: Exact absolute paths to skip
+        _current_depth: Internal recursion tracker
+    """
+    aggregates = await client.get_directory_aggregates(session, path)
+
+    if "error" in aggregates:
+        results.append({
+            "path": path,
+            "error": aggregates["error"],
+        })
+        return
+
+    total_files = int(aggregates.get("total_files", 0))
+    total_dirs = int(aggregates.get("total_directories", 0))
+    total_capacity = int(aggregates.get("total_capacity", 0))
+
+    results.append({
+        "path": path,
+        "files": total_files,
+        "subdirectories": total_dirs,
+        "total_size": total_capacity,
+    })
+
+    # Recurse into subdirectories if depth permits
+    if max_depth is not None and _current_depth < max_depth:
+        # Normalize omit paths once
+        normalized_omit_paths = (
+            {p.rstrip("/") for p in omit_paths} if omit_paths else set()
+        )
+
+        # Stream directory entries page by page, collecting only subdirectories.
+        # This avoids loading millions of file entries into memory.
+        subdirs = []
+
+        async def extract_subdirs(page):
+            for entry in page:
+                if entry.get("type") != "FS_FILE_TYPE_DIRECTORY":
+                    continue
+                subdir_path = entry["path"]
+                subdir_name = subdir_path.rstrip("/").split("/")[-1]
+
+                if subdir_path.rstrip("/") in normalized_omit_paths:
+                    continue
+                if omit_subdirs and any(
+                    fnmatch.fnmatch(subdir_name, pat.rstrip("/"))
+                    for pat in omit_subdirs
+                ):
+                    continue
+                subdirs.append(subdir_path)
+
+        try:
+            await client.enumerate_directory_streaming(
+                session, path, callback=extract_subdirs
+            )
+        except Exception as e:
+            log_stderr("WARN", f"Could not enumerate {path}: {e}")
+            return
+
+        for subdir_path in subdirs:
+            await collect_stats(
+                client, session, subdir_path,
+                results=results,
+                max_depth=max_depth,
+                omit_subdirs=omit_subdirs,
+                omit_paths=omit_paths,
+                _current_depth=_current_depth + 1,
+            )
+
+
 async def apply_acl_to_tree(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -3220,6 +3315,18 @@ async def main_async(args):
                 log_stderr("ERROR", f"HTTP {e.status}: {e.message}", newline_before=True)
             sys.exit(1)
 
+    # Display scope aggregates for --path (universal, all modes)
+    if args.path:
+        async with client.create_session() as session:
+            aggregates = await client.get_directory_aggregates(session, args.path)
+            if "error" not in aggregates:
+                total_files = int(aggregates.get("total_files", 0))
+                total_dirs = int(aggregates.get("total_directories", 0))
+                print(
+                    f"Searching {total_dirs:,} directories and {total_files:,} files",
+                    file=sys.stderr,
+                )
+
     # ACL Cloning Mode
     if args.source_acl or args.source_acl_file or args.acl_target:
         # Validate: need a source and a target
@@ -4699,6 +4806,79 @@ async def main_async(args):
 
         return  # Exit after attribute modification mode
 
+    # Directory aggregate statistics mode (--stats)
+    if args.stats:
+        stats_results = []
+        async with client.create_session() as session:
+            await collect_stats(
+                client, session, args.path,
+                results=stats_results,
+                max_depth=args.max_depth,
+                omit_subdirs=args.omit_subdirs,
+                omit_paths=args.omit_path,
+            )
+
+        # Display formatted table to stderr
+        valid = [e for e in stats_results if "error" not in e]
+        errors = [e for e in stats_results if "error" in e]
+
+        if valid:
+            # Build formatted columns
+            rows = []
+            for e in valid:
+                rows.append((
+                    e["path"],
+                    f"{e['files']:,}",
+                    f"{e['subdirectories']:,}",
+                    format_bytes(e["total_size"]),
+                ))
+
+            headers = ("Path", "Files", "Subdirectories", "Total Size")
+            # Calculate column widths from data and headers
+            col_widths = [len(h) for h in headers]
+            for row in rows:
+                for i, val in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(val))
+
+            # Path left-aligned, numeric columns right-aligned
+            fmt = f"{{:<{col_widths[0]}}}  {{:>{col_widths[1]}}}  {{:>{col_widths[2]}}}  {{:>{col_widths[3]}}}"
+            separator = f"{{:<{col_widths[0]}}}  {{:>{col_widths[1]}}}  {{:>{col_widths[2]}}}  {{:>{col_widths[3]}}}"
+
+            print(fmt.format(*headers), file=sys.stderr)
+            print(separator.format(
+                "-" * col_widths[0], "-" * col_widths[1],
+                "-" * col_widths[2], "-" * col_widths[3],
+            ), file=sys.stderr)
+            for row in rows:
+                print(fmt.format(*row), file=sys.stderr)
+
+        for entry in errors:
+            print(f"[ERROR] {entry['path']}: {entry['error']}", file=sys.stderr)
+
+        # Write JSON to stdout if requested
+        if args.json:
+            json_parser.dump(valid, sys.stdout, indent=2)
+            print()  # trailing newline
+
+        # Write JSON file if requested
+        if args.json_out:
+            with open(args.json_out, "w") as f:
+                json_parser.dump(valid, f, indent=2)
+            log_stderr("INFO", f"Wrote {len(valid)} entries to {args.json_out}")
+
+        # Write CSV file if requested
+        if args.csv_out:
+            import csv
+            with open(args.csv_out, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["path", "files", "subdirectories", "total_size"]
+                )
+                writer.writeheader()
+                writer.writerows(valid)
+            log_stderr("INFO", f"Wrote {len(valid)} entries to {args.csv_out}")
+
+        return
+
     # PHASE 3: Directory statistics exploration mode
     if args.show_dir_stats:
         log_stderr("INFO", "Directory statistics mode (exploration)", newline_before=True)
@@ -4778,16 +4958,6 @@ async def main_async(args):
         if args.progress or args.limit
         else None
     )
-
-    # Fetch and display directory aggregates to inform user of search scope
-    async with client.create_session() as session:
-        await display_scope_aggregates(
-            client, session, args.path,
-            label="Searching directory",
-            verbose=args.verbose,
-            max_depth=args.max_depth,
-            omit_subdirs=args.omit_subdirs,
-        )
 
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
@@ -6617,6 +6787,12 @@ Examples:
         'Explore directory structure without enumerating files')
 
     exploration.add_argument(
+        "--stats",
+        action="store_true",
+        help="Show directory aggregate statistics and exit (no tree walk). "
+             "Respects --max-depth, --omit-subdirs, and --omit-path.",
+    )
+    exploration.add_argument(
         "--show-dir-stats",
         action="store_true",
         help="Show directory statistics only (no file enumeration)",
@@ -6783,6 +6959,36 @@ Examples:
         )
         print("Please choose either CSV or JSON output format", file=sys.stderr)
         sys.exit(1)
+
+    # Check --stats conflicts with other operational modes
+    if args.stats:
+        conflicting = []
+        if args.source_acl or args.source_acl_file or args.acl_target:
+            conflicting.append("--source-acl/--acl-target")
+        if getattr(args, 'ace_restore', None):
+            conflicting.append("--ace-restore")
+        if args.change_owner or args.change_group or args.change_owners_file or args.change_groups_file:
+            conflicting.append("--change-owner/--change-group")
+        if getattr(args, 'set_attribute_true', None) or getattr(args, 'set_attribute_false', None):
+            conflicting.append("--set-attribute-true/--set-attribute-false")
+        if args.show_dir_stats:
+            conflicting.append("--show-dir-stats")
+        if args.owner_report:
+            conflicting.append("--owner-report")
+        if args.acl_report:
+            conflicting.append("--acl-report")
+        if getattr(args, 'find_similar', None):
+            conflicting.append("--find-similar")
+        if getattr(args, 'benchmark', None):
+            conflicting.append("--benchmark")
+        if getattr(args, 'remove_aces', None) or getattr(args, 'add_aces', None) or getattr(args, 'replace_aces', None):
+            conflicting.append("--add-ace/--remove-ace/--replace-ace")
+        if conflicting:
+            print(
+                f"Error: --stats cannot be combined with {', '.join(conflicting)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Handle --benchmark mode
     if args.benchmark:

@@ -5,6 +5,26 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-04-09
+
+### Added
+
+- **Directory statistics mode** - `--stats` flag to display directory aggregate statistics and exit without performing a tree walk
+  - Shows files, subdirectories, and total size in a formatted table
+  - Supports `--max-depth` for recursive subdirectory breakdown
+  - Respects `--omit-subdirs` and `--omit-path` during recursion
+  - Output options: `--json` (stdout), `--json-out FILE`, `--csv-out FILE`
+  - Memory-safe: uses streaming enumeration to find subdirectories without loading all entries
+  - Conflict validation prevents combining `--stats` with other operational modes
+- **Universal scope display** - All modes with `--path` now show "Searching N directories and N files" immediately after connection verification, before any operation begins
+
+### Documentation
+
+- **User Guide** - Added "Directory Statistics" section with recipes for `--stats`, `--max-depth`, omit patterns, and export options
+- **README** - Added `--stats` to Features list, Directory Options reference, and Quick Examples
+
+---
+
 ## [2.5.0] - 2026-03-29
 
 ### Added

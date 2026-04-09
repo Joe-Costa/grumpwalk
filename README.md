@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.5.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 2.6.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -44,7 +44,8 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Symlink resolution** - Display symlink targets as absolute paths
 - **Progress tracking** - Real-time statistics with smart skip counters
 - **Multiple output formats** - Plain text, JSON, or CSV
-- **Directory scope preview** - Shows total subdirs/files before search
+- **Directory statistics** - Quick aggregate counts without a tree walk (`--stats`)
+- **Directory scope preview** - Shows total subdirs/files before every operation
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
@@ -198,6 +199,12 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 
 # Find similar files
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
+
+# Quick directory statistics (no tree walk)
+./grumpwalk.py --host cluster.example.com --path /data --stats
+
+# Directory statistics with one level of subdirectory breakdown
+./grumpwalk.py --host cluster.example.com --path /data --stats --max-depth 1
 ```
 
 ## Output Formats
@@ -321,6 +328,7 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--omit-subdirs PATTERN` - Skip directories (supports glob and paths, repeatable)
 - `--omit-path PATH` - Skip specific absolute path (must start with `/`, repeatable)
 - `--max-entries-per-dir N` - Skip directories exceeding N entries
+- `--stats` - Show directory aggregate statistics (files, subdirectories, total size) and exit. Supports `--max-depth`, `--omit-subdirs`, `--omit-path`, and all output options (`--json`, `--json-out`, `--csv-out`)
 - `--show-dir-stats` - Show directory statistics (file/dir counts, sizes)
 
 ### Symlink Options
