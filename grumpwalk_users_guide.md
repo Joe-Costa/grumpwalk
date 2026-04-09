@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.6.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.6.1** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -332,6 +332,21 @@ Use `--max-depth` to recurse into subdirectories:
 ```
 
 The CSV and JSON output include raw byte values for `total_size`, suitable for further processing.
+
+### How do I sort the results?
+
+Use `--sort` to order the table by size, file count, or name:
+
+```bash
+# Largest directories first
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --sort size
+
+# Most files first
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --sort count
+
+# Alphabetical by path
+./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --sort name
+```
 
 ---
 
@@ -1861,6 +1876,7 @@ done
 |------|---------|
 | Directory stats | `--path /data --stats` |
 | Subdirectory breakdown | `--path /data --stats --max-depth 1` |
+| Stats sorted by size | `--path /data --stats --max-depth 1 --sort size` |
 | Full inventory | `--path / --progress > inventory.ndjson` |
 | Find large files | `--larger-than 1GB --type file` |
 | Find old files | `--older-than 365 --type file` |

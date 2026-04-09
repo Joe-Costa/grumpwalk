@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 import argparse
 import asyncio
@@ -4822,6 +4822,16 @@ async def main_async(args):
         valid = [e for e in stats_results if "error" not in e]
         errors = [e for e in stats_results if "error" in e]
 
+        # Sort table output if requested
+        if args.sort and valid:
+            sort_keys = {
+                "size": lambda e: e["total_size"],
+                "count": lambda e: e["files"],
+                "name": lambda e: e["path"],
+            }
+            reverse = args.sort != "name"
+            valid.sort(key=sort_keys[args.sort], reverse=reverse)
+
         if valid:
             # Build formatted columns
             rows = []
@@ -6793,6 +6803,14 @@ Examples:
              "Respects --max-depth, --omit-subdirs, and --omit-path.",
     )
     exploration.add_argument(
+        "--sort",
+        nargs="?",
+        const="_missing_",
+        default=None,
+        help="Sort --stats table output by: size (largest first), "
+             "count (most files first), or name (alphabetical)",
+    )
+    exploration.add_argument(
         "--show-dir-stats",
         action="store_true",
         help="Show directory statistics only (no file enumeration)",
@@ -6959,6 +6977,28 @@ Examples:
         )
         print("Please choose either CSV or JSON output format", file=sys.stderr)
         sys.exit(1)
+
+    # Validate --sort
+    valid_sort_values = ("size", "count", "name")
+    if args.sort is not None:
+        if args.sort == "_missing_":
+            print(
+                f"Error: --sort requires a value: {', '.join(valid_sort_values)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.sort not in valid_sort_values:
+            print(
+                f"Error: --sort invalid choice '{args.sort}' (choose from: {', '.join(valid_sort_values)})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.stats:
+            print(
+                "Error: --sort requires --stats",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Check --stats conflicts with other operational modes
     if args.stats:
