@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.6.1** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.6.2** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -172,6 +172,8 @@ A practical guide with recipes for common storage administration tasks using gru
 ```bash
 ./grumpwalk.py --host cluster --path /data --type directory
 ```
+
+When `--type directory` is used alone (without other filters), grumpwalk uses recursive aggregates to skip enumeration of "leaf" directories that contain only files. On trees with many file-heavy leaf directories, this is a significant speedup.
 
 **Find only symlinks:**
 ```bash
@@ -1049,6 +1051,18 @@ OLDDOMAIN\svc_backup,NEWDOMAIN\svc_backup
   --progress
 ```
 
+**Audit directory ACLs only (much faster):**
+```bash
+./grumpwalk.py --host cluster --path /sensitive \
+  --acl-report \
+  --acl-resolve-names \
+  --acl-csv permissions_audit.csv \
+  --type directory \
+  --progress
+```
+
+If you only need ACLs for directories (a common audit pattern), adding `--type directory` is significantly faster: grumpwalk skips enumeration of leaf directories that contain only files.
+
 ### How do I find files with specific permissions?
 
 **Find files accessible by Everyone:**
@@ -1638,6 +1652,10 @@ The `*` marks the optimal concurrency level. Note that higher concurrency does n
   --connector-limit 500 \
   --progress
 ```
+
+**Use type filters when possible:**
+
+When you only need files, use `--type file`. When you only need directories, use `--type directory`. Grumpwalk uses recursive aggregates to skip entire subtrees that cannot contain matches -- e.g. with `--type directory`, leaf directories containing only files are never enumerated.
 
 **Skip identity resolution when you only need raw IDs:**
 ```bash

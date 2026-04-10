@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 
 import argparse
 import asyncio
@@ -1723,6 +1723,13 @@ async def collect_stats(
 
     # Recurse into subdirectories if depth permits
     if max_depth is not None and _current_depth < max_depth:
+        # Smart skip: total_directories from aggregates is recursive.
+        # If 0, there are no subdirectories anywhere in this subtree, so we
+        # can skip enumeration entirely (no point paging through millions of
+        # file entries just to find no directories).
+        if total_dirs == 0:
+            return
+
         # Normalize omit paths once
         normalized_omit_paths = (
             {p.rstrip("/") for p in omit_paths} if omit_paths else set()

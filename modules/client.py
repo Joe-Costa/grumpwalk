@@ -1014,6 +1014,20 @@ class AsyncQumuloClient:
                                 )
                             return []
 
+                    # If filter accepts directories but rejects files, check subdir count
+                    # This is the mirror of the file_only optimization above:
+                    # with --type directory, a subtree with 0 subdirectories anywhere
+                    # contains nothing we want to collect (only files, all rejected) and
+                    # nothing to recurse into. The current directory itself was already
+                    # added by its parent's enumeration.
+                    if file_filter(test_dir) and not file_filter(test_file):
+                        if total_directories == 0:
+                            if progress:
+                                await progress.increment_skipped(
+                                    total_files, total_directories
+                                )
+                            return []
+
                 # PHASE 3: Enhanced smart skipping for time and size filters
                 # Use aggregates data to skip directories that cannot possibly contain matching files
 
@@ -1719,26 +1733,36 @@ class AsyncQumuloClient:
         if total_files > 0:
             print(f"{indent}  Average file size: {format_bytes(avg_size)}")
 
-        # Recurse to subdirectories if depth permits
-        if current_depth < max_depth:
-            # Enumerate immediate children only (just to get directory names)
-            try:
-                entries = await self.enumerate_directory(session, path)
-                subdirs = [
-                    e for e in entries if e.get("type") == "FS_FILE_TYPE_DIRECTORY"
-                ]
+        # Recurse to subdirectories if depth permits.
+        # Smart skip: total_dirs is the recursive count. If 0, there are no
+        # subdirectories anywhere in this subtree -- no point enumerating.
+        if current_depth < max_depth and total_dirs > 0:
+            # Stream entries page-by-page, collecting only subdirectory paths.
+            # This avoids loading millions of file entries into memory just to
+            # filter them down to a handful of directories.
+            subdirs = []
 
-                for subdir in subdirs:
-                    subdir_path = subdir["path"]
-                    await self.show_directory_stats(
-                        session, subdir_path, max_depth, current_depth + 1
-                    )
+            async def extract_subdirs(page):
+                for entry in page:
+                    if entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
+                        subdirs.append(entry["path"])
+
+            try:
+                await self.enumerate_directory_streaming(
+                    session, path, callback=extract_subdirs
+                )
             except Exception as e:
                 if self.verbose:
                     print(
                         f"{indent}  [ERROR] Failed to enumerate subdirectories: {e}",
                         file=sys.stderr,
                     )
+                return
+
+            for subdir_path in subdirs:
+                await self.show_directory_stats(
+                    session, subdir_path, max_depth, current_depth + 1
+                )
 
     async def expand_identity(
         self, session: aiohttp.ClientSession, auth_id: str

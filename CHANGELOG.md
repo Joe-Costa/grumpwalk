@@ -5,6 +5,16 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2] - 2026-04-10
+
+### Performance
+
+- **Smart skip for `--type directory` walks** - When walking a tree with `--type directory` (e.g. `--acl-report --type directory`), grumpwalk now skips enumeration of directories whose entire subtree contains no further subdirectories. Mirrors the existing `--type file` optimization.
+- **Smart skip in `--stats` mode** - `collect_stats` now short-circuits enumeration when a directory's recursive subdirectory count is 0, avoiding paging through millions of file entries to find no subdirs.
+- **Smart skip and memory safety in `--show-dir-stats` mode** - Same optimization applied; `--show-dir-stats` also now uses streaming enumeration instead of loading all directory entries into memory.
+
+---
+
 ## [2.6.1] - 2026-04-09
 
 ### Added
