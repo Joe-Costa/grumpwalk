@@ -2133,6 +2133,280 @@ async def apply_acl_to_tree(
     return stats
 
 
+async def recurse_ace_modifications_to_tree(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    target_path: str,
+    remove_patterns: List[dict],
+    add_patterns: List[dict],
+    add_rights_patterns: List[dict],
+    remove_rights_patterns: List[dict],
+    replace_patterns: List[Tuple[dict, dict]] = None,
+    clone_patterns: List[dict] = None,
+    migrate_patterns: List[dict] = None,
+    sync_cloned_aces: bool = False,
+    file_filter = None,
+    progress: bool = False,
+    continue_on_error: bool = False,
+    args = None,
+    acl_concurrency: int = 100,
+    dry_run: bool = False,
+    verbose: bool = False
+) -> dict:
+    """
+    Walk a directory tree and apply ACE modifications to each child's individual ACL.
+
+    Unlike apply_acl_to_tree (which stamps one ACL onto all children), this function
+    preserves each child's existing ACL and only applies the specified modifications.
+    This prevents non-inherited permissions from being incorrectly propagated.
+
+    For each child:
+    1. GET the child's current ACL
+    2. Apply the same modification patterns (remove, add, replace, etc.)
+    3. If changes were made, PUT the modified ACL back (preserving original flags)
+
+    The target_path itself is NOT modified (caller handles that separately).
+
+    Args:
+        client: AsyncQumuloClient instance
+        session: aiohttp session
+        target_path: Root path (children are processed, not this path itself)
+        remove_patterns: Patterns for ACEs to remove
+        add_patterns: Patterns for ACEs to add
+        add_rights_patterns: Patterns for rights to add to existing ACEs
+        remove_rights_patterns: Patterns for rights to remove from existing ACEs
+        replace_patterns: List of (find_pattern, new_ace_pattern) tuples
+        clone_patterns: Patterns for cloning ACEs between trustees
+        migrate_patterns: Patterns for migrating trustees in-place
+        sync_cloned_aces: If True, sync existing cloned ACEs to match source
+        file_filter: Filter function for matching objects
+        progress: Show progress output
+        continue_on_error: Continue on errors without prompting
+        args: Command line arguments
+        acl_concurrency: Number of concurrent operations (default 100)
+        dry_run: Report changes without applying them
+        verbose: Show detailed logging
+
+    Returns:
+        Statistics dict with objects_changed, objects_unchanged, objects_failed,
+        objects_skipped, total_objects_processed, errors
+    """
+    stats = {
+        'objects_changed': 0,
+        'objects_unchanged': 0,
+        'objects_failed': 0,
+        'objects_skipped': 0,
+        'total_objects_processed': 0,
+        'errors': []
+    }
+
+    start_time = time.time()
+
+    walk_progress = ProgressTracker(verbose=False, limit=args.limit if args else None)
+
+    entry_queue = asyncio.Queue(maxsize=10000)
+
+    producer_done = asyncio.Event()
+    abort_requested = asyncio.Event()
+    limit_reached = asyncio.Event()
+    entries_queued = [0]
+
+    async def modify_single_file(path: str):
+        """GET ACL, apply modifications, PUT if changed."""
+        # GET current ACL
+        current_acl = await client.get_file_acl(session, path)
+        if current_acl is None:
+            return (False, "Failed to get ACL", False)
+
+        # Apply the same modifications to this child's ACL
+        modified_acl, mod_stats = apply_ace_modifications(
+            current_acl,
+            remove_patterns, add_patterns,
+            add_rights_patterns, remove_rights_patterns,
+            replace_aces=replace_patterns,
+            clone_patterns=clone_patterns,
+            migrate_patterns=migrate_patterns,
+            sync_cloned_aces=sync_cloned_aces,
+            verbose=verbose
+        )
+
+        # Check if anything changed (including inheritance break which modifies
+        # control flags even if no individual ACEs were added/removed)
+        total_changes = (
+            mod_stats['removed'] + mod_stats['added'] +
+            mod_stats['modified'] + mod_stats['replaced'] +
+            mod_stats['cloned'] + mod_stats['synced'] +
+            mod_stats['migrated']
+        )
+        if total_changes == 0 and not mod_stats.get('inheritance_broken'):
+            return (True, None, False)
+
+        if dry_run:
+            return (True, None, True)
+
+        # Normalize and PUT back, preserving original inheritance flags
+        normalized = normalize_acl_for_put(modified_acl)
+        success, error = await client.set_file_acl(
+            session, path, normalized, mark_inherited=False
+        )
+        return (success, error, True)
+
+    async def queue_entry(entry):
+        """Callback to add matching entries to the processing queue."""
+        if abort_requested.is_set() or limit_reached.is_set():
+            return
+        # Skip target path (already handled by caller)
+        if entry.get('path') == target_path:
+            return
+        if args and args.limit and entries_queued[0] >= args.limit:
+            limit_reached.set()
+            return
+        await entry_queue.put(entry)
+        entries_queued[0] += 1
+
+    async def producer():
+        """Walk tree and stream matching entries to queue."""
+        try:
+            await client.walk_tree_async(
+                session=session,
+                path=target_path,
+                max_depth=args.max_depth if args else None,
+                progress=walk_progress,
+                file_filter=file_filter,
+                collect_results=False,
+                output_callback=queue_entry,
+            )
+        except Exception as e:
+            if progress:
+                log_stderr("ERROR", f"Tree walk failed: {e}", newline_before=True)
+        finally:
+            producer_done.set()
+
+    async def consumer():
+        """Process entries from queue, applying ACE modifications in batches."""
+        batch_size = acl_concurrency
+        batch = []
+        processed = 0
+
+        while True:
+            if abort_requested.is_set():
+                break
+
+            try:
+                entry = await asyncio.wait_for(entry_queue.get(), timeout=0.1)
+                batch.append(entry)
+                while len(batch) < batch_size:
+                    try:
+                        entry = entry_queue.get_nowait()
+                        batch.append(entry)
+                    except asyncio.QueueEmpty:
+                        break
+            except asyncio.TimeoutError:
+                if producer_done.is_set() and entry_queue.empty():
+                    break
+                if not batch:
+                    continue
+
+            if batch:
+                tasks = []
+                paths = []
+                for entry in batch:
+                    path = entry['path']
+                    paths.append(path)
+                    tasks.append(modify_single_file(path))
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for path, result in zip(paths, results):
+                    processed += 1
+                    stats['total_objects_processed'] += 1
+
+                    if isinstance(result, Exception):
+                        stats['objects_failed'] += 1
+                        error_msg = str(result)
+                        stats['errors'].append({
+                            'path': path,
+                            'error_code': 'EXCEPTION',
+                            'message': error_msg
+                        })
+                        if continue_on_error:
+                            if progress:
+                                log_stderr("WARN", f"Error on {path}: {error_msg}, continuing...", newline_before=True)
+                        else:
+                            log_stderr("ERROR", f"Failed to modify ACL on: {path}", newline_before=True)
+                            log_stderr("ERROR", f"{error_msg}")
+                            while True:
+                                response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                                if response in ['c', 'continue']:
+                                    break
+                                elif response in ['a', 'abort']:
+                                    log_stderr("INFO", "Operation aborted by user.")
+                                    abort_requested.set()
+                                    return
+                                print("Invalid response. Please enter 'c' or 'a'.")
+
+                    elif isinstance(result, tuple):
+                        success, error_msg, had_changes = result
+                        if success:
+                            if had_changes:
+                                stats['objects_changed'] += 1
+                            else:
+                                stats['objects_unchanged'] += 1
+                        else:
+                            stats['objects_failed'] += 1
+                            stats['errors'].append({
+                                'path': path,
+                                'error_code': 'MODIFY_FAILURE',
+                                'message': error_msg
+                            })
+                            if continue_on_error:
+                                if progress:
+                                    log_stderr("WARN", f"Error on {path}: {error_msg}, continuing...", newline_before=True)
+                            else:
+                                log_stderr("ERROR", f"Failed to modify ACL on: {path}", newline_before=True)
+                                log_stderr("ERROR", f"{error_msg}")
+                                while True:
+                                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                                    if response in ['c', 'continue']:
+                                        break
+                                    elif response in ['a', 'abort']:
+                                        log_stderr("INFO", "Operation aborted by user.")
+                                        abort_requested.set()
+                                        return
+                                    print("Invalid response. Please enter 'c' or 'a'.")
+
+                if progress:
+                    elapsed = time.time() - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    queue_size = entry_queue.qsize()
+                    progress_label = "DRY RUN" if dry_run else "ACE MODIFY"
+                    changed_label = "Would change" if dry_run else "Changed"
+                    print(
+                        f"\r[{progress_label}] {changed_label}: {stats['objects_changed']:,} | "
+                        f"Unchanged: {stats['objects_unchanged']:,} | "
+                        f"Failed: {stats['objects_failed']:,} | "
+                        f"Queue: {queue_size:,} | "
+                        f"Rate: {rate:.0f}/s",
+                        end='',
+                        file=sys.stderr
+                    )
+                    sys.stderr.flush()
+
+                batch = []
+
+    await asyncio.gather(producer(), consumer())
+
+    stats['objects_skipped'] = walk_progress.total_objects - walk_progress.matches
+
+    if progress:
+        print()  # New line after progress
+        elapsed = time.time() - start_time
+        complete_label = "DRY RUN" if dry_run else "ACE MODIFY"
+        log_stderr(complete_label, f"Completed in {elapsed:.1f}s")
+
+    return stats
+
+
 async def generate_acl_report(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -4153,16 +4427,29 @@ async def main_async(args):
 
             log_stderr("INFO", "ACL applied successfully")
 
-            # Step 6: Propagate to children if requested
+            # Step 6: Recurse modifications to children if requested
+            # Uses per-file modification: GET each child's ACL, apply the same
+            # modifications, PUT back. This preserves each child's existing ACL
+            # and prevents non-inherited permissions from being incorrectly propagated.
             if args.propagate_changes:
-                log_stderr("INFO", f"Propagating ACL to children of: {args.path}", newline_before=True)
+                log_stderr("INFO", f"Applying modifications to children of: {args.path}", newline_before=True)
                 await display_scope_aggregates(
                     client, session, args.path,
-                    label="Propagating to",
+                    label="Modifying children of",
                     verbose=args.verbose,
                     max_depth=args.max_depth,
                     omit_subdirs=args.omit_subdirs,
                 )
+
+                # Pre-resolve trustees in add/replace patterns for child ACE creation.
+                # The parent's resolution already ran; use resolved_auth_id so children
+                # don't need per-file API calls to resolve new ACE trustees.
+                for p in add_patterns:
+                    if p.get('raw_trustee') and p.get('resolved_auth_id'):
+                        p['raw_trustee'] = str(p['resolved_auth_id'])
+                for find_pat, new_pat in replace_patterns:
+                    if new_pat and new_pat.get('raw_trustee') and new_pat.get('resolved_auth_id'):
+                        new_pat['raw_trustee'] = str(new_pat['resolved_auth_id'])
 
                 # Resolve owner filters if any
                 owner_auth_ids = None
@@ -4171,26 +4458,33 @@ async def main_async(args):
 
                 file_filter = create_file_filter(args, owner_auth_ids)
 
-                # Use existing apply_acl_to_tree for propagation
-                # The modified ACL will be inherited (mark_inherited=True for children)
-                propagate_stats = await apply_acl_to_tree(
+                propagate_stats = await recurse_ace_modifications_to_tree(
                     client=client,
                     session=session,
-                    acl_data=normalized_acl,
                     target_path=args.path,
-                    propagate=True,
+                    remove_patterns=remove_patterns,
+                    add_patterns=add_patterns,
+                    add_rights_patterns=add_rights_patterns,
+                    remove_rights_patterns=remove_rights_patterns,
+                    replace_patterns=replace_patterns,
+                    clone_patterns=clone_patterns,
+                    migrate_patterns=migrate_patterns,
+                    sync_cloned_aces=args.sync_cloned_aces,
                     file_filter=file_filter,
                     progress=args.progress,
                     continue_on_error=args.continue_on_error,
                     args=args,
-                    acl_concurrency=args.acl_concurrency
+                    acl_concurrency=args.acl_concurrency,
+                    dry_run=args.dry_run,
+                    verbose=args.verbose
                 )
 
-                log_stderr("INFO", "Propagation complete:", newline_before=True)
-                print(f"  Objects changed:  {propagate_stats['objects_changed']:,}", file=sys.stderr)
-                print(f"  Objects failed:   {propagate_stats['objects_failed']:,}", file=sys.stderr)
+                log_stderr("INFO", "Recursion complete:", newline_before=True)
+                print(f"  Objects changed:    {propagate_stats['objects_changed']:,}", file=sys.stderr)
+                print(f"  Objects unchanged:  {propagate_stats['objects_unchanged']:,}", file=sys.stderr)
+                print(f"  Objects failed:     {propagate_stats['objects_failed']:,}", file=sys.stderr)
                 if file_filter:
-                    print(f"  Objects skipped:  {propagate_stats['objects_skipped']:,}", file=sys.stderr)
+                    print(f"  Objects skipped:    {propagate_stats['objects_skipped']:,}", file=sys.stderr)
 
                 if propagate_stats['objects_failed'] > 0:
                     sys.exit(1)
