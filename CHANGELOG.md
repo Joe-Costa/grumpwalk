@@ -5,6 +5,19 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-04-22
+
+### Fixed
+
+- **Critical ACL bug: `--propagate-changes` with ACE manipulation no longer corrupts inheritance flags** - Previously, `--remove-ace` (and other ACE operations) combined with `--propagate-changes` would stamp the parent's modified ACL onto all children using `mark_inherited=True`, causing non-inherited/non-inheritable permissions to become inherited across the entire tree. For example, an explicit "Everyone Read/Execute" on the parent folder would suddenly propagate as an inherited permission to all children -- a security-impacting permission escalation. The fix replaces the old "stamp parent ACL" approach with per-file modification: each child's ACL is individually fetched, modified with the same patterns, and written back with its original inheritance flags preserved. Children without matching ACEs are detected and skipped (no unnecessary writes).
+
+### Changed
+
+- ACE manipulation with `--propagate-changes` now shows "Objects unchanged" count in addition to changed/failed/skipped, providing visibility into how many children did not have the targeted ACE
+- Progress label changed from "ACL CLONE" to "ACE MODIFY" during recursive ACE modification to better distinguish from full ACL cloning operations
+
+---
+
 ## [2.6.2] - 2026-04-10
 
 ### Performance
