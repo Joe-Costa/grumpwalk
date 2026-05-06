@@ -700,34 +700,6 @@ class AsyncQumuloClient:
                     log_stderr("WARN", f"Error reading chunk from {path}: {e}")
                 return None
 
-    def calculate_adaptive_concurrency(self, total_entries: int) -> int:
-        """
-        Calculate adaptive concurrency based on directory size.
-
-        PHASE 3.2: Adaptive concurrency reduces concurrent operations for very large
-        directories to prevent overwhelming the cluster and consuming excessive memory.
-
-        Thresholds:
-        - < 10k entries: Use full concurrency
-        - 10k-50k entries: Reduce to 50% of base
-        - 50k-100k entries: Reduce to 25% of base
-        - > 100k entries: Reduce to 10% of base (min 5)
-
-        Args:
-            total_entries: Total entries in directory (files + directories)
-
-        Returns:
-            Adjusted concurrency level
-        """
-        if total_entries < 10000:
-            return self.max_concurrent
-        elif total_entries < 50000:
-            return max(5, self.max_concurrent // 2)
-        elif total_entries < 100000:
-            return max(5, self.max_concurrent // 4)
-        else:
-            return max(5, self.max_concurrent // 10)
-
     async def enumerate_directory_adaptive(
         self,
         session: aiohttp.ClientSession,
@@ -920,507 +892,290 @@ class AsyncQumuloClient:
         output_callback=None,
     ) -> List[dict]:
         """
-        Recursively walk directory tree with concurrent directory enumeration.
+        Walk directory tree using bounded-memory BFS with async worker pool.
+
+        Uses an asyncio.Queue with fixed-size worker pool instead of recursive
+        coroutine expansion. Memory usage is O(queue_capacity) regardless of
+        filesystem size, preventing OOM on large filesystems.
 
         Args:
             session: aiohttp ClientSession
             path: Directory path to walk
             max_depth: Maximum depth to traverse (-1 or None for unlimited)
-            _current_depth: Internal tracking of current depth
+            _current_depth: Ignored (kept for API compatibility)
             progress: Optional ProgressTracker for reporting progress
             file_filter: Optional function to filter files
             owner_stats: Optional OwnerStats for collecting ownership data
             omit_subdirs: Optional list of wildcard patterns for directories to skip
             omit_paths: Optional list of exact absolute paths to skip (no wildcards)
-            collect_results: If False, don't accumulate matching entries (saves memory for reports)
+            collect_results: If False, don't accumulate matching entries (saves memory)
             verbose: If True, emit warnings to stderr for large directories
             max_entries_per_dir: If set, skip directories with more entries than this limit
             time_filter_info: Optional dict with time filter thresholds for smart skipping
             size_filter_info: Optional dict with size filter thresholds for smart skipping
             owner_filter_info: Optional dict with owner filter auth_ids for smart skipping
+            output_callback: Optional async callback for streaming results
 
         Returns:
             List of matching file entries (empty if collect_results=False)
         """
-        # Check depth limit
-        if max_depth is not None and max_depth >= 0 and _current_depth >= max_depth:
-            return []
+        # Pre-normalize omit_paths once (avoid repeated work per directory)
+        normalized_omit_paths = None
+        if omit_paths:
+            normalized_omit_paths = set(p.rstrip("/") for p in omit_paths)
 
-        # Early exit: Check if limit reached
-        if progress and progress.should_stop():
-            return []
+        # Shared state for collect_results mode
+        collected_results = [] if collect_results else None
+        results_lock = asyncio.Lock()
 
-        # Get directory aggregates for pre-flight intelligence
-        aggregates = await self.get_directory_aggregates(session, path)
+        # Bounded work queue: (path, depth) tuples
+        queue = asyncio.Queue(maxsize=50_000)
+        await queue.put((path, 0))
 
-        # Check for errors in aggregates response (API may not be available)
-        has_aggregates_error = "error" in aggregates
+        num_workers = min(self.max_concurrent, 200)
 
-        if not has_aggregates_error:
-            # Parse aggregate statistics (API returns strings, convert to ints)
-            try:
-                total_files = int(aggregates.get("total_files", 0))
-                total_directories = int(aggregates.get("total_directories", 0))
-                total_entries = total_files + total_directories
+        async def _process_directory(dir_path: str, current_depth: int):
+            """Process a single directory: smart skip, enumerate, filter, enqueue children."""
+            # Check depth limit
+            if max_depth is not None and max_depth >= 0 and current_depth >= max_depth:
+                return
 
-                # Warn on large directories (100k+ entries)
-                if verbose and total_entries > 100_000:
-                    print(
-                        f"\r[WARN] Large directory: {path} ({total_entries:,} entries: "
-                        f"{total_files:,} files, {total_directories:,} dirs)",
-                        file=sys.stderr,
-                    )
+            # Early exit: Check if limit reached
+            if progress and progress.should_stop():
+                return
 
-                # Safety valve: skip directories exceeding max_entries_per_dir
-                if max_entries_per_dir and total_entries > max_entries_per_dir:
-                    # if verbose:
-                    #     print(f"\r[SKIP] Directory exceeds limit: {path} "
-                    #           f"({total_entries:,} entries > {max_entries_per_dir:,} limit)",
-                    #           file=sys.stderr)
+            # Get directory aggregates for pre-flight intelligence
+            aggregates = await self.get_directory_aggregates(session, dir_path)
+
+            # Check for errors in aggregates response
+            has_aggregates_error = "error" in aggregates
+
+            if not has_aggregates_error:
+                try:
+                    total_files = int(aggregates.get("total_files", 0))
+                    total_directories = int(aggregates.get("total_directories", 0))
+                    total_entries = total_files + total_directories
+
+                    if verbose and total_entries > 100_000:
+                        print(
+                            f"\r[WARN] Large directory: {dir_path} ({total_entries:,} entries: "
+                            f"{total_files:,} files, {total_directories:,} dirs)",
+                            file=sys.stderr,
+                        )
+
+                    # Safety valve: skip directories exceeding max_entries_per_dir
+                    if max_entries_per_dir and total_entries > max_entries_per_dir:
+                        if progress:
+                            await progress.increment_skipped(total_files, total_directories)
+                        return
+
+                    # Smart skipping: type-based
+                    if file_filter:
+                        test_dir = {"type": "FS_FILE_TYPE_DIRECTORY", "path": "/test", "name": "test"}
+                        test_file = {"type": "FS_FILE_TYPE_FILE", "path": "/test", "name": "test"}
+
+                        if not file_filter(test_dir) and file_filter(test_file):
+                            if total_files == 0:
+                                if progress:
+                                    await progress.increment_skipped(total_files, total_directories)
+                                return
+
+                        if file_filter(test_dir) and not file_filter(test_file):
+                            if total_directories == 0:
+                                if progress:
+                                    await progress.increment_skipped(total_files, total_directories)
+                                return
+
+                    # Smart skipping: time-based
+                    if time_filter_info:
+                        oldest_mod = aggregates.get("oldest_modification_time")
+                        newest_mod = aggregates.get("newest_modification_time")
+                        older_than_threshold = time_filter_info.get("older_than")
+                        newer_than_threshold = time_filter_info.get("newer_than")
+                        time_field = time_filter_info.get("time_field", "modification_time")
+
+                        if time_field == "modification_time" and oldest_mod and newest_mod:
+                            try:
+                                oldest_time = datetime.fromisoformat(oldest_mod.rstrip("Z").split(".")[0])
+                                newest_time = datetime.fromisoformat(newest_mod.rstrip("Z").split(".")[0])
+
+                                if older_than_threshold and newest_time >= older_than_threshold:
+                                    if progress:
+                                        await progress.increment_skipped(total_files, total_directories)
+                                    return
+
+                                if newer_than_threshold and oldest_time <= newer_than_threshold:
+                                    if progress:
+                                        await progress.increment_skipped(total_files, total_directories)
+                                    return
+                            except (ValueError, AttributeError):
+                                pass
+
+                    # Smart skipping: size-based
+                    if size_filter_info:
+                        total_capacity = aggregates.get("total_capacity")
+                        min_size = size_filter_info.get("min_size")
+                        if min_size and total_capacity:
+                            try:
+                                if int(total_capacity) < min_size:
+                                    if progress:
+                                        await progress.increment_skipped(total_files, total_directories)
+                                    return
+                            except (ValueError, TypeError):
+                                pass
+
+                    # Smart skipping: owner-based
+                    if owner_filter_info:
+                        owner_auth_ids = owner_filter_info.get("auth_ids")
+                        if owner_auth_ids:
+                            capacity_data = await self.get_directory_capacity(session, dir_path)
+                            if capacity_data and "capacity_by_owner" in capacity_data:
+                                owners_with_files = set()
+                                for entry in capacity_data.get("capacity_by_owner", []):
+                                    owner_id = entry.get("id")
+                                    if owner_id:
+                                        owners_with_files.add(owner_id)
+                                if not any(aid in owners_with_files for aid in owner_auth_ids):
+                                    if progress:
+                                        await progress.increment_skipped(total_files, total_directories)
+                                    return
+
+                except (ValueError, TypeError):
                     pass
-                    if progress:
-                        await progress.increment_skipped(total_files, total_directories)
-                    return []
 
-                # PHASE 2: Smart skipping - skip directories that can't possibly match filters
-                # This saves API calls by not enumerating directories we know won't have matches
-                if file_filter:
-                    # Check if file_only filter is active (file_filter rejects all directories)
-                    # We detect this by checking if args has file_only attribute
-                    # Since we don't have access to args here, we check by testing the filter
-                    # with a mock directory entry
-                    test_dir = {
-                        "type": "FS_FILE_TYPE_DIRECTORY",
-                        "path": "/test",
-                        "name": "test",
-                    }
-                    test_file = {
-                        "type": "FS_FILE_TYPE_FILE",
-                        "path": "/test",
-                        "name": "test",
-                    }
-
-                    # If filter rejects directories but might accept files, check file count
-                    if not file_filter(test_dir) and file_filter(test_file):
-                        # This looks like --file-only filter
-                        if total_files == 0:
-                            # if verbose:
-                            #     print(f"\r[SKIP] Smart skip: {path} (0 files, --file-only active)",
-                            #           file=sys.stderr)
-                            pass
-                            if progress:
-                                await progress.increment_skipped(
-                                    total_files, total_directories
-                                )
-                            return []
-
-                    # If filter accepts directories but rejects files, check subdir count
-                    # This is the mirror of the file_only optimization above:
-                    # with --type directory, a subtree with 0 subdirectories anywhere
-                    # contains nothing we want to collect (only files, all rejected) and
-                    # nothing to recurse into. The current directory itself was already
-                    # added by its parent's enumeration.
-                    if file_filter(test_dir) and not file_filter(test_file):
-                        if total_directories == 0:
-                            if progress:
-                                await progress.increment_skipped(
-                                    total_files, total_directories
-                                )
-                            return []
-
-                # PHASE 3: Enhanced smart skipping for time and size filters
-                # Use aggregates data to skip directories that cannot possibly contain matching files
-
-                # Time-based smart skipping
-                if time_filter_info:
-                    oldest_mod = aggregates.get("oldest_modification_time")
-                    newest_mod = aggregates.get("newest_modification_time")
-
-                    # Parse time filter info
-                    older_than_threshold = time_filter_info.get("older_than")
-                    newer_than_threshold = time_filter_info.get("newer_than")
-                    time_field = time_filter_info.get("time_field", "modification_time")
-
-                    # Only apply smart skipping for modification_time (since aggregates provides mod times)
-                    if time_field == "modification_time" and (
-                        oldest_mod and newest_mod
-                    ):
-                        try:
-                            # Parse aggregates times
-                            oldest_time = datetime.fromisoformat(
-                                oldest_mod.rstrip("Z").split(".")[0]
-                            )
-                            newest_time = datetime.fromisoformat(
-                                newest_mod.rstrip("Z").split(".")[0]
-                            )
-
-                            # Check --older-than filter
-                            if older_than_threshold:
-                                # If the NEWEST file is younger than threshold, NO files match
-                                if newest_time >= older_than_threshold:
-                                    # if verbose:
-                                    #     print(f"\r[SKIP] Smart skip: {path} (all files newer than threshold)",
-                                    #           file=sys.stderr)
-                                    if progress:
-                                        await progress.increment_skipped(
-                                            total_files, total_directories
-                                        )
-                                    return []
-
-                            # Check --newer-than filter
-                            if newer_than_threshold:
-                                # If the OLDEST file is older than threshold, NO files match
-                                if oldest_time <= newer_than_threshold:
-                                    # if verbose:
-                                    #     print(f"\r[SKIP] Smart skip: {path} (all files older than threshold)",
-                                    #           file=sys.stderr)
-                                    if progress:
-                                        await progress.increment_skipped(
-                                            total_files, total_directories
-                                        )
-                                    return []
-
-                        except (ValueError, AttributeError):
-                            # If time parsing fails, continue without smart skipping
-                            pass
-
-                # Size-based smart skipping
-                if size_filter_info:
-                    total_capacity = aggregates.get("total_capacity")
-                    min_size = size_filter_info.get("min_size")
-
-                    # Check --larger-than filter (min_size)
-                    if min_size and total_capacity:
-                        try:
-                            total_cap_bytes = int(total_capacity)
-                            # If total directory capacity is less than min_size,
-                            # NO individual files can be >= min_size
-                            if total_cap_bytes < min_size:
-                                # if verbose:
-                                #     print(f"\r[SKIP] Smart skip: {path} "
-                                #           f"(total capacity {total_cap_bytes} < min {min_size})",
-                                #           file=sys.stderr)
-                                if progress:
-                                    await progress.increment_skipped(
-                                        total_files, total_directories
-                                    )
-                                return []
-                        except (ValueError, TypeError):
-                            # If capacity parsing fails, continue without smart skipping
-                            pass
-
-                # PHASE 3.3: Owner-based smart skipping
-                # Use capacity API to check if target owner has any files in this directory
-                if owner_filter_info:
-                    owner_auth_ids = owner_filter_info.get("auth_ids")
-                    if owner_auth_ids:
-                        # Get capacity breakdown by owner
-                        capacity_data = await self.get_directory_capacity(session, path)
-                        if capacity_data and "capacity_by_owner" in capacity_data:
-                            # Extract owner IDs from capacity data
-                            owners_with_files = set()
-                            for entry in capacity_data.get("capacity_by_owner", []):
-                                owner_id = entry.get("id")
-                                if owner_id:
-                                    owners_with_files.add(owner_id)
-
-                            # Check if any of our target owners have files here
-                            has_matching_owner = any(
-                                auth_id in owners_with_files
-                                for auth_id in owner_auth_ids
-                            )
-
-                            if not has_matching_owner:
-                                # if verbose:
-                                #     print(f"\r[SKIP] Smart skip: {path} (no files owned by target owner(s))",
-                                #           file=sys.stderr)
-                                if progress:
-                                    await progress.increment_skipped(
-                                        total_files, total_directories
-                                    )
-                                return []
-
-            except (ValueError, TypeError):
-                # If we can't parse aggregates, continue without the check
-                pass
-
-        # PHASE 3.2: Use adaptive enumeration (automatically chooses streaming vs batch mode)
-        # Pass progress tracker for per-page updates in streaming mode
-        matching_entries, subdirs, match_count, total_processed = (
-            await self.enumerate_directory_adaptive(
-                session,
-                path,
-                aggregates,
-                file_filter,
-                owner_stats,
-                collect_results,
-                verbose,
-                progress,
-                output_callback,
-            )
-        )
-
-        # Filter subdirectories based on omit patterns
-        if omit_subdirs:
-            filtered_subdirs = []
-            filtered_entries = []
-            omitted_dirs_count = 0
-
-            for subdir_path in subdirs:
-                # Extract directory name (last component, handling trailing slashes)
-                subdir_name = (
-                    subdir_path.rstrip("/").split("/")[-1]
-                    if "/" in subdir_path
-                    else subdir_path
+            # Enumerate directory (adaptive: streaming for large dirs, batch for small)
+            matching_entries, subdirs, match_count, total_processed = (
+                await self.enumerate_directory_adaptive(
+                    session, dir_path, aggregates,
+                    file_filter, owner_stats, collect_results,
+                    verbose, progress, output_callback,
                 )
+            )
 
-                # Check if this directory should be omitted
-                should_omit = False
-                matched_pattern = None
-                for pattern in omit_subdirs:
-                    # Normalize pattern by stripping trailing slashes for matching
-                    normalized_pattern = pattern.rstrip("/")
+            # Filter subdirectories based on omit patterns
+            if omit_subdirs:
+                filtered_subdirs = []
+                omitted_dirs_count = 0
 
-                    # Try matching against:
-                    # 1. Full path (e.g., "/home/bob" matches "/home/bob")
-                    # 2. Directory name only (e.g., "bob" matches "bob")
-                    # 3. Pattern with wildcards (e.g., "bob*" matches "bob123")
-                    if (fnmatch.fnmatch(subdir_path.rstrip("/"), normalized_pattern) or
-                        fnmatch.fnmatch(subdir_name, normalized_pattern)):
-                        should_omit = True
-                        matched_pattern = pattern
-                        break
-
-                if should_omit:
-                    omitted_dirs_count += 1
-                else:
-                    filtered_subdirs.append(subdir_path)
-
-            subdirs = filtered_subdirs
-
-            # Report omitted directories to progress tracker
-            if progress and omitted_dirs_count > 0:
-                # We count each omitted directory as 1 subdirectory skipped
-                # We don't have file counts for omitted dirs without fetching their aggregates,
-                # so we report 0 files (the subdirs count is what matters here)
-                await progress.increment_skipped(0, omitted_dirs_count)
-
-            # Also filter matching_entries to remove directories that match omit patterns
-            for entry in matching_entries:
-                entry_path = entry.get('path', '')
-                entry_type = entry.get('type', '')
-
-                # Only filter directories
-                if entry_type == 'FS_FILE_TYPE_DIRECTORY':
-                    entry_name = (
-                        entry_path.rstrip("/").split("/")[-1]
-                        if "/" in entry_path
-                        else entry_path
+                for subdir_path in subdirs:
+                    subdir_name = (
+                        subdir_path.rstrip("/").split("/")[-1]
+                        if "/" in subdir_path else subdir_path
                     )
-
                     should_omit = False
                     for pattern in omit_subdirs:
                         normalized_pattern = pattern.rstrip("/")
-                        if (fnmatch.fnmatch(entry_path.rstrip("/"), normalized_pattern) or
-                            fnmatch.fnmatch(entry_name, normalized_pattern)):
+                        if (fnmatch.fnmatch(subdir_path.rstrip("/"), normalized_pattern) or
+                                fnmatch.fnmatch(subdir_name, normalized_pattern)):
                             should_omit = True
                             break
+                    if should_omit:
+                        omitted_dirs_count += 1
+                    else:
+                        filtered_subdirs.append(subdir_path)
 
-                    if not should_omit:
-                        filtered_entries.append(entry)
-                else:
-                    # Keep all files
-                    filtered_entries.append(entry)
+                subdirs = filtered_subdirs
 
-            matching_entries = filtered_entries
+                if progress and omitted_dirs_count > 0:
+                    await progress.increment_skipped(0, omitted_dirs_count)
 
-        # Filter based on exact absolute paths (--omit-path)
-        if omit_paths:
-            filtered_subdirs = []
-            filtered_entries = []
-            omitted_paths_count = 0
+                # Filter matching_entries for omitted directories
+                if collect_results:
+                    filtered_entries = []
+                    for entry in matching_entries:
+                        entry_path = entry.get('path', '')
+                        entry_type = entry.get('type', '')
+                        if entry_type == 'FS_FILE_TYPE_DIRECTORY':
+                            entry_name = (
+                                entry_path.rstrip("/").split("/")[-1]
+                                if "/" in entry_path else entry_path
+                            )
+                            should_omit = False
+                            for pattern in omit_subdirs:
+                                normalized_pattern = pattern.rstrip("/")
+                                if (fnmatch.fnmatch(entry_path.rstrip("/"), normalized_pattern) or
+                                        fnmatch.fnmatch(entry_name, normalized_pattern)):
+                                    should_omit = True
+                                    break
+                            if not should_omit:
+                                filtered_entries.append(entry)
+                        else:
+                            filtered_entries.append(entry)
+                    matching_entries = filtered_entries
 
-            # Normalize omit_paths by stripping trailing slashes for consistent matching
-            normalized_omit_paths = [p.rstrip("/") for p in omit_paths]
+            # Filter based on exact absolute paths (--omit-path)
+            if normalized_omit_paths:
+                filtered_subdirs = []
+                omitted_paths_count = 0
 
-            # Filter subdirectories
-            for subdir_path in subdirs:
-                normalized_subdir = subdir_path.rstrip("/")
-                if normalized_subdir in normalized_omit_paths:
-                    omitted_paths_count += 1
-                else:
-                    filtered_subdirs.append(subdir_path)
+                for subdir_path in subdirs:
+                    if subdir_path.rstrip("/") in normalized_omit_paths:
+                        omitted_paths_count += 1
+                    else:
+                        filtered_subdirs.append(subdir_path)
 
-            subdirs = filtered_subdirs
+                subdirs = filtered_subdirs
 
-            # Report omitted paths to progress tracker
-            if progress and omitted_paths_count > 0:
-                await progress.increment_skipped(0, omitted_paths_count)
+                if progress and omitted_paths_count > 0:
+                    await progress.increment_skipped(0, omitted_paths_count)
 
-            # Also filter matching_entries to remove paths that match
-            for entry in matching_entries:
-                entry_path = entry.get('path', '')
-                normalized_entry_path = entry_path.rstrip("/")
-
-                # Check if this path should be omitted
-                if normalized_entry_path not in normalized_omit_paths:
-                    filtered_entries.append(entry)
-
-            matching_entries = filtered_entries
-
-        # Output matches immediately if callback provided
-        # NOTE: Entries are already output during enumeration in enumerate_directory_adaptive
-        # This section is kept for backwards compatibility but should not output duplicates
-        # since output_callback is now called during enumeration
-
-        # Update progress tracker for batch mode
-        # In streaming mode, progress is already updated per-page inside enumerate_directory_adaptive
-        # In batch mode, we update once with the total for this directory
-        # We determine the mode by checking if total_entries >= 50000 (streaming threshold)
-        try:
-            total_files = int(aggregates.get("total_files", 0))
-            total_dirs = int(aggregates.get("total_directories", 0))
-            total_entries = total_files + total_dirs
-            used_streaming = total_entries >= 50000 and (collect_results or output_callback is not None)
-        except (ValueError, TypeError):
-            used_streaming = False
-
-        if progress and not used_streaming:
-            # Batch mode: update progress once for this directory
-            # Count ACTUAL entries processed (not recursive aggregates)
-            await progress.update(total_processed, 1, match_count)
-
-        # Recursively process subdirectories concurrently
-        if subdirs and (
-            max_depth is None or max_depth < 0 or _current_depth + 1 < max_depth
-        ):
-            # PHASE 3.2: Adaptive concurrency - process subdirectories in batches
-            # Calculate batch size based on number of subdirectories
-            num_subdirs = len(subdirs)
-            batch_size = self.calculate_adaptive_concurrency(num_subdirs)
-
-            # If limit is set, use smaller batch size for more responsive early exit
-            if progress and progress.limit:
-                batch_size = min(batch_size, 10)
-
-            if verbose and batch_size < self.max_concurrent and num_subdirs > 0:
-                log_stderr("INFO", f"Adaptive concurrency: Processing {num_subdirs} subdirs with batch size {batch_size} (reduced from {self.max_concurrent})")
-
-            # Process subdirectories in batches
-            all_results = []
-
-            # Track progress for large subdirectory sets
-            show_batch_progress = progress and num_subdirs > 10000
-            last_progress_time = time.time()
-            batch_progress_interval = 10.0  # Show progress every 10 seconds
-
-            for i in range(0, len(subdirs), batch_size):
-                # Early exit: Check if limit reached before processing next batch
-                if progress and progress.should_stop():
-                    if verbose:
-                        print(
-                            f"\r[INFO] Early exit: Limit reached, skipping remaining {len(subdirs) - i} subdirectories",
-                            file=sys.stderr,
-                        )
-                    break
-
-                batch = subdirs[i : i + batch_size]
-                tasks = [
-                    self.walk_tree_async(
-                        session,
-                        subdir,
-                        max_depth,
-                        _current_depth + 1,
-                        progress,
-                        file_filter,
-                        owner_stats,
-                        omit_subdirs,
-                        omit_paths,
-                        collect_results,
-                        verbose,
-                        max_entries_per_dir,
-                        time_filter_info,
-                        size_filter_info,
-                        owner_filter_info,
-                        output_callback,
-                    )
-                    for subdir in batch
-                ]
-
-                # Process this batch concurrently
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                all_results.extend(batch_results)
-
-                # Show batch progress for large directories
-                if show_batch_progress:
-                    current_time = time.time()
-                    elapsed_since_last = current_time - last_progress_time
-                    batch_num = (i // batch_size) + 1
-                    total_batches = (num_subdirs + batch_size - 1) // batch_size
-
-                    # Show progress every 100 batches or every 10 seconds
-                    if (
-                        batch_num % 100 == 0
-                        or elapsed_since_last >= batch_progress_interval
-                        or batch_num == total_batches
-                    ):
-                        percent = (i + batch_size) / num_subdirs * 100
-                        subdirs_processed = min(i + batch_size, num_subdirs)
-
-                        # Shorten path for display
-                        display_path = path if len(path) <= 50 else "..." + path[-47:]
-
-                        elapsed_total = current_time - progress.start_time
-                        time_str = format_time(elapsed_total)
-
-                        print(
-                            f"\r[PROGRESS] Scanning subdirs in {display_path}: "
-                            f"{subdirs_processed:,}/{num_subdirs:,} ({percent:.1f}%) | "
-                            f"Run time: {time_str}",
-                            end="",
-                            file=sys.stderr,
-                        )
-
-                        last_progress_time = current_time
-
-            # Clear the batch progress line if we showed it
-            if show_batch_progress:
-                print(file=sys.stderr)  # Newline to finish the progress line
-
-            # Collect results from subdirectories (only if collect_results=True)
-            if collect_results:
-                # Optimize: At the top level, use efficient concatenation for large result sets
-                # At deeper levels, use simple extend to avoid memory overhead
-                if _current_depth == 0 and len(all_results) > 1000:
-                    if verbose:
-                        print(
-                            f"\r[INFO] Collecting results from {len(all_results)} subdirectory batches...",
-                            file=sys.stderr,
-                        )
-
-                    # Use itertools.chain for efficient concatenation
-                    import itertools
-
-                    result_lists = [
-                        result for result in all_results if isinstance(result, list)
+                if collect_results:
+                    matching_entries = [
+                        e for e in matching_entries
+                        if e.get('path', '').rstrip("/") not in normalized_omit_paths
                     ]
-                    if result_lists:
-                        matching_entries.extend(
-                            itertools.chain.from_iterable(result_lists)
-                        )
 
+            # Update progress for batch mode
+            try:
+                tf = int(aggregates.get("total_files", 0))
+                td = int(aggregates.get("total_directories", 0))
+                te = tf + td
+                used_streaming = te >= 50000 and (collect_results or output_callback is not None)
+            except (ValueError, TypeError):
+                used_streaming = False
+
+            if progress and not used_streaming:
+                await progress.update(total_processed, 1, match_count)
+
+            # Collect results if needed
+            if collect_results and matching_entries:
+                async with results_lock:
+                    collected_results.extend(matching_entries)
+
+            # Enqueue child subdirectories (or process inline if queue is full)
+            if subdirs and (max_depth is None or max_depth < 0 or current_depth + 1 < max_depth):
+                for subdir in subdirs:
+                    if progress and progress.should_stop():
+                        break
+                    try:
+                        queue.put_nowait((subdir, current_depth + 1))
+                    except asyncio.QueueFull:
+                        # Queue is full -- process inline to avoid deadlock.
+                        # Recursion depth is bounded by filesystem depth (typically 10-30).
+                        await _process_directory(subdir, current_depth + 1)
+
+        async def _worker(worker_id: int):
+            """Worker coroutine: pull directories from queue and process them."""
+            while True:
+                dir_path, depth = await queue.get()
+                try:
+                    await _process_directory(dir_path, depth)
+                except Exception as e:
                     if verbose:
-                        print(
-                            f"\r[INFO] Collection complete, {len(matching_entries)} total matches          ",
-                            file=sys.stderr,
-                        )
-                else:
-                    # For smaller result sets or nested levels, simple extend is fine
-                    for result in all_results:
-                        if isinstance(result, list):
-                            matching_entries.extend(result)
+                        log_stderr("WARN", f"Error processing {dir_path}: {e}")
+                finally:
+                    queue.task_done()
 
-        return matching_entries
+        # Launch worker pool and wait for completion
+        workers = [asyncio.create_task(_worker(i)) for i in range(num_workers)]
+
+        await queue.join()
+
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        return collected_results if collected_results is not None else []
 
     async def resolve_identity(
         self, session: aiohttp.ClientSession, identifier: str, id_type: str = "auth_id"

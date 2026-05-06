@@ -5479,14 +5479,19 @@ async def main_async(args):
     # Flush any remaining batched output
     if batched_handler:
         await batched_handler.flush()
+        if batched_handler.duplicates_skipped > 0:
+            log_stderr("WARN", f"Skipped {batched_handler.duplicates_skipped:,} duplicate entries during output", newline_before=True)
 
     # Close streaming file handler and report results
     if streaming_file_handler:
         await streaming_file_handler.close()
         rows_written = streaming_file_handler.get_rows_written()
+        dupes_skipped = streaming_file_handler.get_duplicates_skipped()
         output_path = args.json_out if args.json_out else args.csv_out
         if args.verbose or args.progress:
             log_stderr("INFO", f"Streaming complete: wrote {rows_written:,} rows to {output_path}", newline_before=True)
+        if dupes_skipped > 0:
+            log_stderr("WARN", f"Skipped {dupes_skipped:,} duplicate entries during output", newline_before=True)
         # Save identity cache and exit - no further processing needed
         save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
         return

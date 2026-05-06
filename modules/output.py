@@ -158,6 +158,7 @@ class BatchedOutputHandler:
         self.dont_resolve_ids = dont_resolve_ids
         self.field_specs = field_specs
         self.unix_time = unix_time
+        self.duplicates_skipped = 0
 
     async def add_entry(self, entry: dict):
         """Add entry to batch and flush if batch is full."""
@@ -618,6 +619,15 @@ class StreamingFileOutputHandler:
         self.csv_writer = None
         self.header_written = False
         self.rows_written = 0
+        self.duplicates_skipped = 0
+
+    async def add_entry(self, entry: dict):
+        """Add entry to batch and flush if batch is full."""
+        async with self.lock:
+            self.batch.append(entry)
+
+            if len(self.batch) >= self.batch_size:
+                await self._flush_batch()
 
     def _get_fieldnames(self) -> list:
         """Determine CSV fieldnames based on configuration."""
@@ -686,14 +696,6 @@ class StreamingFileOutputHandler:
             )
             self.csv_writer.writeheader()
             self.header_written = True
-
-    async def add_entry(self, entry: dict):
-        """Add entry to batch and flush if batch is full."""
-        async with self.lock:
-            self.batch.append(entry)
-
-            if len(self.batch) >= self.batch_size:
-                await self._flush_batch()
 
     async def _flush_batch(self):
         """Resolve identities for current batch and write to file."""
@@ -843,6 +845,10 @@ class StreamingFileOutputHandler:
     def get_rows_written(self) -> int:
         """Return the number of rows written."""
         return self.rows_written
+
+    def get_duplicates_skipped(self) -> int:
+        """Return the number of duplicate entries skipped."""
+        return self.duplicates_skipped
 
 
 class Profiler:
