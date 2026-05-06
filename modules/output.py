@@ -159,17 +159,10 @@ class BatchedOutputHandler:
         self.field_specs = field_specs
         self.unix_time = unix_time
         self.duplicates_skipped = 0
-        self._seen_paths: set = set()
 
     async def add_entry(self, entry: dict):
-        """Add entry to batch and flush if batch is full. Skips duplicates."""
+        """Add entry to batch and flush if batch is full."""
         async with self.lock:
-            path = entry.get("path")
-            if path in self._seen_paths:
-                self.duplicates_skipped += 1
-                return
-            self._seen_paths.add(path)
-
             self.batch.append(entry)
 
             if len(self.batch) >= self.batch_size:
@@ -627,17 +620,10 @@ class StreamingFileOutputHandler:
         self.header_written = False
         self.rows_written = 0
         self.duplicates_skipped = 0
-        self._seen_paths: set = set()
 
     async def add_entry(self, entry: dict):
-        """Add entry to batch and flush if batch is full. Skips duplicates."""
+        """Add entry to batch and flush if batch is full."""
         async with self.lock:
-            path = entry.get("path")
-            if path in self._seen_paths:
-                self.duplicates_skipped += 1
-                return
-            self._seen_paths.add(path)
-
             self.batch.append(entry)
 
             if len(self.batch) >= self.batch_size:
