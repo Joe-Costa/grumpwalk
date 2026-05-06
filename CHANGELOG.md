@@ -5,6 +5,15 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-05-06
+
+### Changed
+
+- **Bounded-memory tree walk** - Rewrote the directory tree walk to use constant memory regardless of filesystem size. Previously, crawling very large filesystems (100M+ directories) could exhaust available RAM and be killed by the OS. The new implementation keeps memory usage flat even on billion-file filesystems.
+- **Improved output memory efficiency** - Streaming CSV and JSON output no longer tracks all previously seen paths in memory, eliminating a scaling bottleneck on very large result sets.
+
+---
+
 ## [2.7.0] - 2026-04-22
 
 ### Fixed
