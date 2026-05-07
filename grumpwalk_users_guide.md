@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.8.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.9.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -739,6 +739,68 @@ Use `--source-acl` and `--acl-target` to clone an entire ACL (all ACEs, owner, a
   --propagate-acls \
   --older-than 30 --type file \
   --progress
+```
+
+### How do I set POSIX permissions (like chmod)?
+
+Use `--set-mode` with a standard octal mode to replace the ACL with clean POSIX-style permissions using the `OWNER@`, `GROUP@`, and `EVERYONE@` placeholders. This is the equivalent of running `chmod` on the cluster.
+
+**Set mode on a single file or directory:**
+```bash
+./grumpwalk.py --host cluster --set-mode 755 --path /data/project
+```
+
+**Recursive chmod (apply to all children):**
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 755 --path /data/project \
+  --propagate --progress
+```
+
+**Set mode with setgid on a shared directory:**
+
+Setgid (`2xxx`) ensures new files inherit the parent directory's group. When propagating, setgid is applied to directories only -- files receive the base permissions without the setgid bit.
+
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 2775 --path /data/shared \
+  --propagate --progress
+```
+
+**Set sticky bit (restricted delete) on a shared directory:**
+
+The sticky bit (`1xxx`) prevents users from deleting files they don't own, even if they have write access to the directory. Common on shared temp or drop-box directories.
+
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 1777 --path /data/dropbox
+```
+
+**Set mode only on files (leave directories unchanged):**
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 644 --path /data/project \
+  --propagate --type file --progress
+```
+
+**Set permissions and change ownership at the same time:**
+
+Use `--new-owner` and `--new-group` to specify explicit identities. This replaces the `OWNER@`/`GROUP@` placeholders in the ACL with the resolved identity and changes the file's actual ownership -- combining `chmod` and `chown` in one pass.
+
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 2775 --path /data/shared \
+  --new-owner uid:1001 --new-group gid:5000 \
+  --propagate --progress
+```
+
+`--new-owner` and `--new-group` accept the same identity formats as other grumpwalk flags: `uid:N`, `gid:N`, `username`, `DOMAIN\user`, or a SID.
+
+**Preview changes with dry-run:**
+```bash
+./grumpwalk.py --host cluster \
+  --set-mode 750 --path /data/sensitive \
+  --propagate --dry-run
 ```
 
 ### How do I keep two users' permissions in sync?
@@ -1904,6 +1966,9 @@ done
 | ACL audit | `--acl-report --acl-resolve-names` |
 | Add permission | `--add-ace 'Allow:fd:Group:Modify' --propagate-changes` |
 | Remove permission | `--remove-ace 'Allow:Everyone' --propagate-changes` |
+| Set POSIX mode | `--set-mode 755 --path /data` |
+| Recursive chmod | `--set-mode 755 --path /data --propagate` |
+| chmod + chown | `--set-mode 755 --path /data --new-owner uid:1001 --new-group gid:5000 --propagate` |
 | Change owner | `--change-owner 'old:new' --propagate-changes` |
 | Change group | `--change-group 'old:new' --propagate-changes` |
 | Bulk owner migration | `--change-owners-file migration.csv --propagate-changes` |

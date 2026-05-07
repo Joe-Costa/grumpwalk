@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.8.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 2.9.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -197,6 +197,12 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 # Copy owner and group only (no ACL changes)
 ./grumpwalk.py --host cluster.example.com --source-acl /source/dir --acl-target /target/dir --copy-owner --copy-group --owner-group-only --propagate-acls
 
+# Set POSIX mode (like chmod)
+./grumpwalk.py --host cluster.example.com --set-mode 755 --path /data/project
+
+# Recursive chmod with ownership change
+./grumpwalk.py --host cluster.example.com --set-mode 2775 --path /data/shared --new-owner uid:1001 --new-group gid:5000 --propagate --progress
+
 # Find similar files
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
 
@@ -345,11 +351,16 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - These rights map directly to the 14 NTFS rights in an ACE
 - Refer to [The nfs4_acl man page](https://www.man7.org/linux//man-pages/man5/nfs4_acl.5.html) for details
 
+### POSIX Mode Options
+- `--set-mode MODE` - Set POSIX permissions using chmod-style octal (e.g., `755`, `2770`, `0644`). Replaces the ACL with `OWNER@`/`GROUP@`/`EVERYONE@` entries. Use `--propagate` for recursive application. Setgid (`2xxx`) is applied to directories only.
+- `--new-owner IDENTITY` - Set file owner (use with `--set-mode`). Accepts `uid:N`, username, `DOMAIN\user`, or SID. Uses the specified identity as the owner ACL trustee and changes file ownership.
+- `--new-group IDENTITY` - Set file group (use with `--set-mode`). Accepts `gid:N`, groupname, `DOMAIN\group`, or SID. Uses the specified identity as the group ACL trustee and changes file group ownership.
+
 ### ACL Management Options
 - `--source-acl PATH` - Source ACL from cluster path
 - `--source-acl-file FILE` - Source ACL from local JSON file
 - `--acl-target PATH` - Target object/directory path
-- `--propagate-acls` - Apply to all child objects recursively
+- `--propagate-acls`, `--propagate` - Apply to all child objects recursively
 - `--continue-on-error` - Continue on errors without prompting
 - `--copy-owner` - Copy owner from source
 - `--copy-group` - Copy group from source
