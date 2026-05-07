@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.9.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 2.9.1** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -776,12 +776,23 @@ The sticky bit (`1xxx`) prevents users from deleting files they don't own, even 
   --set-mode 1777 --path /data/dropbox
 ```
 
-**Set mode only on files (leave directories unchanged):**
+**Controlling scope with --type:**
+
+Use `--type` to restrict which objects `--set-mode` applies to. When `--type file` is specified, the target directory itself is left unchanged and only files inside the tree are modified. Likewise, `--type directory` applies only to directories.
+
 ```bash
+# Set 644 on files only -- the target directory and subdirectories are untouched
 ./grumpwalk.py --host cluster \
   --set-mode 644 --path /data/project \
   --propagate --type file --progress
+
+# Set 755 on directories only -- files are untouched
+./grumpwalk.py --host cluster \
+  --set-mode 755 --path /data/project \
+  --propagate --type directory --progress
 ```
+
+This is useful when files and directories need different permissions. Run `--set-mode` twice with different `--type` filters to apply 755 to directories and 644 to files, for example.
 
 **Set permissions and change ownership at the same time:**
 

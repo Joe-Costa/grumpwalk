@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"
 
 import argparse
 import asyncio
@@ -3790,33 +3790,40 @@ async def main_async(args):
                     log_stderr("DRY RUN", "SET_GID would be applied to directories only")
                 return
 
-            # Apply to target path (use no-setgid variant for non-directories)
-            target_acl = acl_data
-            if has_setgid:
-                attr = await client.get_file_attr(session, args.path)
-                if attr and attr.get('type') != 'FS_FILE_TYPE_DIRECTORY':
+            # Apply to target path (skip if it doesn't match the filter)
+            attr = await client.get_file_attr(session, args.path)
+            target_entry = attr if attr else {}
+            skip_target = file_filter and not file_filter(target_entry)
+
+            if not skip_target:
+                # Use no-setgid variant for non-directories
+                target_acl = acl_data
+                if has_setgid and target_entry.get('type') != 'FS_FILE_TYPE_DIRECTORY':
                     target_acl = acl_data_no_setgid
 
-            success, error_msg = await client.set_file_acl(
-                session, args.path, target_acl, mark_inherited=False
-            )
-            if not success:
-                log_stderr("ERROR", f"Failed to set mode on {args.path}: {error_msg}")
-                sys.exit(1)
-
-            # Change owner/group if requested
-            if resolved_owner_auth_id or resolved_group_auth_id:
-                ok, err = await client.set_file_owner_group(
-                    session, args.path,
-                    owner=resolved_owner_auth_id,
-                    group=resolved_group_auth_id,
+                success, error_msg = await client.set_file_acl(
+                    session, args.path, target_acl, mark_inherited=False
                 )
-                if not ok:
-                    log_stderr("ERROR", f"Failed to set owner/group on {args.path}: {err}")
+                if not success:
+                    log_stderr("ERROR", f"Failed to set mode on {args.path}: {error_msg}")
                     sys.exit(1)
 
-            if args.progress or args.verbose:
-                log_stderr("SET-MODE", f"Applied mode {args.set_mode} to {args.path}")
+                # Change owner/group if requested
+                if resolved_owner_auth_id or resolved_group_auth_id:
+                    ok, err = await client.set_file_owner_group(
+                        session, args.path,
+                        owner=resolved_owner_auth_id,
+                        group=resolved_group_auth_id,
+                    )
+                    if not ok:
+                        log_stderr("ERROR", f"Failed to set owner/group on {args.path}: {err}")
+                        sys.exit(1)
+
+                if args.progress or args.verbose:
+                    log_stderr("SET-MODE", f"Applied mode {args.set_mode} to {args.path}")
+            else:
+                if args.verbose:
+                    log_stderr("INFO", f"Skipped target path (does not match filter): {args.path}")
 
             # Propagate to children if requested
             if args.propagate_acls:
