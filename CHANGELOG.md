@@ -5,7 +5,7 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.9.0] - 2026-05-06
+## [2.9.0] - 2026-05-07
 
 ### Added
 
@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--new-owner IDENTITY`** - Set file owner when used with `--set-mode`. Accepts `uid:N`, username, `DOMAIN\user`, or SID. Replaces the `OWNER@` placeholder in the ACL with the specified identity and changes file ownership.
 - **`--new-group IDENTITY`** - Set file group when used with `--set-mode`. Accepts `gid:N`, groupname, `DOMAIN\group`, or SID. Replaces the `GROUP@` placeholder in the ACL with the specified identity and changes file group ownership.
 - **`--propagate`** - Short alias for `--propagate-acls`. Both flags are equivalent.
+
+---
+
+## [2.8.0] - 2026-05-06
 
 ### Changed
 
