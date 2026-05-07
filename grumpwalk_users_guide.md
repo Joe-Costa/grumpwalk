@@ -743,7 +743,7 @@ Use `--source-acl` and `--acl-target` to clone an entire ACL (all ACEs, owner, a
 
 ### How do I set POSIX permissions (like chmod)?
 
-Use `--set-mode` with a standard octal mode to replace the ACL with clean POSIX-style permissions using the `OWNER@`, `GROUP@`, and `EVERYONE@` placeholders. This is the equivalent of running `chmod` on the cluster.
+Use `--set-mode` with a standard octal mode to replace the ACL with clean POSIX-style permissions using the `OWNER@`, `GROUP@`, and `EVERYONE@` placeholders. This is the equivalent of running `chmod` via an NFS client.
 
 **Set mode on a single file or directory:**
 ```bash
