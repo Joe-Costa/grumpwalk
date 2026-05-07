@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 import argparse
 import asyncio
@@ -570,6 +570,103 @@ def analyze_acl_structure(qacl_data: Dict) -> Dict:
         'trustees': sorted(list(trustees)),
         'fingerprint': create_acl_fingerprint(qacl_data)
     }
+
+
+# ============================================================================
+# POSIX MODE TO ACL CONVERSION
+# ============================================================================
+
+# Rights granted by each POSIX permission bit, derived from Qumulo's
+# native POSIX-mode-to-ACL mapping (verified against cluster reference files).
+POSIX_READ_RIGHTS = ['READ', 'READ_EA', 'READ_ATTR', 'READ_ACL', 'SYNCHRONIZE']
+POSIX_WRITE_RIGHTS = ['WRITE_EA', 'WRITE_ATTR', 'MODIFY', 'EXTEND', 'DELETE_CHILD']
+POSIX_EXECUTE_RIGHTS = ['EXECUTE']
+
+
+def mode_to_acl(mode_str: str, owner_auth_id: str = None, group_auth_id: str = None) -> tuple:
+    """
+    Convert a chmod-style octal mode string to a Qumulo ACL dict.
+
+    Accepts 1-4 octal digits. A leading 0 is optional (0755 == 755).
+    The leading digit encodes special bits (setuid=4, setgid=2, sticky=1).
+
+    Args:
+        mode_str: Octal mode string, e.g. '755', '2770', '0644'
+        owner_auth_id: If provided, use this auth_id for the owner ACE
+                       instead of the OWNER@ (File Owner) placeholder.
+        group_auth_id: If provided, use this auth_id for the group ACE
+                       instead of the GROUP@ (File Group Owner) placeholder.
+
+    Returns:
+        Tuple of (acl_dict, has_setgid: bool).
+        has_setgid is True when the mode includes setgid (2xxx), so the
+        caller can apply it only to directories during propagation.
+
+    Raises:
+        ValueError: If the mode string is not valid octal (digits 0-7).
+    """
+    # Strip leading 0s for parsing, but keep at least one digit
+    stripped = mode_str.lstrip('0') or '0'
+
+    # Validate: all digits must be 0-7
+    if not all(c in '01234567' for c in stripped):
+        raise ValueError(f"Invalid octal mode: {mode_str}")
+
+    # Pad to 4 digits: e.g. '755' -> '0755', '2770' -> '2770'
+    padded = stripped.zfill(4)
+    if len(padded) > 4:
+        raise ValueError(f"Mode too long: {mode_str}")
+
+    special = int(padded[0])
+    owner = int(padded[1])
+    group = int(padded[2])
+    others = int(padded[3])
+
+    def bits_to_rights(bits):
+        rights = []
+        if bits & 4:
+            rights.extend(POSIX_READ_RIGHTS)
+        if bits & 2:
+            rights.extend(POSIX_WRITE_RIGHTS)
+        if bits & 1:
+            rights.extend(POSIX_EXECUTE_RIGHTS)
+        return rights
+
+    # Trustees: use explicit auth_ids if provided, otherwise POSIX placeholders
+    trustee_owner = {'auth_id': owner_auth_id} if owner_auth_id else {'auth_id': '18446744065119617025'}
+    trustee_group = {'auth_id': group_auth_id} if group_auth_id else {'auth_id': '18446744065119617026'}
+    trustee_everyone = {'auth_id': '8589934592'}
+
+    # Build ACEs -- only emit an ACE if the triplet is non-zero
+    aces = []
+    trustees = [(trustee_owner, owner), (trustee_group, group), (trustee_everyone, others)]
+    for trustee, bits in trustees:
+        if bits:
+            aces.append({
+                'type': 'ALLOWED',
+                'flags': [],
+                'trustee': trustee,
+                'rights': bits_to_rights(bits),
+            })
+
+    # Special permission bits
+    posix_special = []
+    has_setgid = False
+    if special & 4:
+        posix_special.append('SET_UID')
+    if special & 2:
+        posix_special.append('SET_GID')
+        has_setgid = True
+    if special & 1:
+        posix_special.append('STICKY_BIT')
+
+    acl_data = {
+        'control': ['PRESENT'],
+        'posix_special_permissions': posix_special,
+        'aces': aces,
+    }
+
+    return acl_data, has_setgid
 
 
 # ============================================================================
@@ -3608,8 +3705,202 @@ async def main_async(args):
                     file=sys.stderr,
                 )
 
+    # --new-owner / --new-group require --set-mode
+    if (args.new_owner or args.new_group) and not args.set_mode:
+        log_stderr("ERROR", "--new-owner and --new-group require --set-mode")
+        sys.exit(1)
+
+    # --set-mode validation
+    if args.set_mode:
+        if not args.path:
+            log_stderr("ERROR", "--set-mode requires --path")
+            sys.exit(1)
+        if args.source_acl or args.source_acl_file:
+            log_stderr("ERROR", "--set-mode cannot be combined with --source-acl or --source-acl-file")
+            sys.exit(1)
+        if args.owner_group_only:
+            log_stderr("ERROR", "--set-mode cannot be combined with --owner-group-only")
+            sys.exit(1)
+        # Validate octal format
+        try:
+            mode_to_acl(args.set_mode)
+        except ValueError as e:
+            log_stderr("ERROR", str(e))
+            sys.exit(1)
+
+    # POSIX Mode Setting
+    if args.set_mode:
+        import copy as _copy
+
+        # Resolve --new-owner / --new-group if provided
+        resolved_owner_auth_id = None
+        resolved_group_auth_id = None
+
+        if args.new_owner or args.new_group:
+            async with client.create_session() as resolve_session:
+                if args.new_owner:
+                    trustee_spec = parse_trustee(args.new_owner)
+                    payload = trustee_spec['payload']
+                    id_type = trustee_spec['type']
+                    identifier = payload.get(id_type) if id_type in ('uid', 'gid', 'sid', 'auth_id') else payload.get('name')
+                    result = await client.resolve_identity(resolve_session, identifier, id_type)
+                    if result and result.get('auth_id'):
+                        resolved_owner_auth_id = str(result['auth_id'])
+                        if args.verbose:
+                            log_stderr("INFO", f"Resolved owner '{args.new_owner}' -> auth_id {resolved_owner_auth_id}")
+                    else:
+                        log_stderr("ERROR", f"Could not resolve owner '{args.new_owner}'")
+                        sys.exit(1)
+
+                if args.new_group:
+                    trustee_spec = parse_trustee(args.new_group)
+                    payload = trustee_spec['payload']
+                    id_type = trustee_spec['type']
+                    identifier = payload.get(id_type) if id_type in ('uid', 'gid', 'sid', 'auth_id') else payload.get('name')
+                    result = await client.resolve_identity(resolve_session, identifier, id_type)
+                    if result and result.get('auth_id'):
+                        resolved_group_auth_id = str(result['auth_id'])
+                        if args.verbose:
+                            log_stderr("INFO", f"Resolved group '{args.new_group}' -> auth_id {resolved_group_auth_id}")
+                    else:
+                        log_stderr("ERROR", f"Could not resolve group '{args.new_group}'")
+                        sys.exit(1)
+
+        acl_data, has_setgid = mode_to_acl(args.set_mode, resolved_owner_auth_id, resolved_group_auth_id)
+
+        # Build a version without SET_GID for files when propagating with setgid
+        acl_data_no_setgid = None
+        if has_setgid:
+            acl_data_no_setgid = _copy.deepcopy(acl_data)
+            acl_data_no_setgid['posix_special_permissions'] = [
+                p for p in acl_data_no_setgid['posix_special_permissions'] if p != 'SET_GID'
+            ]
+
+        file_filter = create_file_filter(args, None)
+
+        if args.progress or args.verbose:
+            log_stderr("INFO", f"Setting POSIX mode {args.set_mode} on {args.path}")
+
+        async with client.create_session() as session:
+            if args.dry_run:
+                log_stderr("DRY RUN", f"Would set mode {args.set_mode} on: {args.path}")
+                if args.propagate_acls:
+                    log_stderr("DRY RUN", "Would propagate to all matching children")
+                if has_setgid:
+                    log_stderr("DRY RUN", "SET_GID would be applied to directories only")
+                return
+
+            # Apply to target path (use no-setgid variant for non-directories)
+            target_acl = acl_data
+            if has_setgid:
+                attr = await client.get_file_attr(session, args.path)
+                if attr and attr.get('type') != 'FS_FILE_TYPE_DIRECTORY':
+                    target_acl = acl_data_no_setgid
+
+            success, error_msg = await client.set_file_acl(
+                session, args.path, target_acl, mark_inherited=False
+            )
+            if not success:
+                log_stderr("ERROR", f"Failed to set mode on {args.path}: {error_msg}")
+                sys.exit(1)
+
+            # Change owner/group if requested
+            if resolved_owner_auth_id or resolved_group_auth_id:
+                ok, err = await client.set_file_owner_group(
+                    session, args.path,
+                    owner=resolved_owner_auth_id,
+                    group=resolved_group_auth_id,
+                )
+                if not ok:
+                    log_stderr("ERROR", f"Failed to set owner/group on {args.path}: {err}")
+                    sys.exit(1)
+
+            if args.progress or args.verbose:
+                log_stderr("SET-MODE", f"Applied mode {args.set_mode} to {args.path}")
+
+            # Propagate to children if requested
+            if args.propagate_acls:
+                acl_concurrency = args.acl_concurrency if hasattr(args, 'acl_concurrency') else 100
+
+                progress_tracker = ProgressTracker(verbose=True) if args.progress else None
+
+                # Producer-consumer queue for concurrent ACL operations
+                acl_queue = asyncio.Queue(maxsize=10_000)
+                stats = {'changed': 0, 'failed': 0, 'skipped': 0}
+                stats_lock = asyncio.Lock()
+
+                async def acl_worker():
+                    while True:
+                        item = await acl_queue.get()
+                        try:
+                            child_path, child_type = item
+                            # Choose ACL variant: directories get setgid, files don't
+                            if has_setgid and child_type != 'FS_FILE_TYPE_DIRECTORY':
+                                child_acl = acl_data_no_setgid
+                            else:
+                                child_acl = acl_data
+
+                            ok, err = await client.set_file_acl(
+                                session, child_path, child_acl, mark_inherited=True
+                            )
+                            if ok and (resolved_owner_auth_id or resolved_group_auth_id):
+                                ok, err = await client.set_file_owner_group(
+                                    session, child_path,
+                                    owner=resolved_owner_auth_id,
+                                    group=resolved_group_auth_id,
+                                )
+                            async with stats_lock:
+                                if ok:
+                                    stats['changed'] += 1
+                                else:
+                                    stats['failed'] += 1
+                                    if args.verbose:
+                                        log_stderr("ERROR", f"Failed: {child_path}: {err}")
+                        except Exception as e:
+                            async with stats_lock:
+                                stats['failed'] += 1
+                            if args.verbose:
+                                log_stderr("ERROR", f"Error: {child_path}: {e}")
+                        finally:
+                            acl_queue.task_done()
+
+                workers = [asyncio.create_task(acl_worker()) for _ in range(acl_concurrency)]
+
+                async def output_callback(entry):
+                    child_path = entry.get('path')
+                    child_type = entry.get('type')
+                    await acl_queue.put((child_path, child_type))
+
+                # Walk tree from target path
+                await client.walk_tree_async(
+                    session,
+                    args.path,
+                    max_depth=args.max_depth,
+                    progress=progress_tracker,
+                    file_filter=file_filter,
+                    collect_results=False,
+                    verbose=args.verbose,
+                    output_callback=output_callback,
+                )
+
+                await acl_queue.join()
+
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+
+                if progress_tracker:
+                    progress_tracker.final_report()
+
+                log_stderr("INFO",
+                    f"Set-mode propagation complete: {stats['changed']:,} changed, "
+                    f"{stats['failed']:,} failed",
+                    newline_before=True)
+
+        return
+
     # ACL Cloning Mode
-    if args.source_acl or args.source_acl_file or args.acl_target:
+    if args.source_acl or args.source_acl_file or (args.acl_target and not args.set_mode):
         # Validate: need a source and a target
         if not ((args.source_acl or args.source_acl_file) and args.acl_target):
             log_stderr("ERROR", "Both a source (--source-acl or --source-acl-file) and --acl-target must be specified")
@@ -6774,6 +7065,29 @@ Examples:
         'Copy ACLs, owner, and group between objects')
 
     acl_management.add_argument(
+        "--set-mode",
+        help="Set POSIX permissions using chmod-style octal mode (e.g., 755, 2770, 0644). "
+             "Replaces the ACL with OWNER@/GROUP@/EVERYONE@ entries. "
+             "Use with --path. Supports --propagate-acls for recursive application. "
+             "Setgid (2xxx) is applied to directories only.",
+        metavar="MODE"
+    )
+
+    acl_management.add_argument(
+        "--new-owner",
+        help="Set file owner (use with --set-mode). Accepts uid:N, username, DOMAIN\\\\user, or SID. "
+             "Replaces the OWNER@ placeholder in the ACL with this identity and changes file ownership.",
+        metavar="IDENTITY"
+    )
+
+    acl_management.add_argument(
+        "--new-group",
+        help="Set file group (use with --set-mode). Accepts gid:N, groupname, DOMAIN\\\\group, or SID. "
+             "Replaces the GROUP@ placeholder in the ACL with this identity and changes file group.",
+        metavar="IDENTITY"
+    )
+
+    acl_management.add_argument(
         "--source-acl",
         help="Source object path on cluster",
         metavar="PATH"
@@ -6793,6 +7107,7 @@ Examples:
 
     acl_management.add_argument(
         "--propagate-acls",
+        "--propagate",
         action="store_true",
         help="Apply to all child objects recursively"
     )
