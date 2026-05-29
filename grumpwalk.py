@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "2.9.1"
+__version__ = "3.0.0"
 
 import argparse
 import asyncio
@@ -1108,11 +1108,16 @@ def normalize_acl_for_put(acl: dict) -> dict:
     else:
         inner = result
 
-    # Clean each ACE - remove internal marker fields but keep trustee format
+    # Clean each ACE - remove internal marker fields and normalize trustees
     for ace in inner.get('aces', []):
         # Remove internal marker fields
         ace.pop('_needs_resolution', None)
         ace.pop('trustee_details', None)
+
+        # v2 API requires trustee as object, not string
+        trustee = ace.get('trustee')
+        if isinstance(trustee, str):
+            ace['trustee'] = {'auth_id': trustee}
 
     # Remove 'generated' field if present (read-only field from GET response)
     result.pop('generated', None)
@@ -1187,6 +1192,52 @@ def break_acl_inheritance(acl: dict) -> dict:
     inner['control'] = list(control)
 
     return result
+
+
+def strip_inherited_aces(acl: dict) -> Tuple[dict, int]:
+    """
+    Remove all inherited ACEs and block future inheritance.
+
+    Equivalent to Windows "Disable Inheritance" > "Remove inherited entries"
+    or icacls /inheritance:r.
+
+    This:
+    1. Removes all ACEs with 'INHERITED' flag
+    2. Adds 'PROTECTED' to control flags (blocks parent inheritance)
+    3. Removes 'AUTO_INHERIT' from control flags
+    4. Keeps 'PRESENT' in control flags
+
+    Args:
+        acl: ACL dict (may have nested 'acl' structure)
+
+    Returns:
+        Tuple of (modified ACL dict, count of removed ACEs)
+    """
+    import copy
+    result = copy.deepcopy(acl)
+
+    # Handle nested structure
+    if 'acl' in result and 'aces' not in result:
+        inner = result['acl']
+    else:
+        inner = result
+
+    original_aces = inner.get('aces', [])
+    explicit_aces = [
+        ace for ace in original_aces
+        if 'INHERITED' not in ace.get('flags', [])
+    ]
+    removed_count = len(original_aces) - len(explicit_aces)
+    inner['aces'] = explicit_aces
+
+    # Update control flags
+    control = set(inner.get('control', []))
+    control.add('PRESENT')
+    control.add('PROTECTED')
+    control.discard('AUTO_INHERIT')
+    inner['control'] = list(control)
+
+    return result, removed_count
 
 
 def needs_inheritance_break(acl: dict, patterns: List[dict]) -> bool:
@@ -3728,6 +3779,21 @@ async def main_async(args):
             log_stderr("ERROR", str(e))
             sys.exit(1)
 
+    # --disable-inheritance validation
+    if args.disable_inheritance:
+        if not args.path:
+            log_stderr("ERROR", "--disable-inheritance requires --path")
+            sys.exit(1)
+        if args.set_mode:
+            log_stderr("ERROR", "--disable-inheritance cannot be combined with --set-mode")
+            sys.exit(1)
+        if args.source_acl or args.source_acl_file:
+            log_stderr("ERROR", "--disable-inheritance cannot be combined with --source-acl or --source-acl-file")
+            sys.exit(1)
+    if args.remove_inherited and not args.disable_inheritance:
+        log_stderr("ERROR", "--remove-inherited requires --disable-inheritance")
+        sys.exit(1)
+
     # POSIX Mode Setting
     if args.set_mode:
         import copy as _copy
@@ -3902,6 +3968,205 @@ async def main_async(args):
                 log_stderr("INFO",
                     f"Set-mode propagation complete: {stats['changed']:,} changed, "
                     f"{stats['failed']:,} failed",
+                    newline_before=True)
+
+        return
+
+    # Disable Inheritance Mode
+    if args.disable_inheritance:
+        mode_label = "remove" if args.remove_inherited else "convert"
+        icacls_equiv = "/inheritance:r" if args.remove_inherited else "/inheritance:d"
+
+        file_filter = create_file_filter(args, None)
+
+        if args.progress or args.verbose:
+            log_stderr("INFO",
+                f"Disabling inheritance on {args.path} "
+                f"(mode: {mode_label}, equivalent to icacls {icacls_equiv})")
+
+        async with client.create_session() as session:
+            # Get current ACL for the target path
+            current_acl = await client.get_file_acl(session, args.path)
+            if not current_acl:
+                log_stderr("ERROR", f"Could not read ACL for {args.path}")
+                sys.exit(1)
+
+            # Handle nested structure for counting
+            if 'acl' in current_acl and 'aces' not in current_acl:
+                current_aces = current_acl['acl'].get('aces', [])
+            else:
+                current_aces = current_acl.get('aces', [])
+
+            inherited_count = sum(
+                1 for ace in current_aces
+                if 'INHERITED' in ace.get('flags', [])
+            )
+            explicit_count = len(current_aces) - inherited_count
+
+            if args.verbose:
+                log_stderr("INFO",
+                    f"Current ACL has {len(current_aces)} ACEs "
+                    f"({inherited_count} inherited, {explicit_count} explicit)")
+
+            if inherited_count == 0:
+                log_stderr("INFO", f"No inherited ACEs found on {args.path} - nothing to do")
+                if not args.propagate_acls:
+                    return
+
+            if args.remove_inherited and inherited_count > 0 and explicit_count == 0:
+                log_stderr("WARNING",
+                    f"All {inherited_count} ACEs on {args.path} are inherited. "
+                    "Removing them will leave the object with NO access control entries.")
+
+            if args.dry_run:
+                if inherited_count > 0:
+                    if args.remove_inherited:
+                        log_stderr("DRY RUN",
+                            f"Would remove {inherited_count} inherited ACEs from {args.path} "
+                            f"({explicit_count} explicit ACEs would remain)")
+                    else:
+                        log_stderr("DRY RUN",
+                            f"Would convert {inherited_count} inherited ACEs to explicit on {args.path}")
+                if args.propagate_acls:
+                    log_stderr("DRY RUN", "Would apply to all matching children recursively")
+                return
+
+            # Apply to target path
+            if inherited_count > 0:
+                if args.remove_inherited:
+                    modified_acl, removed = strip_inherited_aces(current_acl)
+                    action_msg = f"Removed {removed} inherited ACEs from"
+                else:
+                    modified_acl = break_acl_inheritance(current_acl)
+                    action_msg = f"Converted {inherited_count} inherited ACEs to explicit on"
+
+                normalized = normalize_acl_for_put(modified_acl)
+                success, error_msg = await client.set_file_acl(
+                    session, args.path, normalized, mark_inherited=False
+                )
+                if not success:
+                    log_stderr("ERROR", f"Failed to set ACL on {args.path}: {error_msg}")
+                    sys.exit(1)
+
+                if args.progress or args.verbose:
+                    log_stderr("INHERITANCE", f"{action_msg} {args.path}")
+            else:
+                if args.verbose:
+                    log_stderr("INFO", f"Skipped {args.path} (no inherited ACEs)")
+
+            # Propagate to children if requested
+            if args.propagate_acls:
+                acl_concurrency = args.acl_concurrency if hasattr(args, 'acl_concurrency') else 100
+
+                progress_tracker = ProgressTracker(verbose=True) if args.progress else None
+
+                acl_queue = asyncio.Queue(maxsize=10_000)
+                stats = {'changed': 0, 'skipped': 0, 'failed': 0, 'warnings': 0}
+                stats_lock = asyncio.Lock()
+
+                async def inheritance_worker():
+                    while True:
+                        item = await acl_queue.get()
+                        try:
+                            child_path = item
+                            child_acl = await client.get_file_acl(session, child_path)
+                            if not child_acl:
+                                async with stats_lock:
+                                    stats['failed'] += 1
+                                if args.verbose:
+                                    log_stderr("ERROR", f"Could not read ACL: {child_path}")
+                                continue
+
+                            # Count inherited ACEs on this child
+                            if 'acl' in child_acl and 'aces' not in child_acl:
+                                child_aces = child_acl['acl'].get('aces', [])
+                            else:
+                                child_aces = child_acl.get('aces', [])
+
+                            child_inherited = sum(
+                                1 for ace in child_aces
+                                if 'INHERITED' in ace.get('flags', [])
+                            )
+
+                            if child_inherited == 0:
+                                async with stats_lock:
+                                    stats['skipped'] += 1
+                                continue
+
+                            child_explicit = len(child_aces) - child_inherited
+                            if args.remove_inherited and child_explicit == 0:
+                                async with stats_lock:
+                                    stats['warnings'] += 1
+                                if args.verbose:
+                                    log_stderr("WARNING",
+                                        f"All ACEs inherited, removing leaves no ACEs: {child_path}")
+
+                            if args.remove_inherited:
+                                child_modified, _ = strip_inherited_aces(child_acl)
+                            else:
+                                child_modified = break_acl_inheritance(child_acl)
+
+                            normalized = normalize_acl_for_put(child_modified)
+                            ok, err = await client.set_file_acl(
+                                session, child_path, normalized, mark_inherited=False
+                            )
+                            async with stats_lock:
+                                if ok:
+                                    stats['changed'] += 1
+                                else:
+                                    stats['failed'] += 1
+                                    if args.verbose:
+                                        log_stderr("ERROR", f"Failed: {child_path}: {err}")
+                                    if not args.continue_on_error:
+                                        log_stderr("ERROR",
+                                            f"Stopping on error. Use --continue-on-error to skip failures.")
+                                        raise SystemExit(1)
+                        except SystemExit:
+                            raise
+                        except Exception as e:
+                            async with stats_lock:
+                                stats['failed'] += 1
+                            if args.verbose:
+                                log_stderr("ERROR", f"Error: {child_path}: {e}")
+                        finally:
+                            acl_queue.task_done()
+
+                workers = [asyncio.create_task(inheritance_worker()) for _ in range(acl_concurrency)]
+
+                async def output_callback(entry):
+                    child_path = entry.get('path')
+                    await acl_queue.put(child_path)
+
+                await client.walk_tree_async(
+                    session,
+                    args.path,
+                    max_depth=args.max_depth,
+                    progress=progress_tracker,
+                    file_filter=file_filter,
+                    collect_results=False,
+                    verbose=args.verbose,
+                    output_callback=output_callback,
+                )
+
+                await acl_queue.join()
+
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+
+                if progress_tracker:
+                    progress_tracker.final_report()
+
+                summary_parts = [f"{stats['changed']:,} changed"]
+                if stats['skipped']:
+                    summary_parts.append(f"{stats['skipped']:,} skipped (no inherited ACEs)")
+                if stats['failed']:
+                    summary_parts.append(f"{stats['failed']:,} failed")
+                if stats['warnings']:
+                    summary_parts.append(f"{stats['warnings']:,} warnings (all ACEs were inherited)")
+
+                log_stderr("INFO",
+                    f"Inheritance propagation complete: {', '.join(summary_parts)}",
                     newline_before=True)
 
         return
@@ -7157,6 +7422,23 @@ Examples:
         help="Apply changes to all children recursively. "
              "Without this flag, only the target path itself is changed. "
              "Works with ACE manipulation, owner/group changes, and ACL cloning."
+    )
+
+    acl_management.add_argument(
+        "--disable-inheritance",
+        action="store_true",
+        help="Disable ACL inheritance at --path. By default, converts inherited ACEs "
+             "to explicit (like icacls /inheritance:d). Use with --remove-inherited to "
+             "remove all inherited ACEs instead (like icacls /inheritance:r). "
+             "Supports --propagate for recursive application and --dry-run for preview."
+    )
+
+    acl_management.add_argument(
+        "--remove-inherited",
+        action="store_true",
+        help="When used with --disable-inheritance, removes all inherited ACEs entirely "
+             "instead of converting them to explicit. Equivalent to icacls /inheritance:r. "
+             "WARNING: If the only ACEs are inherited, this leaves the object with no ACEs."
     )
 
     acl_management.add_argument(

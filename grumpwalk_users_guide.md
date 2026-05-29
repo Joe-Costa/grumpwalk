@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 2.9.1** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.0.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -896,6 +896,33 @@ Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-
   --remove-rights "Allow:Domain Users:w" \
   --propagate-changes --progress
 ```
+
+### How do I disable inheritance on a directory tree?
+
+Equivalent to Windows "Disable Inheritance" or `icacls /inheritance`:
+
+**Convert inherited ACEs to explicit** (preserve all permissions, just break the link to parent):
+```bash
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --propagate --progress
+```
+
+**Remove all inherited ACEs** (strip inherited entries, keep only explicitly-set ones):
+```bash
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --remove-inherited --propagate --progress
+```
+
+**Preview first with dry-run:**
+```bash
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --remove-inherited --propagate --dry-run --verbose
+```
+
+> **Tip:** If you want to strip inherited entries and set a clean POSIX ACL in one step, `--set-mode` replaces the entire ACL:
+> ```bash
+> ./grumpwalk.py --host cluster --set-mode 755 --path /data/project --propagate --progress
+> ```
 
 ---
 
@@ -1977,6 +2004,8 @@ done
 | ACL audit | `--acl-report --acl-resolve-names` |
 | Add permission | `--add-ace 'Allow:fd:Group:Modify' --propagate-changes` |
 | Remove permission | `--remove-ace 'Allow:Everyone' --propagate-changes` |
+| Disable inheritance (convert) | `--disable-inheritance --path /data --propagate` |
+| Disable inheritance (remove) | `--disable-inheritance --remove-inherited --path /data --propagate` |
 | Set POSIX mode | `--set-mode 755 --path /data` |
 | Recursive chmod | `--set-mode 755 --path /data --propagate` |
 | chmod + chown | `--set-mode 755 --path /data --new-owner uid:1001 --new-group gid:5000 --propagate` |
@@ -2047,7 +2076,30 @@ When modifying an inherited ACE, grumpwalk automatically:
 
 This establishes the target as a new inheritance root. Use `--propagate-changes` to push the modified ACL to children.
 
-To restart inheritance from a parent, use ACL cloning:
+### Disabling Inheritance
+
+Use `--disable-inheritance` for standalone inheritance control, equivalent to Windows "Disable Inheritance" or `icacls /inheritance`:
+
+**Convert inherited ACEs to explicit** (keeps all entries, removes INHERITED flag):
+```bash
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --propagate --progress
+```
+
+**Remove all inherited ACEs** (deletes inherited entries, keeps only explicit):
+```bash
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --remove-inherited --propagate --progress
+```
+
+| Mode | Equivalent | Explicit ACEs | Inherited ACEs |
+|------|-----------|---------------|----------------|
+| `--disable-inheritance` | `icacls /inheritance:d` | Kept | Converted to explicit |
+| `--disable-inheritance --remove-inherited` | `icacls /inheritance:r` | Kept | Deleted |
+
+> **Note:** If all ACEs on an object are inherited, `--remove-inherited` will leave it with no ACEs. Use `--dry-run` to preview before applying. Both modes set the PROTECTED control flag to block future inheritance from parent directories.
+
+**Restarting inheritance** from a parent after disabling it:
 ```bash
 ./grumpwalk.py --host cluster.example.com \
   --source-acl /parent/path --acl-target /child/path \
@@ -2075,6 +2127,7 @@ The `--propagate-changes` flag applies modifications recursively to all children
 
 Works with:
 - ACE operations (`--add-ace`, `--remove-ace`, `--replace-ace`, etc.)
+- Inheritance control (`--disable-inheritance`, `--disable-inheritance --remove-inherited`)
 - Owner/group changes (`--change-owner`, `--change-group`)
 - Trustee migration (`--migrate-trustees`)
 - ACE cloning (`--clone-ace-source/--clone-ace-target`)

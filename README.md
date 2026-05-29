@@ -203,6 +203,12 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 # Recursive chmod with ownership change
 ./grumpwalk.py --host cluster.example.com --set-mode 2775 --path /data/shared --new-owner uid:1001 --new-group gid:5000 --propagate --progress
 
+# Disable inheritance - convert inherited ACEs to explicit (icacls /inheritance:d)
+./grumpwalk.py --host cluster.example.com --path /data/project --disable-inheritance --propagate --progress
+
+# Disable inheritance - remove all inherited ACEs (icacls /inheritance:r)
+./grumpwalk.py --host cluster.example.com --path /data/project --disable-inheritance --remove-inherited --propagate --progress
+
 # Find similar files
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
 
@@ -366,6 +372,8 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--copy-group` - Copy group from source
 - `--owner-group-only` - Copy only owner/group, skip ACL
 - `--acl-concurrency N` - Concurrent ACL operations (default: 100, try 500 for faster throughput)
+- `--disable-inheritance` - Disable ACL inheritance at `--path`. Converts inherited ACEs to explicit (like `icacls /inheritance:d`). Use with `--remove-inherited` to delete inherited ACEs instead (like `icacls /inheritance:r`). Supports `--propagate` for recursive application.
+- `--remove-inherited` - When used with `--disable-inheritance`, removes all inherited ACEs entirely instead of converting them to explicit. Warning: leaves objects with no ACEs if all entries were inherited.
 
 ### Owner/Group Change Options
 
@@ -518,6 +526,31 @@ When modifying an inherited ACE (one that has the INHERITED flag), grumpwalk aut
 3. **Applies your modifications** to the now-explicit ACE
 
 This establishes the target path as a new inheritance root. When used with `--propagate-changes`, the modified ACL propagates to all children with proper inheritance flags.
+
+**Disabling Inheritance Directly:**
+
+Use `--disable-inheritance` for standalone inheritance control without other ACE modifications:
+
+```bash
+# Convert inherited ACEs to explicit, preserving all entries (icacls /inheritance:d)
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --propagate --progress
+
+# Remove all inherited ACEs entirely (icacls /inheritance:r)
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --remove-inherited --propagate --progress
+
+# Preview changes first
+./grumpwalk.py --host cluster --path /data/project \
+  --disable-inheritance --remove-inherited --propagate --dry-run
+```
+
+| Mode | Flag | Behavior | icacls equivalent |
+|------|------|----------|-------------------|
+| Convert | `--disable-inheritance` | Inherited ACEs become explicit | `/inheritance:d` |
+| Remove | `--disable-inheritance --remove-inherited` | Inherited ACEs are deleted | `/inheritance:r` |
+
+Both modes set the PROTECTED control flag to block future inheritance from parent directories. Supports all standard filters (`--type`, `--name`, `--max-depth`, etc.) and `--continue-on-error`.
 
 **Restarting Inheritance:**
 

@@ -5,6 +5,19 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-05-28
+
+### Added
+
+- **`--disable-inheritance`** - Disable ACL inheritance at `--path`, converting inherited ACEs to explicit entries. Equivalent to Windows "Disable Inheritance" > "Convert inherited permissions" or `icacls /inheritance:d`. Sets the PROTECTED control flag to block future inheritance from parent directories. Supports `--propagate` for recursive application, `--dry-run` for preview, and all standard filters.
+- **`--remove-inherited`** - When used with `--disable-inheritance`, removes all inherited ACEs entirely instead of converting them to explicit. Equivalent to `icacls /inheritance:r`. Warns when all ACEs on an object are inherited (removal would leave no access control).
+
+### Fixed
+
+- **v2 API trustee format in `--propagate-changes`** - ACE manipulation with `--propagate-changes` would fail with HTTP 400 ("expected object") when writing modified ACLs to children. The v2 API requires trustees as objects (`{"auth_id": "..."}`) but newly added ACEs used bare auth_id strings. `normalize_acl_for_put()` now converts string trustees to object format before PUT.
+
+---
+
 ## [2.9.1] - 2026-05-07
 
 ### Fixed
