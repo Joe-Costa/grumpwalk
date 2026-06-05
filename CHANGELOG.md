@@ -5,6 +5,13 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0.1] - 2026-05-28
+
+## Changed
+
+- **Removed qumulo_api dependency from requirements.txt** - The `qumulo_api` library is not directly used by `grumpwalk` and is only used as an alternative method of getting API credentials.
+- **Updated Documentation** - Updated docs with the correct method of using long-lived API keys as the preferred authentication method
+
 ## [3.0.0] - 2026-05-28
 
 ### Added

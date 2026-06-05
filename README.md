@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 2.9.1** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.0.0.1** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -58,9 +58,12 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 
 - Python 3.8+
 - `aiohttp` - Install with: `pip install aiohttp`
-- `qumulo_api` - Install with: `pip install qumulo_api`
 - `ujson` (optional) - For faster JSON parsing: `pip install ujson`
 - `argcomplete` - For bash completion support: `pip install argcomplete`
+
+## Optional Requirements
+
+- `qumulo_api` - Install with: `pip install qumulo_api`
 - Qumulo cluster credentials (use `qq login`)
 
 ## Installation
@@ -135,22 +138,28 @@ If tab completion isn't working after setup:
 
 5. **Test in a new shell session** - Sometimes completion only works in fresh shells
 
-## Logging into a cluster
 
-Since we've installed the `qq` CLI you can login with:
+## Logging in wih a long lived API access key (Preferred method)
 
-**Login with a user that has the correct RBAC rights for any operations you want `grumpwalk.py` to perform!**
-
-`qq --host cluster.example.com login -u "DOMAIN\user"`
-
-This will save a `.qfsd_cred` file in your current user's home directory. Note that these keys auto expire after 10 hours.
-
-## Logging in wih a long lived API access key
+You can read about how to create API keys [in this help article](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html) 
 
 Save your access key to a file and use the `--credentials-store` option:
 
+`grumpwalk.py --host cluster.example.com --credentials-store /path/to/keyfile`
 
-`qq --host cluster.example.com --credentials-store /path/to/keyfile`
+**Treat these API keys as any other user credentials and secure them properly!**
+
+## Logging into a cluster with a temporary key using the `qq` CLI (Key expires after 10 hours)
+
+If you have installed the `qq` CLI you can login with:
+
+`qq --host cluster.example.com login -u "DOMAIN\user"`
+
+**Login with a user that has the correct RBAC rights for any operations you want `grumpwalk.py` to perform!**
+
+This will save a `.qfsd_cred` file in your current user's home directory. Note that these keys auto expire after 10 hours.
+
+**Treat these API keys as any other user credentials and secure them properly!**
 
 ## Helpful Qumulo Care Articles
 
