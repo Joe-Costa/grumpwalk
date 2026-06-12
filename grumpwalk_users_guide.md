@@ -13,16 +13,17 @@ A practical guide with recipes for common storage administration tasks using gru
 3. [Directory Statistics](#directory-statistics)
 4. [Storage Capacity Planning](#storage-capacity-planning)
 5. [Data Lifecycle Management](#data-lifecycle-management)
-6. [User and Access Management](#user-and-access-management)
-7. [Domain Migration](#domain-migration)
-8. [Compliance and Auditing](#compliance-and-auditing)
-9. [Security and Incident Response](#security-and-incident-response)
-10. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
-11. [Media and Creative Workflows](#media-and-creative-workflows)
-12. [Reporting and Analytics](#reporting-and-analytics)
-13. [Performance Optimization](#performance-optimization)
-14. [Scripting and Automation](#scripting-and-automation)
-15. [Combining Filters with Actions](#combining-filters-with-actions)
+6. [Object Tagging](#object-tagging)
+7. [User and Access Management](#user-and-access-management)
+8. [Domain Migration](#domain-migration)
+9. [Compliance and Auditing](#compliance-and-auditing)
+10. [Security and Incident Response](#security-and-incident-response)
+11. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
+12. [Media and Creative Workflows](#media-and-creative-workflows)
+13. [Reporting and Analytics](#reporting-and-analytics)
+14. [Performance Optimization](#performance-optimization)
+15. [Scripting and Automation](#scripting-and-automation)
+16. [Combining Filters with Actions](#combining-filters-with-actions)
 
 ---
 
@@ -491,6 +492,88 @@ TOTAL                                               268,789    4,467     2.67 TB
   --name '*.log' --name '*.txt' --name '*.csv' --name '*.json' \
   --larger-than 100MB \
   --type file
+```
+
+---
+
+## Object Tagging
+
+Grumpwalk can attach custom key/value tags to files and directories. Tags are useful for classifying data however you like -- marking review status, recording a project or owner, or flagging assets for a workflow. Every tagging command uses the same filters as the rest of grumpwalk, so you can tag, find, or remove tags on exactly the objects you mean.
+
+There are three modes, all driven by `--path`:
+
+- `--add-tag` adds or updates a tag (needs `--key` and `--value`)
+- `--find-tag` lists objects that carry a tag
+- `--remove-tag` deletes a tag (needs `--key`)
+
+All three walk the tree, so they work with `--progress`, `--dry-run`, and `--limit`. As with the other action flags, `--dry-run` previews every object, and a real run lists each object only when you add `--verbose`.
+
+### How do I tag matching files?
+
+**Tag every JPEG modified in the last three days:**
+```bash
+./grumpwalk.py --host cluster --path /media \
+  --name '*.jpg' --modified --newer-than 3 \
+  --add-tag --key reviewed --value yes --progress
+```
+
+The tag lands on every object the filters match. Point `--path` at a single file to tag just that file, or use `--max-depth 0` to tag only the directory itself and not its contents.
+
+### What happens if the tag already exists?
+
+If the key is already set to the same value, grumpwalk leaves it alone. If the key exists with a *different* value, the object is skipped and reported -- grumpwalk will not overwrite it unless you ask:
+
+```bash
+# Skips files where 'reviewed' is already set to a different value
+./grumpwalk.py --host cluster --path /media --name '*.jpg' \
+  --add-tag --key reviewed --value yes
+
+# Replace the existing value instead
+./grumpwalk.py --host cluster --path /media --name '*.jpg' \
+  --add-tag --key reviewed --value yes --overwrite
+```
+
+### How do I find tagged objects?
+
+`--find-tag` streams one JSON line per match to stdout, ready to pipe into `jq` or save to a file.
+
+```bash
+# Everything with a 'reviewed' tag, any value
+./grumpwalk.py --host cluster --path /media --find-tag --key reviewed
+
+# Only where reviewed=yes
+./grumpwalk.py --host cluster --path /media --find-tag --key reviewed --value yes
+
+# Any object whose tag value is 'archive'
+./grumpwalk.py --host cluster --path /media --find-tag --value archive
+
+# Every tagged object under the path
+./grumpwalk.py --host cluster --path /media --find-tag
+```
+
+Add the usual filters to narrow the search:
+```bash
+# Tagged PNGs only
+./grumpwalk.py --host cluster --path /media \
+  --find-tag --key reviewed --name '*.png' --type file
+```
+
+### How do I remove a tag?
+
+`--remove-tag` deletes a key from matching objects. Add `--value` to remove it only when the current value matches -- a guard against deleting something unexpected.
+
+```bash
+# Preview first
+./grumpwalk.py --host cluster --path /media \
+  --name '*.jpg' --remove-tag --key reviewed --dry-run
+
+# Remove it
+./grumpwalk.py --host cluster --path /media \
+  --name '*.jpg' --remove-tag --key reviewed
+
+# Remove only where reviewed=yes; other values are left untouched
+./grumpwalk.py --host cluster --path /media \
+  --remove-tag --key reviewed --value yes
 ```
 
 ---

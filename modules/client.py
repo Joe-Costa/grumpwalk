@@ -6,6 +6,7 @@ the Qumulo REST API using async/await patterns.
 """
 
 import asyncio
+import base64
 import copy
 import fnmatch
 import ssl
@@ -561,6 +562,158 @@ class AsyncQumuloClient:
                         except:
                             pass
                         return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
+    async def get_file_user_metadata(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> Optional[Dict[str, str]]:
+        """
+        Get all GENERIC user-metadata (custom tags) for a file or directory.
+
+        Reads the v1 user-metadata list endpoint and Base64-decodes each value.
+        Follows pagination via paging.next.
+
+        Args:
+            session: aiohttp ClientSession
+            path: File or directory path
+
+        Returns:
+            Dict mapping tag key to its decoded string value. An empty dict when
+            the object has no GENERIC tags. None when the tags could not be read
+            (callers treat None as an error, not as "no tags").
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/user-metadata/GENERIC/"
+
+            tags: Dict[str, str] = {}
+            seen_urls: Set[str] = set()
+
+            try:
+                while url and url not in seen_urls:
+                    seen_urls.add(url)
+                    async with session.get(url, ssl=self.ssl_context) as response:
+                        if response.status == 404:
+                            # Object exists but currently carries no GENERIC tags.
+                            return tags
+                        if response.status != 200:
+                            if self.verbose:
+                                log_stderr("WARN", f"Failed to read tags for {path}: HTTP {response.status}")
+                            return None
+                        data = await response.json()
+
+                    for entry in data.get("entries", []):
+                        key = entry.get("key")
+                        if key is None:
+                            continue
+                        try:
+                            tags[key] = base64.b64decode(entry.get("value", "")).decode("utf-8", "replace")
+                        except (ValueError, TypeError):
+                            # Value was not valid Base64; record it as empty rather than failing the read.
+                            tags[key] = ""
+
+                    next_url = (data.get("paging") or {}).get("next")
+                    if next_url:
+                        url = next_url if next_url.startswith("http") else f"{self.base_url}{next_url}"
+                    else:
+                        url = None
+
+                return tags
+            except aiohttp.ClientError as e:
+                if self.verbose:
+                    log_stderr("WARN", f"Error reading tags for {path}: {e}")
+                return None
+
+    async def set_file_user_metadata(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        key: str,
+        value: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Create or update (upsert) a GENERIC user-metadata tag.
+
+        Uses PUT, which creates the key or replaces its value. The value is
+        Base64-encoded on the wire; the key is URL-encoded into the path.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Target file/directory path
+            key: Tag key (arbitrary string)
+            value: Tag value (arbitrary string)
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            encoded_key = quote(key, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/user-metadata/GENERIC/{encoded_key}"
+
+            encoded_value = base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+            try:
+                async with session.put(
+                    url, json={"value": encoded_value}, ssl=self.ssl_context
+                ) as response:
+                    if 200 <= response.status < 300:
+                        return (True, None)
+                    error_msg = f"HTTP {response.status}"
+                    try:
+                        error_detail = await response.json()
+                        error_msg += f": {error_detail.get('description', '')}"
+                    except:
+                        pass
+                    return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
+    async def delete_file_user_metadata(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        key: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Delete a GENERIC user-metadata tag.
+
+        Idempotent: a missing key (HTTP 404) is treated as success.
+
+        Args:
+            session: aiohttp ClientSession
+            path: Target file/directory path
+            key: Tag key to delete
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+
+            encoded_path = quote(path, safe="")
+            encoded_key = quote(key, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_path}/user-metadata/GENERIC/{encoded_key}"
+
+            try:
+                async with session.delete(url, ssl=self.ssl_context) as response:
+                    if 200 <= response.status < 300 or response.status == 404:
+                        return (True, None)
+                    error_msg = f"HTTP {response.status}"
+                    try:
+                        error_detail = await response.json()
+                        error_msg += f": {error_detail.get('description', '')}"
+                    except:
+                        pass
+                    return (False, error_msg)
             except aiohttp.ClientError as e:
                 return (False, str(e))
 

@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 import argparse
 import asyncio
@@ -2281,6 +2281,617 @@ async def apply_acl_to_tree(
     return stats
 
 
+class _RootAttrError(Exception):
+    """Raised when a tag operation cannot read the root object's attributes."""
+
+    def __init__(self, path: str):
+        self.path = path
+        super().__init__(path)
+
+
+async def _process_tag_targets(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    root_path: str,
+    file_filter,
+    args,
+    process_object,
+    record_result,
+    abort_event: asyncio.Event,
+    concurrency: int,
+    progress: bool = False,
+    make_progress_line=None,
+    examined_limit: Optional[int] = None,
+    start_time: Optional[float] = None,
+) -> int:
+    """
+    Shared scaffolding for object-tag operations (add / remove / find).
+
+    Processes the root object when it matches the filter, then streams matching
+    descendants from a bounded tree walk through process_object/record_result in
+    concurrent batches of `concurrency`.
+
+      process_object(entry) -> result   (async; the per-object work)
+      record_result(path, result)        (async; update stats/log/output; may set
+                                           abort_event to stop early). `result` is
+                                           whatever process_object returned, or an
+                                           Exception if it raised.
+
+    When set, `examined_limit` stops queueing after that many descendants have
+    been examined (used by add/remove). Find passes None and stops itself via
+    abort_event once enough matches are recorded.
+
+    Returns the count of objects skipped due to filter mismatch (including the
+    root). Raises _RootAttrError if the root attributes cannot be read.
+    """
+    if start_time is None:
+        start_time = time.time()
+
+    # Step 1: the root object itself.
+    root_attr = await client.get_file_attr(session, root_path)
+    if root_attr is None:
+        raise _RootAttrError(root_path)
+    root_attr['path'] = root_path
+
+    root_skipped = 0
+    if file_filter is None or file_filter(root_attr):
+        try:
+            result = await process_object(root_attr)
+        except Exception as e:  # surface as a normal failed result
+            result = e
+        await record_result(root_path, result)
+    else:
+        root_skipped = 1
+        if args and args.verbose:
+            log_stderr("INFO", f"Root does not match filter: {root_path}")
+
+    if abort_event.is_set():
+        return root_skipped
+
+    # Step 2: stream descendants through a bounded producer/consumer.
+    walk_progress = ProgressTracker(verbose=False, limit=args.limit if args else None)
+    entry_queue = asyncio.Queue(maxsize=10000)
+    producer_done = asyncio.Event()
+    limit_reached = asyncio.Event()
+    entries_queued = [0]
+
+    async def queue_entry(entry):
+        if abort_event.is_set() or limit_reached.is_set():
+            return
+        # The root is handled above; never double-process it.
+        if entry.get('path') == root_path:
+            return
+        if examined_limit and entries_queued[0] >= examined_limit:
+            limit_reached.set()
+            return
+        await entry_queue.put(entry)
+        entries_queued[0] += 1
+
+    async def producer():
+        try:
+            await client.walk_tree_async(
+                session=session,
+                path=root_path,
+                max_depth=args.max_depth if args else None,
+                progress=walk_progress,
+                file_filter=file_filter,
+                omit_subdirs=args.omit_subdirs if args else None,
+                omit_paths=args.omit_path if args else None,
+                collect_results=False,
+                verbose=args.verbose if args else False,
+                max_entries_per_dir=args.max_entries_per_dir if args else None,
+                output_callback=queue_entry,
+            )
+        except Exception as e:
+            if progress:
+                log_stderr("ERROR", f"Tree walk failed: {e}", newline_before=True)
+        finally:
+            producer_done.set()
+
+    def print_progress(processed):
+        if not (progress and make_progress_line is not None):
+            return
+        line = make_progress_line()
+        if line is None:
+            return
+        elapsed = time.time() - start_time
+        rate = processed / elapsed if elapsed > 0 else 0
+        print(
+            f"\r{line} | Queue: {entry_queue.qsize():,} | Rate: {rate:.0f}/s",
+            end='',
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+
+    async def consumer():
+        batch = []
+        processed = 0
+        last_redraw = 0.0
+
+        while True:
+            if abort_event.is_set():
+                break
+
+            try:
+                entry = await asyncio.wait_for(entry_queue.get(), timeout=0.1)
+                batch.append(entry)
+                while len(batch) < concurrency:
+                    try:
+                        batch.append(entry_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+            except asyncio.TimeoutError:
+                if producer_done.is_set() and entry_queue.empty():
+                    break
+                if not batch:
+                    continue
+
+            if not batch:
+                continue
+
+            async def run_one(entry):
+                path = entry['path']
+                try:
+                    return path, await process_object(entry)
+                except Exception as exc:  # surfaced to record_result as a failure
+                    return path, exc
+
+            # Launch the batch concurrently and handle each result as it lands so
+            # the progress counter climbs in real time rather than once per batch.
+            tasks = [asyncio.ensure_future(run_one(entry)) for entry in batch]
+            try:
+                for finished in asyncio.as_completed(tasks):
+                    path, result = await finished
+                    await record_result(path, result)
+                    processed += 1
+                    # Throttle redraws to ~10/sec to avoid flooding stderr.
+                    now = time.time()
+                    if now - last_redraw >= 0.1:
+                        last_redraw = now
+                        print_progress(processed)
+                    if abort_event.is_set():
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        break
+            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            batch = []
+
+        print_progress(processed)
+
+    await asyncio.gather(producer(), consumer())
+
+    return root_skipped + (walk_progress.total_objects - walk_progress.matches)
+
+
+async def apply_tags_to_tree(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    key: str,
+    value: str,
+    root_path: str,
+    file_filter=None,
+    overwrite: bool = False,
+    progress: bool = False,
+    continue_on_error: bool = False,
+    args=None,
+    tag_concurrency: int = 100,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Add a GENERIC user-metadata tag (key/value) to every object at or under
+    root_path that matches the active filter.
+
+    The root object is tagged when it matches the filter; descendants are
+    streamed from a filtered tree walk and tagged in concurrent batches. Use
+    --max-depth 0 to tag only the root object.
+
+    Conflict handling (key already exists with a DIFFERENT value):
+      - Without overwrite: the object is skipped and a warning is logged.
+      - With overwrite: the existing value is replaced.
+    A key already set to the same value is a no-op. A key absent on a
+    previously-tagged object is written. Objects whose user_metadata_revision
+    is exactly "0" have never been tagged, so their existing tags are not read;
+    any other (or missing) revision triggers a read so a conflict is never
+    missed.
+
+    Genuine API errors (failed reads or writes) follow continue_on_error:
+    continue (log and proceed) or, when False, an interactive Continue/Abort
+    prompt - mirroring ACL propagation. Conflicts are not errors and never
+    prompt.
+
+    Returns a statistics dict:
+        {
+            'objects_tagged': int,        # value written (new, added, or overwritten)
+            'objects_unchanged': int,     # key already had this value
+            'objects_conflict': int,      # different value, skipped (no overwrite)
+            'objects_failed': int,        # read/write error
+            'objects_skipped': int,       # did not match filter
+            'total_objects_processed': int,
+            'errors': list[dict],         # [{path, error_code, message}]
+        }
+    """
+    stats = {
+        'objects_tagged': 0,
+        'objects_unchanged': 0,
+        'objects_conflict': 0,
+        'objects_failed': 0,
+        'objects_skipped': 0,
+        'total_objects_processed': 0,
+        'errors': [],
+    }
+
+    start_time = time.time()
+    abort_event = asyncio.Event()
+
+    async def process(entry: dict):
+        """
+        Decide and perform the tag action for one object.
+
+        Returns (status, detail):
+          status in {'tagged', 'unchanged', 'conflict', 'failed'}
+          detail: existing value for 'conflict', error message for 'failed', else None
+        """
+        path = entry['path']
+        # Treat ONLY an explicit "0"/0 as never-tagged. A missing revision falls
+        # through to a read so we never silently overwrite a differing value.
+        never_tagged = str(entry.get('user_metadata_revision')) == '0'
+
+        if not never_tagged:
+            existing = await client.get_file_user_metadata(session, path)
+            if existing is None:
+                return ('failed', 'Could not read existing tags')
+            if key in existing:
+                if existing[key] == value:
+                    return ('unchanged', None)
+                if not overwrite:
+                    return ('conflict', existing[key])
+
+        # never tagged, key absent, or overwriting a differing value
+        if dry_run:
+            return ('tagged', None)
+        ok, err = await client.set_file_user_metadata(session, path, key, value)
+        return ('tagged', None) if ok else ('failed', err)
+
+    async def record(path: str, result):
+        """Update stats and emit logging for one object's result."""
+        stats['total_objects_processed'] += 1
+        status, detail = ('failed', str(result)) if isinstance(result, Exception) else result
+
+        if status == 'tagged':
+            stats['objects_tagged'] += 1
+            # Per-item lines: always in dry-run (preview), and on --verbose for a
+            # real run. Plain --progress shows only the live counter. This matches
+            # the convention used by --change-owner and --set-attribute.
+            if dry_run or (args and args.verbose):
+                label = "DRY RUN" if dry_run else "TAG"
+                verb = "Would set" if dry_run else "Set"
+                log_stderr(label, f"{verb} {key}={value} on {path}", newline_before=progress)
+        elif status == 'unchanged':
+            stats['objects_unchanged'] += 1
+            if args and args.verbose:
+                log_stderr("SKIP", f"{path}: {key} already set to '{value}'", newline_before=progress)
+        elif status == 'conflict':
+            stats['objects_conflict'] += 1
+            log_stderr(
+                "WARN",
+                f"{path}: key '{key}' exists = '{detail}' (would set '{value}') -- skipped (use --overwrite)",
+                newline_before=progress,
+            )
+        elif status == 'failed':
+            stats['objects_failed'] += 1
+            stats['errors'].append({'path': path, 'error_code': 'TAG_FAILURE', 'message': detail})
+            if continue_on_error:
+                if progress:
+                    log_stderr("WARN", f"Error on {path}: {detail}, continuing...", newline_before=True)
+            else:
+                log_stderr("ERROR", f"Failed to tag: {path}", newline_before=True)
+                log_stderr("ERROR", f"{detail}")
+                while True:
+                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                    if response in ['c', 'continue']:
+                        break
+                    elif response in ['a', 'abort']:
+                        log_stderr("INFO", "Operation aborted by user.")
+                        abort_event.set()
+                        return
+                    print("Invalid response. Please enter 'c' or 'a'.")
+
+    def progress_line():
+        tagged_label = "Would tag" if dry_run else "Tagged"
+        return (
+            f"[{'DRY RUN' if dry_run else 'TAG'}] {tagged_label}: {stats['objects_tagged']:,} | "
+            f"Unchanged: {stats['objects_unchanged']:,} | "
+            f"Conflicts: {stats['objects_conflict']:,} | "
+            f"Failed: {stats['objects_failed']:,}"
+        )
+
+    try:
+        stats['objects_skipped'] = await _process_tag_targets(
+            client, session, root_path, file_filter, args,
+            process_object=process,
+            record_result=record,
+            abort_event=abort_event,
+            concurrency=tag_concurrency,
+            progress=progress,
+            make_progress_line=progress_line,
+            examined_limit=(args.limit if args else None),
+            start_time=start_time,
+        )
+    except _RootAttrError as e:
+        log_stderr("ERROR", f"Could not read attributes for: {e.path}")
+        stats['objects_failed'] = 1
+        stats['errors'].append({
+            'path': e.path,
+            'error_code': 'ATTR_FAILURE',
+            'message': 'Could not get file attributes',
+        })
+        return stats
+
+    if progress:
+        print()
+        elapsed = time.time() - start_time
+        log_stderr("DRY RUN" if dry_run else "TAG", f"Completed in {elapsed:.1f}s")
+
+    return stats
+
+
+async def remove_tags_from_tree(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    key: str,
+    root_path: str,
+    file_filter=None,
+    value: Optional[str] = None,
+    progress: bool = False,
+    continue_on_error: bool = False,
+    args=None,
+    tag_concurrency: int = 100,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Remove the GENERIC tag `key` from every object at or under root_path that
+    matches the active filter.
+
+    When `value` is given, the key is removed only if its current value equals
+    `value` (a guard against deleting an unexpected value); otherwise the object
+    is left unchanged and counted as a value mismatch. Objects whose
+    user_metadata_revision is exactly "0" have never been tagged and are skipped
+    without a read.
+
+    Returns a statistics dict:
+        {
+            'objects_removed': int,         # tag deleted (or would be, in dry-run)
+            'objects_absent': int,          # object had no such key
+            'objects_value_mismatch': int,  # key present but value != requested value
+            'objects_failed': int,          # read/delete error
+            'objects_skipped': int,         # did not match filter
+            'total_objects_processed': int,
+            'errors': list[dict],
+        }
+    """
+    stats = {
+        'objects_removed': 0,
+        'objects_absent': 0,
+        'objects_value_mismatch': 0,
+        'objects_failed': 0,
+        'objects_skipped': 0,
+        'total_objects_processed': 0,
+        'errors': [],
+    }
+
+    start_time = time.time()
+    abort_event = asyncio.Event()
+
+    async def process(entry: dict):
+        path = entry['path']
+        if str(entry.get('user_metadata_revision')) == '0':
+            return ('absent', None)
+        existing = await client.get_file_user_metadata(session, path)
+        if existing is None:
+            return ('failed', 'Could not read existing tags')
+        if key not in existing:
+            return ('absent', None)
+        if value is not None and existing[key] != value:
+            return ('mismatch', existing[key])
+        if dry_run:
+            return ('removed', None)
+        ok, err = await client.delete_file_user_metadata(session, path, key)
+        return ('removed', None) if ok else ('failed', err)
+
+    async def record(path: str, result):
+        stats['total_objects_processed'] += 1
+        status, detail = ('failed', str(result)) if isinstance(result, Exception) else result
+
+        if status == 'removed':
+            stats['objects_removed'] += 1
+            # Per-item: always in dry-run, on --verbose for a real run (see add).
+            if dry_run or (args and args.verbose):
+                verb = "Would remove" if dry_run else "Removed"
+                log_stderr("DRY RUN" if dry_run else "UNTAG",
+                           f"{verb} {key} from {path}", newline_before=progress)
+        elif status == 'absent':
+            stats['objects_absent'] += 1
+        elif status == 'mismatch':
+            stats['objects_value_mismatch'] += 1
+            if args and args.verbose:
+                log_stderr("SKIP", f"{path}: {key}='{detail}' != '{value}' -- not removed",
+                           newline_before=progress)
+        elif status == 'failed':
+            stats['objects_failed'] += 1
+            stats['errors'].append({'path': path, 'error_code': 'UNTAG_FAILURE', 'message': detail})
+            if continue_on_error:
+                if progress:
+                    log_stderr("WARN", f"Error on {path}: {detail}, continuing...", newline_before=True)
+            else:
+                log_stderr("ERROR", f"Failed to remove tag from: {path}", newline_before=True)
+                log_stderr("ERROR", f"{detail}")
+                while True:
+                    response = input("Continue? [C]ontinue / [A]bort: ").strip().lower()
+                    if response in ['c', 'continue']:
+                        break
+                    elif response in ['a', 'abort']:
+                        log_stderr("INFO", "Operation aborted by user.")
+                        abort_event.set()
+                        return
+                    print("Invalid response. Please enter 'c' or 'a'.")
+
+    def progress_line():
+        return (
+            f"[{'DRY RUN' if dry_run else 'UNTAG'}] Removed: {stats['objects_removed']:,} | "
+            f"Absent: {stats['objects_absent']:,} | "
+            f"Mismatch: {stats['objects_value_mismatch']:,} | "
+            f"Failed: {stats['objects_failed']:,}"
+        )
+
+    try:
+        stats['objects_skipped'] = await _process_tag_targets(
+            client, session, root_path, file_filter, args,
+            process_object=process,
+            record_result=record,
+            abort_event=abort_event,
+            concurrency=tag_concurrency,
+            progress=progress,
+            make_progress_line=progress_line,
+            examined_limit=(args.limit if args else None),
+            start_time=start_time,
+        )
+    except _RootAttrError as e:
+        log_stderr("ERROR", f"Could not read attributes for: {e.path}")
+        stats['objects_failed'] = 1
+        stats['errors'].append({
+            'path': e.path,
+            'error_code': 'ATTR_FAILURE',
+            'message': 'Could not get file attributes',
+        })
+        return stats
+
+    if progress:
+        print()
+        elapsed = time.time() - start_time
+        log_stderr("DRY RUN" if dry_run else "UNTAG", f"Completed in {elapsed:.1f}s")
+
+    return stats
+
+
+async def find_tagged_objects(
+    client: AsyncQumuloClient,
+    session: aiohttp.ClientSession,
+    root_path: str,
+    file_filter=None,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+    progress: bool = False,
+    args=None,
+    tag_concurrency: int = 100,
+) -> dict:
+    """
+    Find objects whose GENERIC tags match the search criteria and stream them to
+    stdout as NDJSON (one {"path", "type", "tags"} object per line).
+
+    Matching:
+      - key set, value None  -> object has a tag with that key
+      - value set, key None  -> object has any tag with that value
+      - both set             -> object has key == value
+      - neither set          -> object has at least one tag
+
+    Objects whose user_metadata_revision is exactly "0" are never tagged and are
+    skipped without a read. --limit stops after N matches.
+
+    Returns a statistics dict:
+        {'matches', 'objects_failed', 'objects_skipped', 'total_objects_processed', 'errors'}
+    """
+    stats = {
+        'matches': 0,
+        'objects_failed': 0,
+        'objects_skipped': 0,
+        'total_objects_processed': 0,
+        'errors': [],
+    }
+
+    start_time = time.time()
+    abort_event = asyncio.Event()
+    limit = args.limit if args else None
+
+    def matched_tags(tags):
+        """Return the subset of tags satisfying the search, or None if no match."""
+        if not tags:
+            return None
+        if key is not None and value is not None:
+            return {key: tags[key]} if tags.get(key) == value else None
+        if key is not None:
+            return {key: tags[key]} if key in tags else None
+        if value is not None:
+            subset = {k: v for k, v in tags.items() if v == value}
+            return subset or None
+        return dict(tags)  # neither set -> any tagged object
+
+    async def process(entry: dict):
+        path = entry['path']
+        if str(entry.get('user_metadata_revision')) == '0':
+            return ('nomatch', None)
+        tags = await client.get_file_user_metadata(session, path)
+        if tags is None:
+            return ('failed', 'Could not read tags')
+        if matched_tags(tags) is None:
+            return ('nomatch', None)
+        return ('match', {'path': path, 'type': entry.get('type'), 'tags': tags})
+
+    async def record(path: str, result):
+        stats['total_objects_processed'] += 1
+        if isinstance(result, Exception):
+            stats['objects_failed'] += 1
+            stats['errors'].append({'path': path, 'error_code': 'READ_FAILURE', 'message': str(result)})
+            return
+        status, detail = result
+        if status == 'failed':
+            stats['objects_failed'] += 1
+            stats['errors'].append({'path': path, 'error_code': 'READ_FAILURE', 'message': detail})
+        elif status == 'match':
+            stats['matches'] += 1
+            print(json.dumps(detail, ensure_ascii=False))
+            if limit and stats['matches'] >= limit:
+                abort_event.set()
+
+    def progress_line():
+        return (
+            f"[FIND] Matches: {stats['matches']:,} | "
+            f"Examined: {stats['total_objects_processed']:,} | "
+            f"Failed: {stats['objects_failed']:,}"
+        )
+
+    try:
+        stats['objects_skipped'] = await _process_tag_targets(
+            client, session, root_path, file_filter, args,
+            process_object=process,
+            record_result=record,
+            abort_event=abort_event,
+            concurrency=tag_concurrency,
+            progress=progress,
+            make_progress_line=progress_line,
+            examined_limit=None,  # find limits by matches, handled in record
+            start_time=start_time,
+        )
+    except _RootAttrError as e:
+        log_stderr("ERROR", f"Could not read attributes for: {e.path}")
+        stats['objects_failed'] = 1
+        stats['errors'].append({
+            'path': e.path,
+            'error_code': 'ATTR_FAILURE',
+            'message': 'Could not get file attributes',
+        })
+        return stats
+
+    if progress:
+        print()
+        elapsed = time.time() - start_time
+        log_stderr("FIND", f"Completed in {elapsed:.1f}s")
+
+    return stats
+
+
 async def recurse_ace_modifications_to_tree(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -3664,6 +4275,23 @@ async def main_async(args):
         banner_line(f"ACL concurrency:  {args.acl_concurrency}")
     else:
         banner_line(f"Path:             {args.path}")
+        if args.add_tag:
+            banner_line(f"Mode:             Object Tagging ({args.key}={args.value})")
+            banner_line(f"Tag concurrency:  {args.tag_concurrency}")
+        elif args.find_tag:
+            crit = []
+            if args.key is not None:
+                crit.append(f"key={args.key}")
+            if args.value is not None:
+                crit.append(f"value={args.value}")
+            banner_line(f"Mode:             Tag Search ({', '.join(crit) if crit else 'any tagged'})")
+            banner_line(f"Tag concurrency:  {args.tag_concurrency}")
+        elif args.remove_tag:
+            removal_desc = f"key={args.key}"
+            if args.value is not None:
+                removal_desc += f", value={args.value}"
+            banner_line(f"Mode:             Tag Removal ({removal_desc})")
+            banner_line(f"Tag concurrency:  {args.tag_concurrency}")
 
     banner_line(f"JSON parser:      {JSON_PARSER_NAME}")
     banner_line(f"Walk concurrency: {args.max_concurrent}")
@@ -4172,6 +4800,179 @@ async def main_async(args):
         return
 
     # ACL Cloning Mode
+    # OBJECT TAGGING MODE: add a GENERIC user-metadata tag to matching objects
+    if args.add_tag:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+
+            stats = await apply_tags_to_tree(
+                client=client,
+                session=session,
+                key=args.key,
+                value=args.value,
+                root_path=args.path,
+                file_filter=file_filter,
+                overwrite=args.overwrite,
+                progress=args.progress,
+                continue_on_error=args.continue_on_error,
+                args=args,
+                tag_concurrency=args.tag_concurrency,
+                dry_run=args.dry_run,
+            )
+
+            dry_label = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nOBJECT TAGGING SUMMARY{dry_label}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            print(f"Tag:               {args.key}={args.value}", file=sys.stderr)
+            if args.overwrite:
+                print(f"Overwrite:         Enabled", file=sys.stderr)
+            tagged_label = "Would tag:" if args.dry_run else "Objects tagged:"
+            print(f"{tagged_label:<19}{stats['objects_tagged']:,}", file=sys.stderr)
+            print(f"Already set:       {stats['objects_unchanged']:,}", file=sys.stderr)
+            if stats['objects_conflict']:
+                print(
+                    f"Conflicts skipped: {stats['objects_conflict']:,} "
+                    f"(key exists with different value; use --overwrite)",
+                    file=sys.stderr,
+                )
+            print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
+            if file_filter:
+                print(f"Objects skipped:   {stats['objects_skipped']:,} (filter mismatch)", file=sys.stderr)
+
+            if stats['errors']:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats['errors'][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats['errors']) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+
+            if stats['objects_failed'] > 0:
+                sys.exit(1)
+
+        return  # Exit after tagging operation
+
+    # OBJECT TAG SEARCH MODE: find objects whose tags match --key/--value
+    if args.find_tag:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+
+            stats = await find_tagged_objects(
+                client=client,
+                session=session,
+                root_path=args.path,
+                file_filter=file_filter,
+                key=args.key,
+                value=args.value,
+                progress=args.progress,
+                args=args,
+                tag_concurrency=args.tag_concurrency,
+            )
+
+            criteria = []
+            if args.key is not None:
+                criteria.append(f"key={args.key}")
+            if args.value is not None:
+                criteria.append(f"value={args.value}")
+            print("\nTAG SEARCH SUMMARY", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            print(f"Criteria:          {', '.join(criteria) if criteria else 'any tagged object'}", file=sys.stderr)
+            print(f"Matches:           {stats['matches']:,}", file=sys.stderr)
+            print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
+            if file_filter:
+                print(f"Objects skipped:   {stats['objects_skipped']:,} (filter mismatch)", file=sys.stderr)
+
+            if stats['errors']:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats['errors'][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats['errors']) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+
+            if stats['objects_failed'] > 0:
+                sys.exit(1)
+
+        return  # Exit after tag search
+
+    # OBJECT TAG REMOVAL MODE: remove tag --key from matching objects
+    if args.remove_tag:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+
+            stats = await remove_tags_from_tree(
+                client=client,
+                session=session,
+                key=args.key,
+                root_path=args.path,
+                file_filter=file_filter,
+                value=args.value,
+                progress=args.progress,
+                continue_on_error=args.continue_on_error,
+                args=args,
+                tag_concurrency=args.tag_concurrency,
+                dry_run=args.dry_run,
+            )
+
+            dry_label = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nTAG REMOVAL SUMMARY{dry_label}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            print(f"Key:               {args.key}", file=sys.stderr)
+            if args.value is not None:
+                print(f"Only when value:   {args.value}", file=sys.stderr)
+            removed_label = "Would remove:" if args.dry_run else "Tags removed:"
+            print(f"{removed_label:<19}{stats['objects_removed']:,}", file=sys.stderr)
+            print(f"No such key:       {stats['objects_absent']:,}", file=sys.stderr)
+            if stats['objects_value_mismatch']:
+                print(
+                    f"Value mismatch:    {stats['objects_value_mismatch']:,} "
+                    f"(key present, value differs)",
+                    file=sys.stderr,
+                )
+            print(f"Objects failed:    {stats['objects_failed']:,}", file=sys.stderr)
+            if file_filter:
+                print(f"Objects skipped:   {stats['objects_skipped']:,} (filter mismatch)", file=sys.stderr)
+
+            if stats['errors']:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats['errors'][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats['errors']) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+
+            if stats['objects_failed'] > 0:
+                sys.exit(1)
+
+        return  # Exit after tag removal
+
     if args.source_acl or args.source_acl_file or (args.acl_target and not args.set_mode):
         # Validate: need a source and a target
         if not ((args.source_acl or args.source_acl_file) and args.acl_target):
@@ -7485,6 +8286,67 @@ Examples:
     )
 
     # ============================================================================
+    # FEATURE: OBJECT TAGGING (USER METADATA)
+    # ============================================================================
+    tagging = parser.add_argument_group('Feature: Object Tagging',
+        'Add custom key/value user-metadata tags to objects matching the filters')
+
+    tagging.add_argument(
+        "--add-tag",
+        action="store_true",
+        help="Add a custom tag to every object at or under --path that matches the "
+             "active filters. Requires --key and --value. Composes with all universal "
+             "filters (time, size, name, type, owner, depth). Use --max-depth 0 to tag "
+             "only the object at --path. Supports --progress, --dry-run, --limit, and "
+             "--continue-on-error."
+    )
+
+    tagging.add_argument(
+        "--find-tag",
+        action="store_true",
+        help="Find objects whose tags match --key and/or --value (or any tagged object "
+             "if neither is given) and stream them as NDJSON to stdout. Composes with all "
+             "universal filters. --limit stops after N matches."
+    )
+
+    tagging.add_argument(
+        "--remove-tag",
+        action="store_true",
+        help="Remove the tag --key from every object at or under --path that matches the "
+             "active filters. With --value, the key is removed only when its current value "
+             "matches. Requires --key. Supports --dry-run, --progress, --limit, and "
+             "--continue-on-error."
+    )
+
+    tagging.add_argument(
+        "--key",
+        metavar="KEY",
+        help="Tag key. Required with --add-tag and --remove-tag; optional filter for --find-tag."
+    )
+
+    tagging.add_argument(
+        "--value",
+        metavar="VALUE",
+        help="Tag value. Required with --add-tag; optional filter/guard for --find-tag and --remove-tag."
+    )
+
+    tagging.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="(--add-tag) Replace an existing value when the key is already present with a "
+             "DIFFERENT value. Without this flag, such objects are skipped with a "
+             "warning (a key already set to the same value is always a no-op)."
+    )
+
+    tagging.add_argument(
+        "--tag-concurrency",
+        type=int,
+        default=default_acl_concurrency,
+        metavar="N",
+        help=f"Concurrent tag operations during a walk (default: {default_acl_concurrency})"
+    )
+
+    # ============================================================================
     # FEATURE: EXTENDED ATTRIBUTE MANAGEMENT
     # ============================================================================
     attr_management = parser.add_argument_group('Feature: Extended Attribute Management',
@@ -7849,6 +8711,60 @@ Examples:
             )
             sys.exit(1)
 
+    # Validate object tagging modes (--add-tag / --find-tag / --remove-tag)
+    active_tag_modes = [name for name, on in (
+        ('--add-tag', args.add_tag),
+        ('--find-tag', args.find_tag),
+        ('--remove-tag', args.remove_tag),
+    ) if on]
+    if len(active_tag_modes) > 1:
+        print(
+            f"Error: {' and '.join(active_tag_modes)} cannot be combined; choose one",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tag_mode = active_tag_modes[0] if active_tag_modes else None
+    if tag_mode:
+        if not args.path:
+            print(f"Error: {tag_mode} requires --path", file=sys.stderr)
+            sys.exit(1)
+        if args.add_tag and (not args.key or not args.value):
+            print("Error: --add-tag requires both --key and --value", file=sys.stderr)
+            sys.exit(1)
+        if args.remove_tag and not args.key:
+            print("Error: --remove-tag requires --key", file=sys.stderr)
+            sys.exit(1)
+        if not args.add_tag and args.overwrite:
+            print("Error: --overwrite only applies to --add-tag", file=sys.stderr)
+            sys.exit(1)
+
+        conflicting = []
+        if args.source_acl or args.source_acl_file or args.acl_target:
+            conflicting.append("--source-acl/--acl-target")
+        if args.set_mode:
+            conflicting.append("--set-mode")
+        if args.disable_inheritance:
+            conflicting.append("--disable-inheritance")
+        if getattr(args, 'ace_restore', None):
+            conflicting.append("--ace-restore")
+        if (args.change_owner or args.change_group or
+                args.change_owners_file or args.change_groups_file):
+            conflicting.append("--change-owner/--change-group")
+        if getattr(args, 'set_attribute_true', None) or getattr(args, 'set_attribute_false', None):
+            conflicting.append("--set-attribute-true/--set-attribute-false")
+        if args.owner_report or args.acl_report:
+            conflicting.append("--owner-report/--acl-report")
+        if conflicting:
+            print(
+                f"Error: {tag_mode} cannot be combined with: {', '.join(conflicting)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif args.key or args.value or args.overwrite:
+        print("Error: --key/--value/--overwrite require --add-tag, --find-tag, or --remove-tag", file=sys.stderr)
+        sys.exit(1)
+
     # Validate and parse --fields
     if args.fields:
         args.parsed_fields = parse_field_specs(args.fields)
@@ -7915,6 +8831,8 @@ Examples:
         conflicting = []
         if args.source_acl or args.source_acl_file or args.acl_target:
             conflicting.append("--source-acl/--acl-target")
+        if args.add_tag or args.find_tag or args.remove_tag:
+            conflicting.append("--add-tag/--find-tag/--remove-tag")
         if getattr(args, 'ace_restore', None):
             conflicting.append("--ace-restore")
         if args.change_owner or args.change_group or args.change_owners_file or args.change_groups_file:

@@ -50,6 +50,7 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
 - **ACE manipulation** - Surgically add, remove, or modify individual ACEs within ACLs
+- **Object tagging** - Add, find, and remove custom key/value tags on matching objects
 - **Extended attribute management** - Find and set DOS attributes (read_only, hidden, system, archive)
 - **Similarity detection** - Find similar files using adaptive sampling
 - **Auto-tuning** - Automatic performance tuning based on system resources
@@ -218,6 +219,18 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 # Disable inheritance - remove all inherited ACEs (icacls /inheritance:r)
 ./grumpwalk.py --host cluster.example.com --path /data/project --disable-inheritance --remove-inherited --propagate --progress
 
+# Tag matching objects with a custom key/value (composes with all filters)
+./grumpwalk.py --host cluster.example.com --path /data --name '*.jpg' --modified-newer-than 3 --add-tag --key reviewed --value yes
+
+# Preview a tagging run without writing anything
+./grumpwalk.py --host cluster.example.com --path /data --add-tag --key project --value alpha --dry-run
+
+# Find objects carrying a tag (streams matches as NDJSON to stdout)
+./grumpwalk.py --host cluster.example.com --path /data --find-tag --key reviewed --value yes > reviewed.ndjson
+
+# Remove a tag from matching objects (only when the value matches, for safety)
+./grumpwalk.py --host cluster.example.com --path /data --remove-tag --key reviewed --value yes --dry-run
+
 # Find similar files
 ./grumpwalk.py --host cluster.example.com --path /backups --find-similar --progress
 
@@ -383,6 +396,20 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--acl-concurrency N` - Concurrent ACL operations (default: 100, try 500 for faster throughput)
 - `--disable-inheritance` - Disable ACL inheritance at `--path`. Converts inherited ACEs to explicit (like `icacls /inheritance:d`). Use with `--remove-inherited` to delete inherited ACEs instead (like `icacls /inheritance:r`). Supports `--propagate` for recursive application.
 - `--remove-inherited` - When used with `--disable-inheritance`, removes all inherited ACEs entirely instead of converting them to explicit. Warning: leaves objects with no ACEs if all entries were inherited.
+
+### Object Tagging Options
+
+Add, find, and remove custom key/value tags (Qumulo user metadata) on objects that match the active filters. The three modes are mutually exclusive and all work with the universal filters plus `--progress`, `--dry-run`, and `--limit`.
+
+- `--add-tag` - Add or update a tag on matching objects. Requires `--key` and `--value`.
+- `--find-tag` - List objects whose tags match `--key` and/or `--value` (or any tagged object if neither is given). Streams one JSON line per match to stdout.
+- `--remove-tag` - Remove tag `--key` from matching objects. With `--value`, removes only when the current value matches.
+- `--key KEY` - Tag key. Required for `--add-tag` and `--remove-tag`; optional filter for `--find-tag`.
+- `--value VALUE` - Tag value. Required for `--add-tag`; optional filter or guard otherwise.
+- `--overwrite` - (`--add-tag`) Replace an existing value. Without it, objects whose key already holds a different value are skipped with a warning; a key already set to the same value is left unchanged.
+- `--tag-concurrency N` - Concurrent tag operations during a walk (default: auto-tuned).
+
+A tag is applied to every matching object under `--path`; use `--max-depth 0` to act only on `--path` itself. Per-object lines are shown with `--dry-run` or `--verbose`, and `--progress` shows a running counter.
 
 ### Owner/Group Change Options
 
