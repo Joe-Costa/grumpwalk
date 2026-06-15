@@ -500,6 +500,8 @@ TOTAL                                               268,789    4,467     2.67 TB
 
 Grumpwalk can attach custom key/value tags to files and directories. Tags are useful for classifying data however you like -- marking review status, recording a project or owner, or flagging assets for a workflow. Every tagging command uses the same filters as the rest of grumpwalk, so you can tag, find, or remove tags on exactly the objects you mean.
 
+For more information refer to the [Managing User-Defined Metadata in Qumulo Core](https://docs.qumulo.com/administrator-guide/metadata/managing-user-defined-metadata.html) guide in the Qumulo Documentation Portal
+
 There are three modes, all driven by `--path`:
 
 - `--add-tag` adds or updates a tag (needs `--key` and `--value`)
