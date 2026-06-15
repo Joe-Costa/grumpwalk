@@ -5,6 +5,20 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-06-15
+
+### Added
+
+- **`--add-tag`** - Add a custom key/value tag (Qumulo `GENERIC` user metadata) to every object at or under `--path` that matches the active filters. Requires `--key` and `--value`. Composes with all universal filters; use `--max-depth 0` to tag only the target object. A key already set to the same value is a no-op; a key already set to a different value is skipped with a warning unless `--overwrite` is given.
+- **`--find-tag`** - Find objects whose tags match `--key` and/or `--value` (or any tagged object if neither is given) and stream them to stdout as NDJSON. `--limit` stops after N matches.
+- **`--remove-tag`** - Remove the tag `--key` from matching objects. With `--value`, removes the key only when its current value matches, guarding against deleting an unexpected value.
+- **`--overwrite`** - Used with `--add-tag` to replace an existing value when the key is already present with a different value.
+- **`--tag-concurrency N`** - Number of concurrent tag operations during a walk.
+
+All three tagging modes honor `--progress`, `--dry-run`, `--limit`, and `--continue-on-error`. As with the other action flags, `--dry-run` previews each object and a real run lists each object with `--verbose`.
+
+---
+
 ## [3.0.0.1] - 2026-05-28
 
 ## Changed
