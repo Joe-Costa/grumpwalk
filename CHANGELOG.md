@@ -5,6 +5,18 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-06-24
+
+### Added
+
+- **`--update-atime`** - Allow access times (atime) to be updated by grumpwalk's reads. By default, on clusters that support it (Qumulo Core 7.9.0+), grumpwalk automatically suppresses atime updates so that crawling does not disturb access-time metadata. This flag restores the cluster's normal atime behavior.
+
+### Changed
+
+- **atime is no longer updated by crawls on Qumulo Core 7.9.0+** - grumpwalk now sends the `skip-atime-update=true` query parameter on every read that would otherwise bump access time: directory enumeration (`entries/`), symlink target reads, and file-content sampling (`data`). The cluster version is detected once at startup via `GET /v1/version`; on older clusters that do not support the parameter, behavior is unchanged. Pass `--update-atime` to opt back into atime updates. If `--update-atime` is given against a cluster that does not support the option, a single warning is emitted and the cluster's default atime behavior applies.
+
+---
+
 ## [3.1.0] - 2026-06-15
 
 ### Added

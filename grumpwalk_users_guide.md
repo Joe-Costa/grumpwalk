@@ -440,6 +440,31 @@ TOTAL                                               268,789    4,467     2.67 TB
 
 ## Data Lifecycle Management
 
+### Does crawling change access times (atime)?
+
+No, not by default on modern clusters. Reading a directory's contents or a file's
+data normally updates that object's access time (atime). For a metadata crawl this
+is an unwanted side effect: an access-time-based workflow (cold-data tiering, "not
+accessed in N days" retention, compliance auditing) would be corrupted by the very
+crawl meant to measure it.
+
+On **Qumulo Core 7.9.0 and later**, grumpwalk automatically suppresses these atime
+updates. It detects the cluster version once at startup and adds the
+`skip-atime-update=true` parameter to every read that would otherwise bump atime
+(directory enumeration, symlink target reads, and file-content sampling). You do not
+need to do anything; the access times you filter on are the access times you observe.
+
+On clusters older than 7.9.0 the parameter is not available, so reads behave as the
+cluster's own atime settings dictate (note that many clusters disable atime updates
+globally, or coarsen them to a daily/weekly granularity).
+
+**If you want reads to update atime as usual, pass `--update-atime`:**
+```bash
+./grumpwalk.py --host cluster --path /data --update-atime --progress
+```
+On a cluster that does not support the option, `--update-atime` prints a single
+warning and reads simply fall back to the cluster's default atime behavior.
+
 ### How do I find stale data for cleanup?
 
 **Find files untouched for 2+ years:**

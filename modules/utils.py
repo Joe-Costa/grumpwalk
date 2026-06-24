@@ -185,6 +185,26 @@ def extract_pagination_token(api_response: dict) -> Optional[str]:
         return None
 
 
+def parse_qumulo_version(version_str: Optional[str]) -> Optional[tuple]:
+    """Parse a Qumulo Core version string into a comparable tuple of ints.
+
+    Accepts the ``revision_id`` returned by ``GET /v1/version`` (e.g.
+    "Qumulo Core 7.9.0") or a bare dotted version ("7.9.0", "7.10.0.1") and
+    returns the leading three numeric components as a tuple, e.g. (7, 9, 0).
+    Returns None if no version number can be found.
+
+    The tuple is suitable for direct comparison, e.g.::
+
+        parse_qumulo_version(rev) >= (7, 9, 0)
+    """
+    if not version_str:
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_str)
+    if not match:
+        return None
+    return tuple(int(g) for g in match.groups())
+
+
 def parse_size_to_bytes(size_str: str) -> int:
     """Parse size string (e.g., '100MB', '1.5GiB') to bytes."""
     match = re.match(r"^([0-9]+\.?[0-9]*)([A-Za-z]*)$", size_str)

@@ -317,6 +317,7 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--path PATH` - Path to search (required for walk mode)
 - `--port PORT` - API port (default: 8000)
 - `--credentials-store PATH` - Credentials file path
+- `--update-atime` - Allow access times (atime) to be updated by grumpwalk's reads. By default, on clusters that support it (Qumulo Core 7.9.0+), grumpwalk suppresses atime updates so a crawl does not disturb access-time metadata. This flag restores normal atime behavior.
 
 ### Name/Type Filters
 - `--name PATTERN` - Match by name (glob/regex, OR logic, repeatable)

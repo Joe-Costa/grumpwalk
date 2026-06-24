@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 import argparse
 import asyncio
@@ -4329,6 +4329,7 @@ async def main_async(args):
         args.connector_limit,
         identity_cache=identity_cache,
         verbose=args.verbose,
+        update_atime=args.update_atime,
     )
 
     # Test basic TCP connectivity to cluster before proceeding
@@ -4371,6 +4372,16 @@ async def main_async(args):
             else:
                 log_stderr("ERROR", f"HTTP {e.status}: {e.message}", newline_before=True)
             sys.exit(1)
+
+        # Probe cluster version to decide whether to suppress atime updates
+        await client.detect_capabilities(session)
+
+    # Single, actionable notice: the user asked to update atime but the cluster
+    # is too old to honor the request. Otherwise stay silent (default behavior).
+    if args.update_atime and not client.supports_skip_atime:
+        log_stderr("WARN", "--update-atime has no effect: this cluster does not support "
+                           "skip-atime-update (requires Qumulo Core 7.9.0+); reads use "
+                           "the cluster's default atime behavior")
 
     # Display scope aggregates for --path (universal, all modes)
     if args.path:
@@ -8615,6 +8626,14 @@ Examples:
     connection.add_argument(
         "--credentials-store",
         help="Path to credentials file (default: ~/.qfsd_cred)",
+    )
+    connection.add_argument(
+        "--update-atime",
+        action="store_true",
+        help="Allow access times (atime) to be updated by grumpwalk's reads. "
+             "By default, on clusters that support it (Qumulo Core 7.9.0+), "
+             "grumpwalk suppresses atime updates so a crawl does not disturb "
+             "access-time metadata. This flag restores normal atime behavior.",
     )
 
     # ============================================================================

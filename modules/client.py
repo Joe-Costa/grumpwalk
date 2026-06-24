@@ -29,9 +29,14 @@ from .utils import (
     extract_pagination_token,
     format_bytes,
     format_time,
+    parse_qumulo_version,
 )
 from .stats import OwnerStats
 from .output import ProgressTracker
+
+# Minimum Qumulo Core version that supports the skip-atime-update query
+# parameter on read endpoints (entries/, data, streams data).
+SKIP_ATIME_MIN_VERSION = (7, 9, 0)
 
 class AsyncQumuloClient:
     """Async Qumulo API client using aiohttp with optimized connection pooling."""
@@ -45,6 +50,7 @@ class AsyncQumuloClient:
         connector_limit: int = 100,
         identity_cache: Optional[Dict] = None,
         verbose: bool = False,
+        update_atime: bool = False,
     ):
         self.host = host
         self.port = port
@@ -52,6 +58,15 @@ class AsyncQumuloClient:
         self.bearer_token = bearer_token
         self.max_concurrent = max_concurrent
         self.verbose = verbose
+
+        # atime handling. By default grumpwalk suppresses access-time updates on
+        # reads (entries/data) when the cluster supports it. update_atime=True
+        # opts back into normal atime behavior. supports_skip_atime is determined
+        # at runtime by detect_capabilities(); until then we assume unsupported.
+        self.update_atime = update_atime
+        self.supports_skip_atime = False
+        self.cluster_version: Optional[str] = None
+        self.api_version: Optional[tuple] = None
 
         # Create SSL context that doesn't verify certificates (for self-signed certs)
         self.ssl_context = ssl.create_default_context()
@@ -150,6 +165,50 @@ class AsyncQumuloClient:
             response.raise_for_status()
             return True
 
+    async def detect_capabilities(self, session: aiohttp.ClientSession) -> None:
+        """Probe the cluster's API version to determine optional features.
+
+        Queries GET /v1/version and records the parsed version. Sets
+        self.supports_skip_atime when the cluster is new enough to accept the
+        skip-atime-update query parameter on read endpoints.
+
+        Failures are non-fatal: if the version cannot be read or parsed, the
+        feature is simply treated as unsupported (safe default, no behavior
+        change versus older grumpwalk releases).
+
+        Args:
+            session: aiohttp ClientSession with auth headers
+        """
+        url = f"{self.base_url}/v1/version"
+        try:
+            async with session.get(url, ssl=self.ssl_context) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self.cluster_version = data.get("revision_id")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self.cluster_version = None
+
+        self.api_version = parse_qumulo_version(self.cluster_version)
+        self.supports_skip_atime = (
+            self.api_version is not None
+            and self.api_version >= SKIP_ATIME_MIN_VERSION
+        )
+
+    def _atime_query_params(self) -> dict:
+        """Query parameters to suppress atime updates on a read, when applicable.
+
+        Returns {'skip-atime-update': 'true'} when the cluster supports the
+        option and the user has not requested normal atime behavior via
+        --update-atime; otherwise returns an empty dict.
+
+        The value MUST be the literal string 'true'. The API rejects integer
+        forms (skip-atime-update=1 -> HTTP 400), and aiohttp raises TypeError
+        if a Python bool is passed as a query parameter value.
+        """
+        if self.supports_skip_atime and not self.update_atime:
+            return {"skip-atime-update": "true"}
+        return {}
+
     async def get_directory_page(
         self,
         session: aiohttp.ClientSession,
@@ -179,6 +238,7 @@ class AsyncQumuloClient:
             params = {"limit": limit}
             if after_token:
                 params["after"] = after_token
+            params.update(self._atime_query_params())
 
             async with session.get(
                 url, params=params, ssl=self.ssl_context
@@ -803,7 +863,9 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v1/files/{encoded_path}/data"
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=self._atime_query_params(), ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         # Read the symlink target (returns as plain text)
                         target = await response.text()
@@ -837,10 +899,15 @@ class AsyncQumuloClient:
                 path = '/' + path
 
             encoded_path = quote(path, safe='')
-            url = f"{self.base_url}/v1/files/{encoded_path}/data?offset={offset}&length={length}"
+            url = f"{self.base_url}/v1/files/{encoded_path}/data"
+
+            params = {"offset": offset, "length": length}
+            params.update(self._atime_query_params())
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=params, ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         data = await response.read()
                         return data
