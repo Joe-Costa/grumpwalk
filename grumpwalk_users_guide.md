@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.0.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.2.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -83,8 +83,16 @@ A practical guide with recipes for common storage administration tasks using gru
 
 **Case-sensitive search:**
 ```bash
-./grumpwalk.py --host cluster --path /docs --name 'README' --name-case-sensitive
+./grumpwalk.py --host cluster --path /docs --name 'README*' --name-case-sensitive
 ```
+
+> **Glob matching is whole-name (like the shell).** `--name 'file_*'` matches names
+> that *begin* with `file_` (not `myfile_1`); `--name '*.log'` matches names ending in
+> `.log`; and a wildcard-free `--name report` matches only the exact name `report` -
+> use `--name '*report*'` for "contains". Always quote patterns so your shell does not
+> expand `*` against your local directory before grumpwalk runs. (Regex patterns - those
+> containing characters like `^`, `$`, `.`, `+` - are matched unanchored; anchor them
+> with `^`/`$` yourself.)
 
 **Find using regex:**
 ```bash
@@ -602,6 +610,170 @@ Add the usual filters to narrow the search:
 ./grumpwalk.py --host cluster --path /media \
   --remove-tag --key reviewed --value yes
 ```
+
+---
+
+## Moving, Copying, and Renaming Files
+
+`--move-to`, `--copy-to`, and `--rename-to` bring `mv`/`cp`-style moves, copies,
+and bulk renaming to a filtered crawl. A move is a single RENAME metadata
+operation; a copy is a server-side `copy-chunk` (data is copied on the cluster,
+not streamed through grumpwalk). Always preview with `--dry-run` first; it prints
+the complete `source -> target` plan and changes nothing.
+
+### How do I move matching files into another directory?
+
+`--move-to DEST` moves every match into the existing directory DEST, flattened
+just like `mv a/x.log b/x.log /archive/`:
+```bash
+# Move all .log files older than 90 days into /archive (preview first)
+./grumpwalk.py --host cluster --path /var/log \
+  --name '*.log' --older-than 90 --type file \
+  --move-to /archive --dry-run
+
+# Run it for real (skip the prompt non-interactively)
+./grumpwalk.py --host cluster --path /var/log \
+  --name '*.log' --older-than 90 --type file \
+  --move-to /archive --yes
+```
+On a name collision the object is skipped with a warning; add `--clobber` to
+overwrite. If two different matches would land on the same name, both are
+skipped (overwriting one move with another is never intended).
+
+### How do I rename files in place?
+
+Use `--rename-to` without `--move-to`. The `{old|new}` form replaces matched
+text and leaves the rest of the name alone:
+```bash
+# Fix an extension: report.jpeg -> report.jpg
+./grumpwalk.py --host cluster --path /photos \
+  --name '*.jpeg' --rename-to '{.jpeg|.jpg}' --yes
+
+# Re-brand a prefix: my_file_1.jpg -> our_file_1.jpg
+./grumpwalk.py --host cluster --path /share \
+  --name 'my_*' --rename-to '{my|our}' --yes
+```
+`{old|new}` accepts regex on the match side and `*`/`?` wildcards that capture:
+`{IMG_*|photo_*}` turns `IMG_2024.jpg` into `photo_2024.jpg`; `{(\d+)|v\1}`
+turns `scan12.tif` into `scanv12.tif`; `{_draft|}` deletes `_draft` from names.
+
+A brace-less pattern is a whole-name template whose `*`/`?` come from the
+matching `--name` glob:
+```bash
+# my_report.csv -> our_report.csv
+./grumpwalk.py --host cluster --path /data \
+  --name 'my_*' --rename-to 'our_*' --yes
+```
+
+### How do I move and rename in one pass?
+
+Combine both flags:
+```bash
+# Move every *.log into /archive and give it a .txt extension
+./grumpwalk.py --host cluster --path /var/log \
+  --name '*.log' --move-to /archive --rename-to '{.log|.txt}' --yes
+```
+
+### How do I move whole directories?
+
+By default only files and symlinks move; matched directories are skipped. Add
+`--include-directories` to move directories with their entire subtree. Objects
+that would travel inside a moved directory are pruned so nothing is moved twice,
+and moving a directory into its own subtree is refused:
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --name '*_archived' --type directory \
+  --move-to /cold-storage --include-directories --yes
+```
+
+### How do I copy matching files (instead of moving them)?
+
+`--copy-to DEST` is the copy counterpart of `--move-to`. The copy happens
+server-side on the cluster (via the `copy-chunk` API - data is not streamed
+through grumpwalk), the source is left untouched, and each file is copied via a
+temp name then atomically renamed into place, so an interrupted run never leaves
+a partial destination:
+```bash
+# Copy every PDF created in the last 7 days into /review (preview first)
+./grumpwalk.py --host cluster --path /incoming \
+  --name '*.pdf' --created --newer-than 7 \
+  --copy-to /review --dry-run
+
+./grumpwalk.py --host cluster --path /incoming \
+  --name '*.pdf' --created --newer-than 7 \
+  --copy-to /review --yes
+```
+`--copy-to` composes with `--rename-to` (copy and rename in one pass) and uses
+the same collision rules as move: skip on a name clash unless `--clobber`.
+`--copy-to` and `--move-to` cannot be used together.
+
+### Does a copy keep the original's owner and permissions?
+
+No - by default a copy contains only the **data**. The new file is owned by you
+(the API user) and its permissions are inherited from the destination directory,
+exactly like plain `cp`. Two flags change that:
+
+- `--preserve-permissions` copies each source's **owner, group, and ACL/mode**:
+```bash
+./grumpwalk.py --host cluster --path /home/alice \
+  --name '*.key' --copy-to /backup/alice --preserve-permissions --yes
+```
+- `--preserve-all` copies **every settable attribute** - owner, group, ACL/mode,
+  DOS extended attributes (`read_only`, `hidden`, etc.), GENERIC user-metadata
+  tags, and timestamps (modification/access/creation):
+```bash
+./grumpwalk.py --host cluster --path /home/alice \
+  --name '*' --copy-to /backup/alice --preserve-all --yes
+```
+Note: `change_time` (ctime) always reflects the moment of the copy and cannot be
+preserved - copying a file is itself a metadata change. (This matches `cp -a` /
+`rsync`, which also cannot restore ctime.)
+
+### How do I copy whole directory trees?
+
+Add `--include-directories`. Each matched directory is recreated under the
+destination and its files, subdirectories, and symlinks are copied recursively
+(an existing target directory is skipped - there is no merge):
+```bash
+./grumpwalk.py --host cluster --path /projects \
+  --name 'release_*' --type directory \
+  --copy-to /archive --include-directories --preserve-all --yes
+```
+
+### What if the copy (or move) destination does not exist yet?
+
+By default a missing `--copy-to` (or `--move-to`) destination is an error. Add
+`--create-destination-directory` to create it (and any missing parent
+directories, like `mkdir -p`). It works the same way for both `--copy-to` and
+`--move-to`. grumpwalk then asks how the new directory should
+be permissioned - inherit the parent directory's permissions, or a specific
+POSIX mode:
+```bash
+./grumpwalk.py --host cluster --path /incoming \
+  --name '*.pdf' --copy-to /archive/2026/q2 --create-destination-directory
+# prompt: [I]nherit from parent or specify a [P]OSIX mode? [I/p]:
+```
+For unattended runs, choose the permissions up front (no prompt). `--yes`
+without a mode inherits from the parent:
+```bash
+# Inherit from parent, owned by a specific user
+./grumpwalk.py --host cluster --path /incoming \
+  --name '*.pdf' --copy-to /archive/2026/q2 \
+  --create-destination-directory --destination-directory-owner 'DOMAIN\dataops' --yes
+
+# Set an explicit mode on the new directories
+./grumpwalk.py --host cluster --path /incoming \
+  --name '*.pdf' --copy-to /archive/2026/q2 \
+  --create-destination-directory --destination-directory-mode 0750 --yes
+```
+Use `--dry-run` to see exactly which directories would be created (and with what
+permissions/owner) before anything is changed.
+
+> **Note:** `--destination-directory-mode` and `--destination-directory-owner`
+> apply only to directories grumpwalk *creates*. If the destination already
+> exists, they are ignored (grumpwalk prints a warning) and the existing
+> directory's owner and permissions are left unchanged - the copy/move still
+> proceeds into it.
 
 ---
 

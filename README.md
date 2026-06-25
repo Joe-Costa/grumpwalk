@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.1.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.2.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -412,6 +412,30 @@ Add, find, and remove custom key/value tags (Qumulo user metadata) on objects th
 
 A tag is applied to every matching object under `--path`; use `--max-depth 0` to act only on `--path` itself. Per-object lines are shown with `--dry-run` or `--verbose`, and `--progress` shows a running counter.
 
+### Move, Copy, and Rename Options
+
+Move, server-side copy, and/or rename objects matching the filters, modeled on POSIX `mv`/`cp`. A move is a single RENAME metadata operation; a copy uses the Qumulo `copy-chunk` API so data is copied on the cluster (not streamed through grumpwalk). Composes with all universal filters plus `--progress`, `--dry-run`, and `--limit`.
+
+- `--move-to DEST` - Move matching objects into the existing directory DEST. Matches are flattened into DEST (like `mv a/x b/x DEST/`).
+- `--copy-to DEST` - Server-side **copy** matching objects into the existing directory DEST (flattened, like `cp`). Mutually exclusive with `--move-to`. Each file is copied via a temp name and atomically renamed into place, so an interrupted copy never leaves a partial destination.
+- `--preserve-permissions` - With `--copy-to`, also copy each source's owner, group, and ACL/mode. Without it, only data is copied (owner becomes you, permissions inherited from DEST - like plain `cp`).
+- `--preserve-all` - With `--copy-to`, preserve every settable attribute: owner, group, ACL/mode, DOS extended attributes, GENERIC user-metadata tags, and timestamps (modification/access/creation). `change_time` (ctime) reflects the copy and cannot be preserved.
+- `--create-destination-directory` - With `--copy-to` or `--move-to`, create DEST (and any missing parents, like `mkdir -p`) if it does not exist. You are prompted to inherit permissions from the parent or set a POSIX mode. Without this flag a missing DEST is an error.
+  - `--destination-directory-mode MODE` - Set this octal mode (e.g. `0755`) on the new directories instead of prompting (omit to inherit from the parent; non-interactive runs without it inherit).
+  - `--destination-directory-owner OWNER` - Set the owner of the new directories (name, `uid:N`, SID, or `DOMAIN\user`).
+  - Note: the mode/owner flags apply only to directories grumpwalk creates. If DEST already exists they are ignored with a warning, and the copy/move proceeds into the existing directory unchanged.
+- `--rename-to PATTERN` - Rename matching objects. Two styles:
+  - **Substitution** `{old|new}` replaces matched text and leaves the rest of the name unchanged. Regex and `*`/`?` wildcards are supported: `{my|our}`, `{IMG_*|photo_*}`, `{(\d+)|v\1}`, `{.jpeg|.jpg}`, `{_old|}` (empty replacement deletes text).
+  - **Template** (no braces) is the whole new name; `*`/`?` are filled from the matching `--name` glob: `--name 'my_*' --rename-to 'our_*'`.
+
+  Use `--rename-to` alone to rename in place, or with `--move-to`/`--copy-to` to transfer and rename in one pass.
+- `--clobber` - Overwrite an existing destination entry (default: skip with a warning). Two matched sources mapping to the same target are always skipped, even with `--clobber`. For `--copy-to`, an existing target *directory* is skipped (no merge).
+- `--include-directories` - Also move/copy matched directories (the whole subtree). For `--copy-to`, the directory is recreated under DEST and its files, subdirectories, and symlinks are copied recursively. Descendants that travel with a transferred directory are pruned (not transferred twice), and transferring a directory into its own subtree is refused. Default: only files and symlinks are moved/copied.
+- `--move-concurrency N` / `--copy-concurrency N` - Concurrent move / copy operations (default: auto-tuned).
+- `--yes` - Skip the confirmation prompt. Required for non-interactive runs (grumpwalk refuses without confirmation otherwise).
+
+**Important:** Always use `--dry-run` first to preview the full `source -> target` plan before applying.
+
 ### Owner/Group Change Options
 
 Selective ownership changes - find files by current owner/group and change to a new owner/group.
@@ -638,18 +662,27 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 
 ### Glob Patterns (shell-style)
 ```bash
---name '*.log'           # All log files
---name 'test_*'          # Files starting with test_
+--name '*.log'           # Names ending in .log
+--name 'test_*'          # Names starting with test_ (NOT "mytest_1")
 --name 'file?.txt'       # file1.txt, fileA.txt, etc.
+--name 'report'          # Exactly "report" (no wildcards = exact name)
+--name '*report*'        # Any name containing "report"
 ```
+
+Globs match the **whole name** (like the shell), so `test_*` matches names that
+*begin* with `test_`, not names that merely contain it; a pattern with no
+wildcards matches the exact name. Always **quote** patterns (`--name 'file_*'`)
+so your shell does not expand the `*` against your local working directory
+before grumpwalk sees it.
 
 ### Regex Patterns
 ```bash
 --name '^test_.*\.py$'   # Python test files (anchored)
 --name '.*\.(jpg|png)$'  # Image files
+--name 'file_.*'         # Regex (the '.' makes it regex): any name CONTAINING file_
 ```
 
-**Auto-detection:** Patterns with `/`, `^`, `$`, or regex chars are treated as regex. Others as glob.
+**Auto-detection:** Patterns with `/`, `^`, `$`, or regex chars are treated as regex. Others as glob. Unlike globs, regex patterns are matched unanchored (substring); anchor them yourself with `^` and `$`.
 
 ### Combining Patterns (--name vs --name-and)
 ```bash

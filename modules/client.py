@@ -9,6 +9,7 @@ import asyncio
 import base64
 import copy
 import fnmatch
+import json
 import ssl
 import sys
 import time
@@ -625,6 +626,64 @@ class AsyncQumuloClient:
             except aiohttp.ClientError as e:
                 return (False, str(e))
 
+    async def set_file_mode(
+        self, session: aiohttp.ClientSession, path: str, mode: str
+    ) -> Tuple[bool, Optional[str]]:
+        """Set the POSIX mode on a file or directory (like chmod).
+
+        PATCHes /info/attributes with the octal mode string (e.g. "0755"). The
+        cluster maps the mode to the object's current owner/group/everyone, so
+        chown the object first if you want the owner bits to apply to a new owner.
+        Returns (success, error_message).
+        """
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+            url = f"{self.base_url}/v1/files/{quote(path, safe='')}/info/attributes"
+            try:
+                async with session.patch(url, json={"mode": mode}, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    error_msg = f"HTTP {response.status}"
+                    try:
+                        error_msg += f": {(await response.json()).get('description', '')}"
+                    except (aiohttp.ClientError, ValueError):
+                        pass
+                    return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
+    async def set_file_timestamps(
+        self, session: aiohttp.ClientSession, path: str, times: dict
+    ) -> Tuple[bool, Optional[str]]:
+        """Set timestamp fields on a file or directory (like utimes).
+
+        times may contain any of modification_time, access_time, creation_time
+        as RFC 3339 strings. change_time (ctime) is not settable in a meaningful
+        way because it reflects the last metadata change, so it is not accepted
+        here. Returns (success, error_message).
+        """
+        payload = {k: v for k, v in (times or {}).items()
+                   if k in ("modification_time", "access_time", "creation_time") and v}
+        if not payload:
+            return (True, None)
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+            url = f"{self.base_url}/v1/files/{quote(path, safe='')}/info/attributes"
+            try:
+                async with session.patch(url, json=payload, ssl=self.ssl_context) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    error_msg = f"HTTP {response.status}"
+                    try:
+                        error_msg += f": {(await response.json()).get('description', '')}"
+                    except (aiohttp.ClientError, ValueError):
+                        pass
+                    return (False, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
     async def get_file_user_metadata(
         self, session: aiohttp.ClientSession, path: str
     ) -> Optional[Dict[str, str]]:
@@ -735,6 +794,186 @@ class AsyncQumuloClient:
                     return (False, error_msg)
             except aiohttp.ClientError as e:
                 return (False, str(e))
+
+    async def rename_entry(
+        self,
+        session: aiohttp.ClientSession,
+        source_path: str,
+        dest_parent: str,
+        new_name: str,
+        clobber: bool = False,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Move/rename an object to <dest_parent>/<new_name> via the RENAME action.
+
+        A Qumulo move is a rename: POST to the destination parent's entries with
+        action RENAME, the new name, and old_path pointing at the source. Works
+        across directories within the cluster; moving a directory relocates its
+        whole subtree. clobber=True overwrites an existing destination entry
+        (the API returns fs_entry_exists_error otherwise).
+
+        Args:
+            session: aiohttp ClientSession
+            source_path: Absolute path of the object to move/rename
+            dest_parent: Absolute path of the destination directory
+            new_name: Name the object will have in dest_parent
+            clobber: Overwrite an existing destination entry
+
+        Returns:
+            Tuple of (success, error_class, error_message). error_class is the
+            Qumulo error_class string when the API supplies one (e.g.
+            'fs_entry_exists_error', 'fs_directory_cycle_error') so callers can
+            tell a collision apart from a hard failure. (True, None, None) on
+            success.
+        """
+        async with self.semaphore:
+            if not source_path.startswith("/"):
+                source_path = "/" + source_path
+            if not dest_parent.startswith("/"):
+                dest_parent = "/" + dest_parent
+
+            encoded_parent = quote(dest_parent, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_parent}/entries/"
+            payload = {
+                "name": new_name,
+                "action": "RENAME",
+                "old_path": source_path,
+                "clobber": bool(clobber),
+            }
+
+            try:
+                async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+                    if 200 <= response.status < 300:
+                        return (True, None, None)
+                    error_class = None
+                    description = ""
+                    try:
+                        detail = await response.json()
+                        error_class = detail.get("error_class")
+                        description = detail.get("description", "")
+                    except (aiohttp.ClientError, ValueError):
+                        pass
+                    error_msg = f"HTTP {response.status}"
+                    if error_class:
+                        error_msg += f" {error_class}"
+                    if description:
+                        error_msg += f": {description}"
+                    return (False, error_class, error_msg)
+            except aiohttp.ClientError as e:
+                return (False, None, str(e))
+
+    async def create_entry(
+        self,
+        session: aiohttp.ClientSession,
+        parent_path: str,
+        name: str,
+        action: str,
+        old_path: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Create a file, directory, or symlink under parent_path.
+
+        Thin wrapper over POST /v1/files/{parent}/entries/. action is one of
+        CREATE_FILE, CREATE_DIRECTORY, CREATE_SYMLINK. For CREATE_SYMLINK,
+        old_path is the link target.
+
+        Returns (success, error_class, error_message); error_class is the
+        Qumulo error_class when supplied (e.g. 'fs_entry_exists_error').
+        """
+        async with self.semaphore:
+            if not parent_path.startswith("/"):
+                parent_path = "/" + parent_path
+            encoded_parent = quote(parent_path, safe="")
+            url = f"{self.base_url}/v1/files/{encoded_parent}/entries/"
+            payload = {"name": name, "action": action}
+            if old_path is not None:
+                payload["old_path"] = old_path
+            try:
+                async with session.post(url, json=payload, ssl=self.ssl_context) as response:
+                    if 200 <= response.status < 300:
+                        return (True, None, None)
+                    error_class, description = None, ""
+                    try:
+                        detail = await response.json()
+                        error_class = detail.get("error_class")
+                        description = detail.get("description", "")
+                    except (aiohttp.ClientError, ValueError):
+                        pass
+                    msg = f"HTTP {response.status}"
+                    if error_class:
+                        msg += f" {error_class}"
+                    if description:
+                        msg += f": {description}"
+                    return (False, error_class, msg)
+            except aiohttp.ClientError as e:
+                return (False, None, str(e))
+
+    async def delete_entry(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> Tuple[bool, Optional[str]]:
+        """Delete a single file/empty-directory/symlink. Returns (ok, error)."""
+        async with self.semaphore:
+            if not path.startswith("/"):
+                path = "/" + path
+            url = f"{self.base_url}/v1/files/{quote(path, safe='')}"
+            try:
+                async with session.delete(url, ssl=self.ssl_context) as response:
+                    if 200 <= response.status < 300 or response.status == 404:
+                        return (True, None)
+                    return (False, f"HTTP {response.status}")
+            except aiohttp.ClientError as e:
+                return (False, str(e))
+
+    async def _copy_chunk(
+        self, session: aiohttp.ClientSession, target_path: str, body: dict
+    ) -> Tuple[int, Optional[dict], Optional[str]]:
+        """One copy-chunk call. Returns (status, response_json_or_None, error)."""
+        async with self.semaphore:
+            url = f"{self.base_url}/v1/files/{quote(target_path, safe='')}/copy-chunk"
+            try:
+                async with session.post(url, json=body, ssl=self.ssl_context) as response:
+                    text = await response.text()
+                    data = None
+                    if text:
+                        try:
+                            data = json.loads(text)
+                        except ValueError:
+                            data = None
+                    return (response.status, data, None if response.status == 200 else text[:200])
+            except aiohttp.ClientError as e:
+                return (0, None, str(e))
+
+    async def copy_file_data(
+        self, session: aiohttp.ClientSession, source_path: str, target_path: str
+    ) -> Tuple[bool, Optional[str]]:
+        """Server-side copy of a file's data into an existing target file.
+
+        Drives POST /v1/files/{target}/copy-chunk in a loop: the copy completes
+        when the server returns HTTP 200 with an empty body. For files larger
+        than the server's per-call limit, the response carries the remaining
+        source_offset/length, which is fed back as the next request. The target
+        file must already exist (a missing target returns fs_no_such_entry_error).
+
+        Returns (success, error_message).
+        """
+        if not source_path.startswith("/"):
+            source_path = "/" + source_path
+        if not target_path.startswith("/"):
+            target_path = "/" + target_path
+
+        body = {"source_path": source_path, "source_offset": "0", "target_offset": "0"}
+        prev_offset = -1
+        # Generous runaway guard; each iteration must advance the source offset.
+        for _ in range(1_000_000):
+            status, resp, err = await self._copy_chunk(session, target_path, body)
+            if status != 200:
+                return (False, err or f"copy-chunk HTTP {status}")
+            if not isinstance(resp, dict) or int(resp.get("length") or 0) <= 0:
+                return (True, None)
+            offset = int(resp.get("source_offset") or 0)
+            if offset <= prev_offset:
+                return (False, "copy-chunk made no progress")
+            prev_offset = offset
+            body = resp
+        return (False, "copy-chunk did not converge")
 
     async def delete_file_user_metadata(
         self,

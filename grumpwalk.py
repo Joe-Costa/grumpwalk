@@ -69,6 +69,8 @@ from modules import (
     parse_field_specs,
     extract_fields,
     convert_timestamps_to_epoch,
+    build_renamer,
+    RenamePatternError,
 )
 from modules.tuning import (
     load_tuning_profile,
@@ -2892,6 +2894,815 @@ async def find_tagged_objects(
     return stats
 
 
+def _mv_parent_of(path: str) -> str:
+    """Parent directory of an absolute path (no trailing slash, root-safe)."""
+    p = path.rstrip("/")
+    if "/" not in p:
+        return "/"
+    parent = p.rsplit("/", 1)[0]
+    return parent or "/"
+
+
+def _mv_basename(path: str) -> str:
+    """Final path component (no trailing slash)."""
+    p = path.rstrip("/")
+    return p.rsplit("/", 1)[-1] if "/" in p else p
+
+
+def _mv_join(parent: str, name: str) -> str:
+    """Join a destination directory and a name into an absolute path."""
+    if parent == "/":
+        return "/" + name
+    return parent.rstrip("/") + "/" + name
+
+
+def _mv_record_error(stats: dict, path: str, message: str) -> None:
+    stats["errors"].append({"path": path, "message": message})
+
+
+async def move_rename_objects(
+    client: AsyncQumuloClient,
+    session,
+    args,
+    file_filter,
+) -> dict:
+    """Move and/or rename objects matching the filters, POSIX-mv style.
+
+    Four phases: collect matches, plan every target (resolving renames,
+    collisions, directory pruning and self-containment), confirm (or print a
+    dry-run plan), then execute the renames concurrently. A Qumulo move is a
+    RENAME, so this is one metadata operation per object.
+
+    Returns a stats dict; the caller prints the summary and sets the exit code.
+    """
+    stats = {
+        "total_matched": 0, "planned": 0, "moved": 0, "failed": 0,
+        "skipped_directory": 0, "skipped_inside_moved_dir": 0,
+        "skipped_rename_no_match": 0, "skipped_rename_invalid": 0,
+        "skipped_noop": 0, "skipped_into_self": 0,
+        "skipped_target_collision": 0, "skipped_exists": 0,
+        "errors": [],
+    }
+
+    # Build the renamer first so a bad pattern fails before any cluster work.
+    renamer = None
+    if args.rename_to:
+        try:
+            renamer = build_renamer(args.rename_to, args.name_patterns or [])
+        except RenamePatternError as e:
+            log_stderr("ERROR", f"Invalid --rename-to pattern: {e}")
+            sys.exit(1)
+
+    # Validate the destination directory up front (if moving).
+    move_to = None
+    if args.move_to:
+        if not args.move_to.startswith("/"):
+            log_stderr("ERROR", "--move-to must be an absolute path")
+            sys.exit(1)
+        move_to = args.move_to.rstrip("/") or "/"
+        attrs = await client.get_file_attr(session, move_to)
+        if attrs is None:
+            if not args.create_destination_directory:
+                log_stderr("ERROR", f"--move-to destination does not exist: {move_to}")
+                log_stderr("HINT", "pass --create-destination-directory to create it")
+                sys.exit(1)
+            if not await _create_destination_directory(client, session, move_to, args):
+                sys.exit(1)
+            # In a real run the directory now exists; in --dry-run it does not, but
+            # planning only computes target path strings, so that is fine.
+        elif attrs.get("type") != "FS_FILE_TYPE_DIRECTORY":
+            log_stderr("ERROR", f"--move-to destination is not a directory: {move_to}")
+            sys.exit(1)
+        else:
+            # Destination already exists: owner/mode flags do not apply.
+            _warn_ignored_dest_dir_flags(args, move_to)
+
+    # Phase 1: collect matches.
+    progress = ProgressTracker(verbose=True, limit=args.limit) if args.progress else None
+    log_stderr("INFO", f"Scanning {args.path} for matches...")
+    entries = await client.walk_tree_async(
+        session,
+        args.path,
+        args.max_depth,
+        progress=progress,
+        file_filter=file_filter,
+        omit_subdirs=args.omit_subdirs,
+        omit_paths=args.omit_path,
+        collect_results=True,
+        verbose=args.verbose,
+        max_entries_per_dir=args.max_entries_per_dir,
+    )
+    if progress:
+        print(file=sys.stderr)
+    if args.limit and len(entries) > args.limit:
+        entries = entries[:args.limit]
+    stats["total_matched"] = len(entries)
+
+    # Phase 2: plan.
+    # 2a. Type gate: directories require --include-directories.
+    candidates = []  # (source, is_dir, old_name)
+    for e in entries:
+        src = e.get("path", "").rstrip("/")
+        if not src:
+            continue
+        is_dir = e.get("type") == "FS_FILE_TYPE_DIRECTORY"
+        if is_dir and not args.include_directories:
+            stats["skipped_directory"] += 1
+            continue
+        candidates.append((src, is_dir, _mv_basename(src)))
+
+    # 2b. Prune objects that live under a directory we are already moving; the
+    # subtree travels with its ancestor, so moving it again would fail.
+    if args.include_directories:
+        moved_dirs = {src for src, is_dir, _ in candidates if is_dir}
+
+        def _under_moved_dir(path: str) -> bool:
+            parent = _mv_parent_of(path)
+            while parent != "/":
+                if parent in moved_dirs:
+                    return True
+                parent = _mv_parent_of(parent)
+            return False
+
+        kept = []
+        for src, is_dir, name in candidates:
+            if _under_moved_dir(src):
+                stats["skipped_inside_moved_dir"] += 1
+                continue
+            kept.append((src, is_dir, name))
+        candidates = kept
+
+    # 2c. Resolve each target path.
+    planned = []  # {source, dest_parent, new_name, target, is_dir}
+    for src, is_dir, old_name in candidates:
+        new_name = old_name
+        if renamer:
+            r = renamer(old_name)
+            if r is None:
+                stats["skipped_rename_no_match"] += 1
+                continue
+            if r == "" or "/" in r:
+                stats["skipped_rename_invalid"] += 1
+                if args.verbose:
+                    log_stderr("SKIP", f"{src}: rename produced an invalid name: {r!r}")
+                continue
+            new_name = r
+        dest_parent = move_to if move_to else _mv_parent_of(src)
+        target = _mv_join(dest_parent, new_name)
+        if target == src:
+            stats["skipped_noop"] += 1
+            continue
+        if is_dir and (dest_parent == src or dest_parent.startswith(src + "/")):
+            stats["skipped_into_self"] += 1
+            continue
+        planned.append({
+            "source": src, "dest_parent": dest_parent,
+            "new_name": new_name, "target": target, "is_dir": is_dir,
+        })
+
+    # 2d. Global guard: the destination must not sit inside a directory we move.
+    if move_to:
+        for p in planned:
+            if p["is_dir"] and (move_to == p["source"] or move_to.startswith(p["source"] + "/")):
+                log_stderr("ERROR",
+                           f"--move-to {move_to} is inside a directory being moved "
+                           f"({p['source']}); aborting")
+                sys.exit(1)
+
+    # 2e. Intra-run collisions: two sources mapping to one target are both skipped
+    # (overwriting one moved object with another is never intended).
+    target_sources = {}
+    for p in planned:
+        target_sources.setdefault(p["target"], []).append(p)
+    deduped = []
+    for p in planned:
+        if len(target_sources[p["target"]]) > 1:
+            stats["skipped_target_collision"] += 1
+        else:
+            deduped.append(p)
+    planned = deduped
+    stats["planned"] = len(planned)
+
+    # Phase 3: dry-run prints the plan and stops; otherwise confirm.
+    if args.dry_run:
+        for p in planned:
+            log_stderr("DRY RUN", f"{p['source']} -> {p['target']}")
+        return stats
+
+    if not planned:
+        log_stderr("INFO", "Nothing to move after planning.")
+        return stats
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log_stderr("ERROR",
+                       "Refusing to move/rename without confirmation in non-interactive "
+                       "mode; pass --yes to proceed")
+            sys.exit(1)
+        verb = "move and rename" if (move_to and renamer) else ("move" if move_to else "rename")
+        print(f"\nAbout to {verb} {len(planned):,} object(s):", file=sys.stderr)
+        for p in planned[:5]:
+            print(f"  {p['source']} -> {p['target']}", file=sys.stderr)
+        if len(planned) > 5:
+            print(f"  ... and {len(planned) - 5:,} more", file=sys.stderr)
+        resp = input("Proceed? [y]es / [N]o: ").strip().lower()
+        if resp not in ("y", "yes"):
+            log_stderr("INFO", "Aborted by user.")
+            return stats
+
+    # Phase 4: execute with bounded concurrency.
+    sem = asyncio.Semaphore(max(1, args.move_concurrency))
+
+    async def _do_move(p):
+        async with sem:
+            ok, error_class, msg = await client.rename_entry(
+                session, p["source"], p["dest_parent"], p["new_name"], clobber=args.clobber)
+            return p, ok, error_class, msg
+
+    tasks = [asyncio.create_task(_do_move(p)) for p in planned]
+    done = 0
+    for fut in asyncio.as_completed(tasks):
+        p, ok, error_class, msg = await fut
+        done += 1
+        if ok:
+            stats["moved"] += 1
+            if args.verbose:
+                log_stderr("MOVED", f"{p['source']} -> {p['target']}", newline_before=args.progress)
+        elif error_class == "fs_entry_exists_error" and not args.clobber:
+            stats["skipped_exists"] += 1
+            log_stderr("SKIP", f"{p['target']} exists (use --clobber to overwrite)",
+                       newline_before=args.progress)
+        else:
+            stats["failed"] += 1
+            _mv_record_error(stats, p["source"], msg)
+            log_stderr("WARN" if args.continue_on_error else "ERROR",
+                       f"Failed: {p['source']} -> {p['target']}: {msg}",
+                       newline_before=args.progress)
+        if args.progress and done % 50 == 0:
+            print(f"\r[MOVE] {done:,}/{len(planned):,}", end="", file=sys.stderr, flush=True)
+    if args.progress:
+        print(file=sys.stderr)
+
+    return stats
+
+
+# Filesystem object type constants used by the copy driver.
+_FS_TYPE_DIR = "FS_FILE_TYPE_DIRECTORY"
+_FS_TYPE_SYMLINK = "FS_FILE_TYPE_SYMLINK"
+
+
+def _preserve_flags(args):
+    """Return (do_preserve, preserve_all) for the active copy preservation mode."""
+    return (bool(args.preserve_permissions or args.preserve_all), bool(args.preserve_all))
+
+
+async def _preserve_early(client, session, source_path, target_path, preserve_all, is_symlink=False):
+    """Preserve attributes that are safe to apply before a directory's children.
+
+    Always copies owner/group; for non-symlinks also the ACL/mode, and with
+    preserve_all the GENERIC user-metadata tags. DOS extended attributes and
+    timestamps are deferred to _preserve_late so they are applied last.
+    Best-effort: returns a short problem string, or None.
+    """
+    problems = []
+    og = await client.get_file_owner_group(session, source_path)
+    if og:
+        ok, err = await client.set_file_owner_group(
+            session, target_path, owner=og.get("owner"), group=og.get("group"))
+        if not ok:
+            problems.append(f"owner/group: {err}")
+    if not is_symlink:
+        acl = await client.get_file_acl(session, source_path)
+        if acl:
+            ok, err = await client.set_file_acl(session, target_path, acl)
+            if not ok:
+                problems.append(f"acl: {err}")
+        if preserve_all:
+            tags = await client.get_file_user_metadata(session, source_path)
+            if tags:
+                for key, value in tags.items():
+                    ok, err = await client.set_file_user_metadata(session, target_path, key, value)
+                    if not ok:
+                        problems.append(f"tag {key}: {err}")
+    return "; ".join(problems) if problems else None
+
+
+async def _preserve_late(client, session, source_path, target_path, is_symlink=False):
+    """Preserve attributes that must be applied LAST (only for --preserve-all).
+
+    DOS extended attributes (non-symlinks) and timestamps (modification/access/
+    creation). For a directory this must run AFTER its children are copied, or
+    creating the children would re-bump the directory's mtime. change_time
+    (ctime) is not preserved -- it always reflects the last metadata change.
+    Best-effort: returns a short problem string, or None.
+    """
+    problems = []
+    src = await client.get_file_attr(session, source_path)
+    if not src:
+        return "could not read source attributes"
+    if not is_symlink:
+        ea = src.get("extended_attributes")
+        if ea:
+            ok, err = await client.set_file_extended_attributes(session, target_path, ea)
+            if not ok:
+                problems.append(f"dos-attrs: {err}")
+    times = {k: src.get(k) for k in ("modification_time", "access_time", "creation_time") if src.get(k)}
+    if times:
+        ok, err = await client.set_file_timestamps(session, target_path, times)
+        if not ok:
+            problems.append(f"timestamps: {err}")
+    return "; ".join(problems) if problems else None
+
+
+async def _preserve_object(client, session, source_path, target_path, args, is_symlink=False):
+    """Apply both preserve phases to a non-directory object (file or symlink).
+
+    Directories must interleave the phases around their children, so they call
+    _preserve_early / _preserve_late directly instead.
+    """
+    do_preserve, preserve_all = _preserve_flags(args)
+    if not do_preserve:
+        return None
+    warns = []
+    early = await _preserve_early(client, session, source_path, target_path, preserve_all, is_symlink)
+    if early:
+        warns.append(early)
+    if preserve_all:
+        late = await _preserve_late(client, session, source_path, target_path, is_symlink)
+        if late:
+            warns.append(late)
+    return "; ".join(warns) if warns else None
+
+
+async def _copy_one_file(client, session, p, args, idx):
+    """Copy a single file via a temp file + atomic rename into place.
+
+    Copy-chunk does not truncate, and a mid-copy failure could corrupt an
+    existing destination, so the data is copied into a uniquely-named temp file
+    and renamed over the final name once the copy succeeds. Attributes are then
+    preserved on the final path (after the rename) so read_only/timestamps land
+    last. Returns (status, message): status is copied/skipped_exists/failed.
+    """
+    src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
+    temp_name = f".grumpwalk-copytmp.{os.getpid()}.{idx}.{new_name}"
+    ok, ec, err = await client.create_entry(session, dest_parent, temp_name, "CREATE_FILE")
+    if not ok:
+        return ("failed", f"create temp failed: {err}")
+    temp_path = _mv_join(dest_parent, temp_name)
+    ok, err = await client.copy_file_data(session, src, temp_path)
+    if not ok:
+        await client.delete_entry(session, temp_path)
+        return ("failed", f"copy failed: {err}")
+    ok, ec, err = await client.rename_entry(
+        session, temp_path, dest_parent, new_name, clobber=args.clobber)
+    if not ok:
+        await client.delete_entry(session, temp_path)
+        if ec == "fs_entry_exists_error":
+            return ("skipped_exists", None)
+        return ("failed", f"rename into place failed: {err}")
+    preserve_warn = await _preserve_object(client, session, src, p["target"], args)
+    return ("copied", preserve_warn)
+
+
+async def _copy_one_symlink(client, session, p, args):
+    """Recreate a symlink at the destination (read target + CREATE_SYMLINK)."""
+    src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
+    target_of = await client.read_symlink(session, src)
+    if target_of is None:
+        return ("failed", "could not read symlink target")
+    if args.clobber:
+        await client.delete_entry(session, p["target"])
+    ok, ec, err = await client.create_entry(
+        session, dest_parent, new_name, "CREATE_SYMLINK", old_path=target_of)
+    if not ok:
+        if ec == "fs_entry_exists_error":
+            return ("skipped_exists", None)
+        return ("failed", f"create symlink failed: {err}")
+    preserve_warn = await _preserve_object(client, session, src, p["target"], args, is_symlink=True)
+    return ("copied", preserve_warn)
+
+
+async def _copy_tree(client, session, source_dir, target_dir, args, stats):
+    """Recursively copy the contents of source_dir into an existing target_dir.
+
+    target_dir is created fresh by the caller, so there are no collisions inside
+    it. Directories, files, and symlinks are recreated; --preserve is applied to
+    each object. Per-object failures are recorded and do not abort the tree.
+    """
+    do_preserve, preserve_all = _preserve_flags(args)
+    children = await client.enumerate_directory(session, source_dir)
+    for child in children:
+        cpath = child.get("path", "").rstrip("/")
+        if not cpath:
+            continue
+        cname = _mv_basename(cpath)
+        ctype = child.get("type")
+        if ctype == _FS_TYPE_DIR:
+            ok, ec, err = await client.create_entry(session, target_dir, cname, "CREATE_DIRECTORY")
+            if not ok:
+                stats["tree_failed"] += 1
+                _mv_record_error(stats, cpath, f"mkdir failed: {err}")
+                continue
+            ctarget = _mv_join(target_dir, cname)
+            if do_preserve:
+                await _preserve_early(client, session, cpath, ctarget, preserve_all)
+            await _copy_tree(client, session, cpath, ctarget, args, stats)
+            if preserve_all:
+                await _preserve_late(client, session, cpath, ctarget)  # after children
+        elif ctype == _FS_TYPE_SYMLINK:
+            target_of = await client.read_symlink(session, cpath)
+            if target_of is None:
+                stats["tree_failed"] += 1
+                _mv_record_error(stats, cpath, "could not read symlink target")
+                continue
+            ok, ec, err = await client.create_entry(
+                session, target_dir, cname, "CREATE_SYMLINK", old_path=target_of)
+            if ok:
+                await _preserve_object(client, session, cpath, _mv_join(target_dir, cname),
+                                       args, is_symlink=True)
+                stats["copied_in_tree"] += 1
+            else:
+                stats["tree_failed"] += 1
+                _mv_record_error(stats, cpath, f"symlink failed: {err}")
+        else:
+            ok, ec, err = await client.create_entry(session, target_dir, cname, "CREATE_FILE")
+            if not ok:
+                stats["tree_failed"] += 1
+                _mv_record_error(stats, cpath, f"create failed: {err}")
+                continue
+            ctarget = _mv_join(target_dir, cname)
+            ok, err = await client.copy_file_data(session, cpath, ctarget)
+            if not ok:
+                stats["tree_failed"] += 1
+                _mv_record_error(stats, cpath, f"copy failed: {err}")
+                continue
+            await _preserve_object(client, session, cpath, ctarget, args)
+            stats["copied_in_tree"] += 1
+
+
+async def _copy_one_dir(client, session, p, args, stats):
+    """Copy a matched directory: create the top dir fresh, then recurse."""
+    src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
+    ok, ec, err = await client.create_entry(session, dest_parent, new_name, "CREATE_DIRECTORY")
+    if not ok:
+        if ec == "fs_entry_exists_error":
+            return ("skipped_exists", None)   # no directory merge in v1
+        return ("failed", f"mkdir failed: {err}")
+    target_dir = _mv_join(dest_parent, new_name)
+    do_preserve, preserve_all = _preserve_flags(args)
+    if do_preserve:
+        await _preserve_early(client, session, src, target_dir, preserve_all)
+    await _copy_tree(client, session, src, target_dir, args, stats)
+    if preserve_all:
+        await _preserve_late(client, session, src, target_dir)  # after children
+    return ("copied", None)
+
+
+def _normalize_mode(mode_str):
+    """Validate and normalize an octal POSIX mode (e.g. '755' -> '0755').
+
+    Returns the 4-character octal string, or None if the input is not a valid
+    3- or 4-digit octal mode.
+    """
+    if not mode_str:
+        return None
+    m = mode_str.strip()
+    if re.fullmatch(r"[0-7]{3,4}", m):
+        return m if len(m) == 4 else "0" + m
+    return None
+
+
+def _choose_new_dir_mode(args):
+    """Decide the new destination directory's permissions.
+
+    Returns an octal mode string to apply, or None to inherit from the parent
+    (the cluster's default). Uses --destination-directory-mode when given;
+    otherwise prompts interactively, defaulting to inherit in non-interactive
+    runs (--yes or no TTY).
+    """
+    if args.destination_directory_mode:
+        return _normalize_mode(args.destination_directory_mode)
+    if args.yes or not sys.stdin.isatty():
+        return None
+    while True:
+        resp = input("New destination directory permissions - "
+                     "[I]nherit from parent or specify a [P]OSIX mode? [I/p]: ").strip().lower()
+        if resp in ("", "i", "inherit"):
+            return None
+        if resp in ("p", "posix", "mode"):
+            while True:
+                entered = input("Enter POSIX mode (e.g. 0755): ").strip()
+                normalized = _normalize_mode(entered)
+                if normalized:
+                    return normalized
+                print("Invalid mode; use an octal value like 0755 or 750.")
+        print("Please answer I (inherit) or P (POSIX mode).")
+
+
+async def _resolve_owner_to_auth_id(client, session, spec):
+    """Resolve an owner spec (name, uid:N, SID, DOMAIN\\user, ...) to an auth_id."""
+    trustee = parse_trustee(spec)
+    payload, id_type = trustee["payload"], trustee["type"]
+    identifier = payload.get(id_type) if id_type in ("uid", "gid", "sid", "auth_id") else payload.get("name")
+    result = await client.resolve_identity(session, identifier, id_type)
+    if result and result.get("auth_id"):
+        return str(result["auth_id"])
+    return None
+
+
+async def _create_destination_directory(client, session, dest, args):
+    """Create dest and any missing parent directories (like mkdir -p).
+
+    Applies the chosen permissions (inherit-from-parent or an explicit POSIX
+    mode) and optional owner to each newly created directory. In --dry-run the
+    intended creations are printed and nothing is created. Returns True on
+    success (or would-succeed), False on failure.
+    """
+    # Walk up to the first existing ancestor, collecting the missing chain.
+    missing = []
+    p = dest
+    while p != "/":
+        existing = await client.get_file_attr(session, p)
+        if existing is not None:
+            if existing.get("type") != _FS_TYPE_DIR:
+                log_stderr("ERROR", f"Cannot create {dest}: {p} exists and is not a directory")
+                return False
+            break
+        missing.append(p)
+        p = _mv_parent_of(p)
+    missing.reverse()  # shallowest first
+    if not missing:
+        return True
+
+    owner_auth_id = None
+    if args.destination_directory_owner:
+        owner_auth_id = await _resolve_owner_to_auth_id(
+            client, session, args.destination_directory_owner)
+        if owner_auth_id is None:
+            log_stderr("ERROR",
+                       f"Could not resolve --destination-directory-owner "
+                       f"'{args.destination_directory_owner}'")
+            return False
+
+    mode = _choose_new_dir_mode(args)
+    perm_desc = f"POSIX mode {mode}" if mode else "inherited from parent"
+    owner_desc = f", owner {args.destination_directory_owner}" if owner_auth_id else ""
+
+    if args.dry_run:
+        for m in missing:
+            log_stderr("DRY RUN", f"Would create directory {m} ({perm_desc}{owner_desc})")
+        return True
+
+    for m in missing:
+        parent, name = _mv_parent_of(m), _mv_basename(m)
+        ok, ec, err = await client.create_entry(session, parent, name, "CREATE_DIRECTORY")
+        if not ok:
+            log_stderr("ERROR", f"Failed to create directory {m}: {err}")
+            return False
+        # Chown before chmod so the mode's owner bits apply to the new owner.
+        if owner_auth_id:
+            ok2, err2 = await client.set_file_owner_group(session, m, owner=owner_auth_id)
+            if not ok2:
+                log_stderr("WARN", f"Created {m} but could not set owner: {err2}")
+        if mode:
+            ok3, err3 = await client.set_file_mode(session, m, mode)
+            if not ok3:
+                log_stderr("WARN", f"Created {m} but could not set mode {mode}: {err3}")
+        log_stderr("INFO", f"Created directory {m} ({perm_desc}{owner_desc})")
+    return True
+
+
+def _warn_ignored_dest_dir_flags(args, dest):
+    """Warn that --destination-directory-owner/-mode were ignored.
+
+    These only apply to directories grumpwalk creates; when the destination
+    already exists they have no effect, so make that visible rather than silently
+    doing nothing.
+    """
+    ignored = []
+    if args.destination_directory_owner:
+        ignored.append(f"--destination-directory-owner {args.destination_directory_owner}")
+    if args.destination_directory_mode:
+        ignored.append(f"--destination-directory-mode {args.destination_directory_mode}")
+    if ignored:
+        log_stderr("WARN", f"Destination {dest} already exists; ignoring "
+                           f"{', '.join(ignored)} (applies only to newly created directories). "
+                           f"The existing directory's owner and permissions are unchanged.")
+
+
+async def copy_objects(client, session, args, file_filter) -> dict:
+    """Server-side copy of objects matching the filters, POSIX cp style.
+
+    Files are copied with copy-chunk; with --include-directories matched
+    directories are recreated and their subtree copied. --rename-to renames the
+    copied object; --preserve also copies owner/group/ACL. Collect -> plan ->
+    confirm -> execute, mirroring move_rename_objects.
+    """
+    stats = {
+        "total_matched": 0, "planned": 0, "copied": 0, "failed": 0,
+        "copied_in_tree": 0, "tree_failed": 0,
+        "skipped_directory": 0, "skipped_inside_copied_dir": 0,
+        "skipped_rename_no_match": 0, "skipped_rename_invalid": 0,
+        "skipped_noop": 0, "skipped_into_self": 0,
+        "skipped_target_collision": 0, "skipped_exists": 0,
+        "errors": [],
+    }
+
+    renamer = None
+    if args.rename_to:
+        try:
+            renamer = build_renamer(args.rename_to, args.name_patterns or [])
+        except RenamePatternError as e:
+            log_stderr("ERROR", f"Invalid --rename-to pattern: {e}")
+            sys.exit(1)
+
+    if not args.copy_to.startswith("/"):
+        log_stderr("ERROR", "--copy-to must be an absolute path")
+        sys.exit(1)
+    copy_to = args.copy_to.rstrip("/") or "/"
+    dest_attrs = await client.get_file_attr(session, copy_to)
+    if dest_attrs is None:
+        if not args.create_destination_directory:
+            log_stderr("ERROR", f"--copy-to destination does not exist: {copy_to}")
+            log_stderr("HINT", "pass --create-destination-directory to create it")
+            sys.exit(1)
+        if not await _create_destination_directory(client, session, copy_to, args):
+            sys.exit(1)
+        # In a real run the directory now exists; in --dry-run it does not, but
+        # planning only computes target path strings, so that is fine.
+    elif dest_attrs.get("type") != _FS_TYPE_DIR:
+        log_stderr("ERROR", f"--copy-to destination is not a directory: {copy_to}")
+        sys.exit(1)
+    else:
+        # Destination already exists: owner/mode flags do not apply.
+        _warn_ignored_dest_dir_flags(args, copy_to)
+
+    # Phase 1: collect matches.
+    progress = ProgressTracker(verbose=True, limit=args.limit) if args.progress else None
+    log_stderr("INFO", f"Scanning {args.path} for matches...")
+    entries = await client.walk_tree_async(
+        session, args.path, args.max_depth, progress=progress, file_filter=file_filter,
+        omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
+        collect_results=True, verbose=args.verbose,
+        max_entries_per_dir=args.max_entries_per_dir,
+    )
+    if progress:
+        print(file=sys.stderr)
+    if args.limit and len(entries) > args.limit:
+        entries = entries[:args.limit]
+    stats["total_matched"] = len(entries)
+
+    # Phase 2: plan.
+    candidates = []  # (source, kind, old_name); kind in {file, dir, symlink}
+    for e in entries:
+        src = e.get("path", "").rstrip("/")
+        if not src:
+            continue
+        etype = e.get("type")
+        is_dir = etype == _FS_TYPE_DIR
+        if is_dir and not args.include_directories:
+            stats["skipped_directory"] += 1
+            continue
+        kind = "dir" if is_dir else ("symlink" if etype == _FS_TYPE_SYMLINK else "file")
+        candidates.append((src, kind, _mv_basename(src)))
+
+    if args.include_directories:
+        copied_dirs = {src for src, kind, _ in candidates if kind == "dir"}
+
+        def _under_copied_dir(path):
+            parent = _mv_parent_of(path)
+            while parent != "/":
+                if parent in copied_dirs:
+                    return True
+                parent = _mv_parent_of(parent)
+            return False
+
+        kept = []
+        for src, kind, name in candidates:
+            if _under_copied_dir(src):
+                stats["skipped_inside_copied_dir"] += 1
+                continue
+            kept.append((src, kind, name))
+        candidates = kept
+
+    planned = []  # {source, dest_parent, new_name, target, kind}
+    for src, kind, old_name in candidates:
+        new_name = old_name
+        if renamer:
+            r = renamer(old_name)
+            if r is None:
+                stats["skipped_rename_no_match"] += 1
+                continue
+            if r == "" or "/" in r:
+                stats["skipped_rename_invalid"] += 1
+                continue
+            new_name = r
+        target = _mv_join(copy_to, new_name)
+        if target == src:
+            stats["skipped_noop"] += 1
+            continue
+        if kind == "dir" and (copy_to == src or copy_to.startswith(src + "/")):
+            stats["skipped_into_self"] += 1
+            continue
+        planned.append({"source": src, "dest_parent": copy_to,
+                        "new_name": new_name, "target": target, "kind": kind})
+
+    # The destination must not sit inside a directory we copy (would recurse into
+    # the growing copy).
+    for p in planned:
+        if p["kind"] == "dir" and (copy_to == p["source"] or copy_to.startswith(p["source"] + "/")):
+            log_stderr("ERROR",
+                       f"--copy-to {copy_to} is inside a directory being copied "
+                       f"({p['source']}); aborting")
+            sys.exit(1)
+
+    target_sources = {}
+    for p in planned:
+        target_sources.setdefault(p["target"], []).append(p)
+    deduped = []
+    for p in planned:
+        if len(target_sources[p["target"]]) > 1:
+            stats["skipped_target_collision"] += 1
+        else:
+            deduped.append(p)
+    planned = deduped
+    stats["planned"] = len(planned)
+
+    if args.dry_run:
+        for p in planned:
+            suffix = "/" if p["kind"] == "dir" else ""
+            log_stderr("DRY RUN", f"{p['source']}{suffix} -> {p['target']}{suffix}")
+        return stats
+
+    if not planned:
+        log_stderr("INFO", "Nothing to copy after planning.")
+        return stats
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log_stderr("ERROR",
+                       "Refusing to copy without confirmation in non-interactive mode; "
+                       "pass --yes to proceed")
+            sys.exit(1)
+        verb = "copy and rename" if renamer else "copy"
+        if args.preserve_all:
+            preserve_note = " (preserving all attributes)"
+        elif args.preserve_permissions:
+            preserve_note = " (preserving owner/group/ACL)"
+        else:
+            preserve_note = ""
+        print(f"\nAbout to {verb} {len(planned):,} object(s) to {copy_to}"
+              f"{preserve_note}:", file=sys.stderr)
+        for p in planned[:5]:
+            print(f"  {p['source']} -> {p['target']}", file=sys.stderr)
+        if len(planned) > 5:
+            print(f"  ... and {len(planned) - 5:,} more", file=sys.stderr)
+        resp = input("Proceed? [y]es / [N]o: ").strip().lower()
+        if resp not in ("y", "yes"):
+            log_stderr("INFO", "Aborted by user.")
+            return stats
+
+    # Phase 4: execute with bounded concurrency.
+    sem = asyncio.Semaphore(max(1, args.copy_concurrency))
+
+    async def _run(p, idx):
+        async with sem:
+            if p["kind"] == "dir":
+                return p, await _copy_one_dir(client, session, p, args, stats)
+            if p["kind"] == "symlink":
+                return p, await _copy_one_symlink(client, session, p, args)
+            return p, await _copy_one_file(client, session, p, args, idx)
+
+    tasks = [asyncio.create_task(_run(p, i)) for i, p in enumerate(planned)]
+    done = 0
+    for fut in asyncio.as_completed(tasks):
+        p, (status, message) = await fut
+        done += 1
+        if status == "copied":
+            stats["copied"] += 1
+            if args.verbose:
+                log_stderr("COPIED", f"{p['source']} -> {p['target']}", newline_before=args.progress)
+            if message:  # preserve warning
+                log_stderr("WARN", f"{p['target']}: preserve incomplete: {message}",
+                           newline_before=args.progress)
+        elif status == "skipped_exists":
+            stats["skipped_exists"] += 1
+            log_stderr("SKIP", f"{p['target']} exists (use --clobber to overwrite)",
+                       newline_before=args.progress)
+        else:
+            stats["failed"] += 1
+            _mv_record_error(stats, p["source"], message or "copy failed")
+            log_stderr("WARN" if args.continue_on_error else "ERROR",
+                       f"Failed: {p['source']} -> {p['target']}: {message}",
+                       newline_before=args.progress)
+        if args.progress and done % 25 == 0:
+            print(f"\r[COPY] {done:,}/{len(planned):,}", end="", file=sys.stderr, flush=True)
+    if args.progress:
+        print(file=sys.stderr)
+
+    return stats
+
+
 async def recurse_ace_modifications_to_tree(
     client: AsyncQumuloClient,
     session: aiohttp.ClientSession,
@@ -4808,6 +5619,120 @@ async def main_async(args):
                     f"Inheritance propagation complete: {', '.join(summary_parts)}",
                     newline_before=True)
 
+        return
+
+    # COPY MODE: server-side copy matching objects (POSIX cp style)
+    if args.copy_to:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+            stats = await copy_objects(client, session, args, file_filter)
+
+            dry_label = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nCOPY SUMMARY{dry_label}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            print(f"Destination:       {args.copy_to}", file=sys.stderr)
+            if args.rename_to:
+                print(f"Rename pattern:    {args.rename_to}", file=sys.stderr)
+            if args.preserve_all:
+                print(f"Preserve:          all attributes (owner, group, ACL/mode, "
+                      f"DOS attrs, tags, timestamps)", file=sys.stderr)
+            elif args.preserve_permissions:
+                print(f"Preserve:          owner, group, ACL/mode", file=sys.stderr)
+            print(f"Matched:           {stats['total_matched']:,}", file=sys.stderr)
+            copied_label = "Would copy:" if args.dry_run else "Copied:"
+            copied_count = stats["planned"] if args.dry_run else stats["copied"]
+            print(f"{copied_label:<19}{copied_count:,}", file=sys.stderr)
+            if stats["copied_in_tree"]:
+                print(f"  (+{stats['copied_in_tree']:,} objects inside copied directories)", file=sys.stderr)
+
+            copy_skip_lines = [
+                ("skipped_directory", "Directories skipped (use --include-directories)"),
+                ("skipped_inside_copied_dir", "Travel with a copied directory"),
+                ("skipped_rename_no_match", "Rename pattern did not match"),
+                ("skipped_rename_invalid", "Rename produced an invalid name"),
+                ("skipped_noop", "Source and target identical"),
+                ("skipped_into_self", "Cannot copy a directory into itself"),
+                ("skipped_target_collision", "Multiple sources to one target"),
+                ("skipped_exists", "Target exists (use --clobber)"),
+            ]
+            for key, label in copy_skip_lines:
+                if stats[key]:
+                    print(f"  {label}: {stats[key]:,}", file=sys.stderr)
+            if not args.dry_run:
+                print(f"Failed:            {stats['failed'] + stats['tree_failed']:,}", file=sys.stderr)
+
+            if stats["errors"]:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats["errors"][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats["errors"]) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+            if stats["failed"] + stats["tree_failed"] > 0:
+                sys.exit(1)
+        return
+
+    # MOVE / RENAME MODE: move and/or rename matching objects (POSIX mv style)
+    if args.move_to or args.rename_to:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+                if owner_auth_ids:
+                    print(f"Filtering by {len(owner_auth_ids)} owner auth_id(s)", file=sys.stderr)
+
+            file_filter = create_file_filter(args, owner_auth_ids)
+            stats = await move_rename_objects(client, session, args, file_filter)
+
+            dry_label = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nMOVE / RENAME SUMMARY{dry_label}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            if args.move_to:
+                print(f"Destination:       {args.move_to}", file=sys.stderr)
+            if args.rename_to:
+                print(f"Rename pattern:    {args.rename_to}", file=sys.stderr)
+            print(f"Matched:           {stats['total_matched']:,}", file=sys.stderr)
+            moved_label = "Would move:" if args.dry_run else "Moved:"
+            moved_count = stats["planned"] if args.dry_run else stats["moved"]
+            print(f"{moved_label:<19}{moved_count:,}", file=sys.stderr)
+
+            skip_lines = [
+                ("skipped_directory", "Directories skipped (use --include-directories)"),
+                ("skipped_inside_moved_dir", "Travel with a moved directory"),
+                ("skipped_rename_no_match", "Rename pattern did not match"),
+                ("skipped_rename_invalid", "Rename produced an invalid name"),
+                ("skipped_noop", "Already at target (no change)"),
+                ("skipped_into_self", "Cannot move a directory into itself"),
+                ("skipped_target_collision", "Multiple sources to one target"),
+                ("skipped_exists", "Target exists (use --clobber)"),
+            ]
+            for key, label in skip_lines:
+                if stats[key]:
+                    print(f"  {label}: {stats[key]:,}", file=sys.stderr)
+            if not args.dry_run:
+                print(f"Failed:            {stats['failed']:,}", file=sys.stderr)
+
+            if stats["errors"]:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats["errors"][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+                if len(stats["errors"]) > 10:
+                    print(f"  ... and {len(stats['errors']) - 10} more", file=sys.stderr)
+
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+            if stats["failed"] > 0:
+                sys.exit(1)
         return
 
     # ACL Cloning Mode
@@ -8358,6 +9283,101 @@ Examples:
     )
 
     # ============================================================================
+    # FEATURE: MOVE AND RENAME
+    # ============================================================================
+    move_rename = parser.add_argument_group('Feature: Move, Copy, and Rename',
+        'Move, server-side copy, and/or rename objects matching the filters, like POSIX mv/cp')
+    move_rename.add_argument(
+        "--move-to",
+        metavar="DEST",
+        help="Move matching objects into the existing directory DEST (flattened, "
+             "like mv). On a name collision the object is skipped with a warning "
+             "unless --clobber is given.",
+    )
+    move_rename.add_argument(
+        "--copy-to",
+        metavar="DEST",
+        help="Server-side copy matching objects into the existing directory DEST "
+             "(flattened, like cp). Files are copied with copy-chunk; add "
+             "--include-directories to copy matched directory subtrees. Mutually "
+             "exclusive with --move-to.",
+    )
+    move_rename.add_argument(
+        "--rename-to",
+        metavar="PATTERN",
+        help="Rename matching objects. '{old|new}' substitutes within the name "
+             "(regex and * wildcards supported); a pattern without braces is a "
+             "whole-name template whose * / ? come from the matching --name glob. "
+             "Use alone to rename in place, or with --move-to/--copy-to.",
+    )
+    move_rename.add_argument(
+        "--preserve-permissions",
+        action="store_true",
+        help="With --copy-to, also copy each source's owner, group, and ACL/mode "
+             "to the copy (default: copies data only, like plain cp).",
+    )
+    move_rename.add_argument(
+        "--preserve-all",
+        action="store_true",
+        help="With --copy-to, preserve every settable attribute: owner, group, "
+             "ACL/mode, DOS extended attributes, GENERIC user-metadata tags, and "
+             "timestamps (modification/access/creation). change_time always "
+             "reflects the copy and cannot be preserved.",
+    )
+    move_rename.add_argument(
+        "--create-destination-directory",
+        action="store_true",
+        help="With --copy-to or --move-to, create the destination directory (and "
+             "any missing parents) if it does not exist. You are prompted to "
+             "either inherit permissions from the parent or set a POSIX mode (see "
+             "--destination-directory-mode to choose non-interactively).",
+    )
+    move_rename.add_argument(
+        "--destination-directory-mode",
+        metavar="MODE",
+        help="With --create-destination-directory, set this octal POSIX mode "
+             "(e.g. 0755) on newly created directories instead of prompting. "
+             "Omit to inherit permissions from the parent directory.",
+    )
+    move_rename.add_argument(
+        "--destination-directory-owner",
+        metavar="OWNER",
+        help="With --create-destination-directory, set the owner of newly created "
+             "directories (name, uid:N, SID, or DOMAIN\\user).",
+    )
+    move_rename.add_argument(
+        "--clobber",
+        action="store_true",
+        help="Overwrite an existing destination entry (default: skip with a warning). "
+             "For --copy-to this applies to files; an existing target directory is skipped.",
+    )
+    move_rename.add_argument(
+        "--include-directories",
+        action="store_true",
+        help="Also move/copy matched directories (the whole subtree). "
+             "Default: only files and symlinks are moved/copied.",
+    )
+    move_rename.add_argument(
+        "--move-concurrency",
+        type=int,
+        default=default_acl_concurrency,
+        metavar="N",
+        help=f"Concurrent move/rename operations (default: {default_acl_concurrency})",
+    )
+    move_rename.add_argument(
+        "--copy-concurrency",
+        type=int,
+        default=default_acl_concurrency,
+        metavar="N",
+        help=f"Concurrent copy operations (default: {default_acl_concurrency})",
+    )
+    move_rename.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt before moving/copying/renaming.",
+    )
+
+    # ============================================================================
     # FEATURE: EXTENDED ATTRIBUTE MANAGEMENT
     # ============================================================================
     attr_management = parser.add_argument_group('Feature: Extended Attribute Management',
@@ -8774,6 +9794,8 @@ Examples:
             conflicting.append("--set-attribute-true/--set-attribute-false")
         if args.owner_report or args.acl_report:
             conflicting.append("--owner-report/--acl-report")
+        if args.move_to or args.rename_to or args.copy_to:
+            conflicting.append("--move-to/--copy-to/--rename-to")
         if conflicting:
             print(
                 f"Error: {tag_mode} cannot be combined with: {', '.join(conflicting)}",
@@ -8782,6 +9804,79 @@ Examples:
             sys.exit(1)
     elif args.key or args.value or args.overwrite:
         print("Error: --key/--value/--overwrite require --add-tag, --find-tag, or --remove-tag", file=sys.stderr)
+        sys.exit(1)
+
+    # Move / Rename mode validation
+    # --copy-to and --move-to are mutually exclusive transfer modes.
+    if args.copy_to and args.move_to:
+        print("Error: --copy-to and --move-to cannot be combined; choose one", file=sys.stderr)
+        sys.exit(1)
+    if (args.preserve_permissions or args.preserve_all) and not args.copy_to:
+        print("Error: --preserve-permissions/--preserve-all require --copy-to", file=sys.stderr)
+        sys.exit(1)
+    if args.create_destination_directory and not (args.copy_to or args.move_to):
+        print("Error: --create-destination-directory requires --copy-to or --move-to", file=sys.stderr)
+        sys.exit(1)
+    if (args.destination_directory_owner or args.destination_directory_mode) \
+            and not args.create_destination_directory:
+        print("Error: --destination-directory-owner/--destination-directory-mode "
+              "require --create-destination-directory", file=sys.stderr)
+        sys.exit(1)
+    if args.destination_directory_mode and _normalize_mode(args.destination_directory_mode) is None:
+        print(f"Error: invalid --destination-directory-mode "
+              f"'{args.destination_directory_mode}'; use an octal mode like 0755", file=sys.stderr)
+        sys.exit(1)
+
+    copy_mode = bool(args.copy_to)
+    # --rename-to alone (no --copy-to) is handled by the move/rename driver.
+    move_rename_mode = bool(args.move_to or args.rename_to) and not copy_mode
+
+    def _transfer_conflicts(label):
+        conflicts = []
+        if args.source_acl or args.source_acl_file or args.acl_target:
+            conflicts.append("--source-acl/--acl-target")
+        if args.set_mode:
+            conflicts.append("--set-mode")
+        if args.disable_inheritance:
+            conflicts.append("--disable-inheritance")
+        if getattr(args, 'ace_restore', None):
+            conflicts.append("--ace-restore")
+        if (args.change_owner or args.change_group or
+                args.change_owners_file or args.change_groups_file):
+            conflicts.append("--change-owner/--change-group")
+        if getattr(args, 'set_attribute_true', None) or getattr(args, 'set_attribute_false', None):
+            conflicts.append("--set-attribute-true/--set-attribute-false")
+        if args.owner_report or args.acl_report:
+            conflicts.append("--owner-report/--acl-report")
+        if conflicts:
+            print(f"Error: {label} cannot be combined with: {', '.join(conflicts)}", file=sys.stderr)
+            sys.exit(1)
+
+    if copy_mode:
+        if not args.path:
+            print("Error: --copy-to requires --path", file=sys.stderr)
+            sys.exit(1)
+        if args.rename_to:
+            try:
+                build_renamer(args.rename_to, args.name_patterns or [])
+            except RenamePatternError as e:
+                print(f"Error: invalid --rename-to pattern: {e}", file=sys.stderr)
+                sys.exit(1)
+        _transfer_conflicts("--copy-to")
+    elif move_rename_mode:
+        if not args.path:
+            print("Error: --move-to/--rename-to requires --path", file=sys.stderr)
+            sys.exit(1)
+        if args.rename_to:
+            try:
+                build_renamer(args.rename_to, args.name_patterns or [])
+            except RenamePatternError as e:
+                print(f"Error: invalid --rename-to pattern: {e}", file=sys.stderr)
+                sys.exit(1)
+        _transfer_conflicts("--move-to/--rename-to")
+    elif args.clobber or args.include_directories or args.yes:
+        print("Error: --clobber/--include-directories/--yes require --move-to, --copy-to, or --rename-to",
+              file=sys.stderr)
         sys.exit(1)
 
     # Validate and parse --fields

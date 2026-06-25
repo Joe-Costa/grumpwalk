@@ -64,6 +64,12 @@ from .filters import (
     parse_attribute_list,
 )
 
+# Import rename/move transform engine
+from .rename import (
+    build_renamer,
+    RenamePatternError,
+)
+
 __all__ = [
     # Utils
     "log_stderr",
@@ -107,4 +113,7 @@ __all__ = [
     "FINDABLE_ATTRIBUTES",
     "SETTABLE_ATTRIBUTES",
     "parse_attribute_list",
+    # Rename / move
+    "build_renamer",
+    "RenamePatternError",
 ]

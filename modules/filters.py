@@ -202,8 +202,11 @@ def glob_to_regex(pattern: str) -> str:
     Convert a glob pattern to a regex pattern.
     Supports common glob wildcards: *, ?, [seq], [!seq]
 
-    If the pattern is already a valid regex (contains regex special chars
-    that aren't glob chars), return it as-is.
+    Globs are anchored to the whole name (standard shell-glob semantics), so
+    'file_*' matches names that begin with 'file_', not names that merely
+    contain it. If the pattern is already a valid regex (contains regex special
+    chars that aren't glob chars), it is returned as-is and stays unanchored so
+    callers' re.search keeps its substring behavior.
 
     Args:
         pattern: Glob or regex pattern
@@ -233,8 +236,13 @@ def glob_to_regex(pattern: str) -> str:
             # If it fails, fall through to glob conversion
             pass
 
-    # Convert glob to regex using fnmatch
-    return fnmatch.translate(pattern)
+    # Convert glob to regex using fnmatch. fnmatch.translate anchors only the
+    # end (\Z); name filters match with re.search, so without a start anchor a
+    # glob would match any name *containing* the pattern (e.g. 'file_*' would
+    # match 'myfile_1'). Prepend \A so a glob matches the WHOLE name, matching
+    # standard shell-glob semantics. User-written regexes (returned above,
+    # unanchored) keep their re.search behavior.
+    return r"\A" + fnmatch.translate(pattern)
 
 
 def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
