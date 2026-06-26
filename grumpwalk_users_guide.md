@@ -33,10 +33,27 @@ A practical guide with recipes for common storage administration tasks using gru
 
 ### Prerequisites
 
-1. **Authentication**: Generate a Qumulo bearer token:
+1. **Authentication**: grumpwalk needs Qumulo credentials. There are two ways to provide them.
+
+   **Long-lived API access key (preferred)** - Create an access key (see
+   [Qumulo: creating and using access tokens](https://docs.qumulo.com/administrator-guide/connecting-to-external-services/creating-using-access-tokens-to-authenticate-external-services-qumulo-core.html)),
+   save it to a file, and point grumpwalk at that file with `--credentials-store`:
    ```bash
-   qq login -h your-cluster.example.com
+   ./grumpwalk.py --host cluster.example.com --credentials-store /path/to/keyfile ...
    ```
+
+   **Temporary login with the `qq` CLI (expires after 10 hours)** - if you have the
+   `qq` CLI installed:
+   ```bash
+   qq --host cluster.example.com login -u "DOMAIN\user"
+   ```
+   This writes a `.qfsd_cred` file to your home directory, which grumpwalk uses
+   automatically (no `--credentials-store` needed). This method is often more
+   convenient if you switch between clusters frequently or prefer tokens that
+   expire on their own.
+
+   Log in as a user with the RBAC rights for whatever grumpwalk will do, and treat
+   these keys like any other credentials - secure them properly.
 
 2. **Dependencies**: Install required packages:
    ```bash
