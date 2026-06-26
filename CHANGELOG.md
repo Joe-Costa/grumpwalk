@@ -5,12 +5,12 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.3.0] - 2026-06-25
+## [3.3.0] - 2026-06-26
 
 ### Added
 
 - **Snapshots: search, copy, and restore.** Qumulo provides no native snapshot-restore call, so grumpwalk lists snapshots and uses the read endpoints' `?snapshot=` parameter (to crawl/search a snapshot) together with `copy-chunk`'s `source_snapshot` field (to copy a file's snapshot version into a live target). All existing filters and output apply in snapshot context.
-- **`--list-snapshots`** - List available snapshots (id, timestamp, name, resolved source path) and exit. Honors `--snapshots-newer-than`/`--snapshots-older-than`.
+- **`--list-snapshots`** - List available snapshots (id, timestamp, name, resolved source path) and exit. Honors `--snapshots-newer-than`/`--snapshots-older-than`; with `--path`, lists only the snapshots whose source covers that path (the path itself or an ancestor).
 - **`--snapshot ID`** - Run the crawl/search in the context of snapshot ID (every read uses `?snapshot=ID`). Finds files as they were at snapshot time, **including files deleted since**. Composes with every universal filter and with `--copy-to`/`--restore-in-place`.
 - **`--all-snapshots`** - Search across ALL snapshots instead of one. Each match is annotated with its snapshot (a `snapshot` field in `--json`, a `[snap N]` prefix otherwise). Used in place of `--path`; if `--path` is given, only snapshots whose source covers that path are searched (reliable `source_file_id` containment, not a read-probe). Search-only.
 - **`--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION`** - With `--all-snapshots`/`--in-the-last-snapshots`/`--list-snapshots`, limit the snapshot set by each snapshot's own age (distinct from `--older-than`/`--newer-than`, which filter files). DURATION accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. Ages are computed in UTC against the snapshots' UTC timestamps.
@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--show-details`** - Show the attributes of matched results instead of just their paths, for **snapshot search** (`--snapshot`/`--all-snapshots`/`--in-the-last-snapshots`) and the live filtered walk. Defaults to `path`, human-readable `size`, and `change_time` (ctime). Renders an aligned table to stdout, or honors `--csv-out` / `--json-out` / `--json` (in those machine formats `size` stays raw bytes). In multi-snapshot search each row carries the source snapshot (a `SNAPSHOT` column / `snapshot` field). `--limit` caps the rows shown.
   - **`--fields` chooses the columns**, and the new value **`--fields all`** selects every attribute (and implies `--show-details`). `--fields all` supersedes `--all-attributes` for snapshot search, where `--all-attributes` previously had no effect. Resolved-name fields (`owner_name`/`group_name`) trigger identity resolution. In the live walk, bare `--fields` keeps its existing streaming projection for backward compatibility; pair it with `--show-details` for the aligned table.
   - **Directory aggregate capacity.** With `--type directory --show-details`, the default columns show the directory's recursive aggregate **`capacity`** (data + metadata of the whole subtree, from the directory-aggregates API) instead of the uninformative inode `size`. Exposed as the `total_capacity` field (alias `capacity`); `--fields all` includes it for directory searches. Costs one aggregates call per matched directory.
+- **`--path` can point at a single file** - Give `--path` a file or symlink (not just a directory) to search, restore, copy, or show details for that one object - e.g. `--path /Shared/dir/report.docx --snapshot 5 --restore-in-place`. Previously a file path matched nothing.
+- **`--skip-unchanged`** - Incremental copy. With `--copy-to`, skip files already present at the destination with the same size and modification time, and copy only new or changed files. Re-run it on a schedule to keep a destination in sync with a changing source. Implies `--preserve-all`.
+- **Live progress for copy and restore** - `--progress` now shows a status line during `--copy-to` and snapshot restores: files done, data copied, transfer rate, and ETA - including progress through a single large file.
+
+### Changed
+
+- **Faster re-runs and resumes** - Re-running a `--copy-to` (or a snapshot `--restore-in-place`) now skips files already at the destination immediately instead of re-copying them. Resuming an interrupted transfer copies only what is missing - what took minutes now takes seconds.
+- **Snapshot-age filters imply a search** - `--snapshots-newer-than` / `--snapshots-older-than` used on their own now search across the snapshots in that window (implying `--all-snapshots`) instead of erroring. So `--path /Shared --name pig --snapshots-newer-than 1h` searches the last hour's snapshots directly. (Combining an age filter with a single `--snapshot ID`, or with `--copy-to`/`--restore-in-place`, gives a clear error - those need one specific snapshot.)
+- **Replication and being-deleted snapshots hidden** - `--list-snapshots` and snapshot searches (`--all-snapshots` / `--in-the-last-snapshots`) now exclude Qumulo replication-system snapshots (`replication_from_*` / `replication_to_*`) and snapshots in the process of being deleted, since neither is useful for restoring data. Use `--include-replication-snapshots` to show the replication ones (deleting snapshots are always hidden). An explicit `--snapshot ID` is never filtered.
+
+### Fixed
+
+- **Accurate copy/restore counts under heavy load** - A copy or restore that hit a transient network timeout could report a file as failed even though it had actually completed. grumpwalk now verifies and retries, so the "copied" and "failed" totals stay correct.
 
 ## [3.2.0] - 2026-06-24
 

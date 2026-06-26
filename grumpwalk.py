@@ -3289,6 +3289,23 @@ async def _rename_into_place(client, session, temp_path, dest_parent, new_name, 
         clobber = args.clobber
     ok, ec, err = await client.rename_entry(session, temp_path, dest_parent, new_name,
                                             clobber=clobber)
+
+    # A transport-level failure (error_class is None, e.g. a socket read timeout) is
+    # ambiguous: the rename may have taken effect server-side even though we never got
+    # the response. Retry. A retry that reports the temp source is gone proves the
+    # original (timed-out) rename actually landed it - so report success, not a false
+    # failure. This keeps the copied/failed counts honest under heavy load.
+    attempt = 0
+    while not ok and ec is None and attempt < 3:
+        attempt += 1
+        await asyncio.sleep(0.5 * attempt)
+        ok, ec, err = await client.rename_entry(session, temp_path, dest_parent, new_name,
+                                                clobber=clobber)
+        if not ok and ec == "fs_no_such_entry_error":
+            if args.verbose:
+                log_stderr("INFO", f"rename verified after timed-out response: {new_name}")
+            return ("copied", new_name, None)
+
     if ok:
         return ("copied", new_name, None)
     if ec != "fs_entry_exists_error":
@@ -3971,18 +3988,51 @@ def _filter_snapshots_by_age(snapshots, newer_hours, older_hours):
     return out
 
 
-async def list_snapshots_mode(client, session, args):
-    """--list-snapshots: print available snapshots (age-filtered) to stdout."""
+# Qumulo's replication system auto-creates snapshots named replication_from_<cluster>
+# (target side) and replication_to_<cluster> (source side). They are not useful for
+# admin restore, so listing and multi-snapshot search drop them by default.
+_REPLICATION_SNAPSHOT_PREFIXES = ("replication_from_", "replication_to_")
+
+
+def _is_replication_snapshot(snap):
+    """True if snap is a Qumulo replication-system snapshot (by name convention)."""
+    return (snap.get("name") or "").startswith(_REPLICATION_SNAPSHOT_PREFIXES)
+
+
+def _admin_snapshots(snaps, args):
+    """The snapshots an admin cares about: age-filtered, with snapshots being deleted
+    (in_delete) always dropped, and replication snapshots dropped unless
+    --include-replication-snapshots is set."""
     snaps = _filter_snapshots_by_age(
-        await client.list_snapshots(session),
-        args.snapshots_newer_hours, args.snapshots_older_hours)
+        snaps, args.snapshots_newer_hours, args.snapshots_older_hours)
+    snaps = [s for s in snaps if not s.get("in_delete")]
+    if not getattr(args, "include_replication_snapshots", False):
+        snaps = [s for s in snaps if not _is_replication_snapshot(s)]
+    return snaps
+
+
+async def list_snapshots_mode(client, session, args):
+    """--list-snapshots: print available snapshots (age-filtered) to stdout. With
+    --path, list only snapshots whose source covers that path (source is the path
+    itself or an ancestor) - i.e. the snapshots you can search or restore it from."""
+    snaps = _admin_snapshots(await client.list_snapshots(session), args)
     if not snaps:
         log_stderr("INFO", "No snapshots match.")
         return
     cache = {}
-    print(f"{'ID':>6}  {'TIMESTAMP (UTC)':<21}  {'NAME':<22}  SOURCE")
+    rows = []
     for snap in sorted(snaps, key=lambda s: s.get("id", 0)):
         src = await _resolve_snapshot_source(client, session, snap, cache)
+        if args.path and (src is None or not _path_within(args.path, src)):
+            continue  # source does not cover --path (or could not be resolved)
+        rows.append((snap, src))
+    if args.path:
+        if not rows:
+            log_stderr("INFO", f"No snapshots cover {args.path}.")
+            return
+        log_stderr("INFO", f"Snapshots whose source covers {args.path}:")
+    print(f"{'ID':>6}  {'TIMESTAMP (UTC)':<21}  {'NAME':<22}  SOURCE")
+    for snap, src in rows:
         ts = (snap.get("timestamp") or "")[:19].replace("T", " ")
         name = (snap.get("name") or "")[:22]
         print(f"{snap.get('id'):>6}  {ts:<21}  {name:<22}  {src or '<source deleted/moved>'}")
@@ -4018,9 +4068,7 @@ async def _select_search_snapshots(client, session, args):
     cache = {}
     pairs = []
     if args.all_snapshots or args.in_the_last_snapshots:
-        snaps = _filter_snapshots_by_age(
-            await client.list_snapshots(session),
-            args.snapshots_newer_hours, args.snapshots_older_hours)
+        snaps = _admin_snapshots(await client.list_snapshots(session), args)
         for snap in snaps:
             src = await _resolve_snapshot_source(client, session, snap, cache)
             if args.path:
@@ -9491,7 +9539,9 @@ Examples:
     # ============================================================================
     required = parser.add_argument_group('Required Arguments')
     required.add_argument("--host", required=True, help="Qumulo cluster hostname or IP")
-    required.add_argument("--path", help="Path to search (not required for ACL cloning with --source-acl/--acl-target)")
+    required.add_argument("--path", help="Path to search: a directory (walked recursively) or a "
+                                         "single file/symlink (acted on directly). Not required for "
+                                         "ACL cloning with --source-acl/--acl-target.")
 
     # ============================================================================
     # UNIVERSAL FILTERS - TIME
@@ -10189,7 +10239,15 @@ Examples:
         "--list-snapshots",
         action="store_true",
         help="List available snapshots (id, name, timestamp, source path) and exit. "
-             "Honors --snapshots-newer-than/--snapshots-older-than to bound the list.",
+             "Honors --snapshots-newer-than/--snapshots-older-than to bound the list. "
+             "With --path, lists only snapshots whose source covers that path.",
+    )
+    snapshots.add_argument(
+        "--include-replication-snapshots",
+        action="store_true",
+        help="Include Qumulo replication-system snapshots (replication_from_*/"
+             "replication_to_*) in listing and search. By default they are excluded, "
+             "since they are not useful for restoring data.",
     )
     snapshots.add_argument(
         "--snapshot",
@@ -10211,8 +10269,9 @@ Examples:
         metavar="DURATION",
         help="Only consider snapshots taken within the last DURATION. Accepts days or "
              "hours: '5' or '5d' = 5 days, '12h' = 12 hours (filters snapshots by their "
-             "UTC timestamp, not files). Use with --all-snapshots/--in-the-last-snapshots/"
-             "--list-snapshots.",
+             "UTC timestamp, not files). On its own this searches across the snapshots in "
+             "that window (implies --all-snapshots); also works with --list-snapshots or "
+             "--in-the-last-snapshots.",
     )
     snapshots.add_argument(
         "--snapshots-older-than",
@@ -10578,6 +10637,25 @@ Examples:
     # Snapshot modes supply their own root: --list-snapshots needs no path,
     # --all-snapshots replaces --path, and --snapshot defaults to the snapshot source.
     acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
+
+    # A snapshot-age filter (--snapshots-newer-than / --snapshots-older-than) bounds a
+    # SET of snapshots. On its own it already means "search the snapshots in that window",
+    # so imply --all-snapshots rather than make the user also type it.
+    _age_filter = args.snapshots_newer_than is not None or args.snapshots_older_than is not None
+    if _age_filter and args.snapshot is not None:
+        print("Error: --snapshots-newer-than / --snapshots-older-than bound a set of snapshots "
+              "and cannot be combined with a single --snapshot ID", file=sys.stderr)
+        sys.exit(1)
+    if _age_filter and (args.copy_to or args.restore_in_place):
+        print("Error: copying/restoring needs a specific --snapshot ID; "
+              "--snapshots-newer-than / --snapshots-older-than only apply to listing or searching",
+              file=sys.stderr)
+        sys.exit(1)
+    if (_age_filter and not args.all_snapshots and not args.in_the_last_snapshots
+            and not args.list_snapshots):
+        args.all_snapshots = True
+        log_stderr("INFO", "Searching across snapshots in the given age window (--all-snapshots implied)")
+
     snapshot_root_mode = (args.list_snapshots or args.all_snapshots or args.in_the_last_snapshots
                           or args.snapshot is not None)
     if not args.path and not acl_cloning_mode and not snapshot_root_mode:
@@ -10611,10 +10689,6 @@ Examples:
                             ("--snapshots-older-than", args.snapshots_older_than, "snapshots_older_hours")):
         if raw is None:
             continue
-        if not multi_snapshot and not args.list_snapshots:
-            print(f"Error: {flag} requires --all-snapshots, --in-the-last-snapshots, or --list-snapshots",
-                  file=sys.stderr)
-            sys.exit(1)
         hours = _parse_age_to_hours(raw)
         if hours is None:
             print(f"Error: invalid {flag} '{raw}'; use N or Nd for days, Nh for hours (e.g. 5, 5d, 12h)",

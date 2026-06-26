@@ -792,6 +792,18 @@ permissions/owner) before anything is changed.
 > directory's owner and permissions are left unchanged - the copy/move still
 > proceeds into it.
 
+### How do I watch progress on a large copy or restore?
+
+Add `--progress`. During `--copy-to` and snapshot restores it shows a live line
+with files done, data copied, transfer rate, and ETA - and it advances *through*
+a single large file, so a multi-gigabyte copy never looks stalled:
+```bash
+./grumpwalk.py --host cluster --path /projects --type file \
+  --copy-to /archive --progress --yes
+#   [COPY] 12/240 files | 18.4 GiB/212 GiB (8.7%) | 410 MiB/s | ETA 7m54s
+```
+The same line appears for `--restore-in-place`, labelled `[RESTORE]`.
+
 ### How do I re-run a copy - to resume it, or to keep a destination in sync?
 
 These are two different needs, and they use different tools.
@@ -852,6 +864,18 @@ have since been deleted**.
 # Narrow by snapshot age:
 ./grumpwalk.py --host cluster --list-snapshots --snapshots-newer-than 7
 ```
+On a large cluster the list can be long. Add `--path` to show only the snapshots
+that cover a path - those whose source is that path or an ancestor, i.e. the
+snapshots you can actually search or restore it from:
+```bash
+./grumpwalk.py --host cluster --list-snapshots --path /home/joe
+# lists only snapshots sourced at /home/joe, /home, or / (not, say, /home/someone-else)
+```
+Qumulo's replication snapshots (`replication_from_*` / `replication_to_*`) and any
+snapshots currently being deleted are hidden by default from both listing and
+search, since they are not useful for restoring data. Add
+`--include-replication-snapshots` if you need to see the replication ones
+(snapshots being deleted are always hidden).
 
 ### How do I search inside a snapshot?
 
@@ -873,6 +897,11 @@ flags to bound the set. Snapshot ages are in **UTC** and accept days or hours -
   --name 'report.docx' --snapshots-newer-than 30d
 #   [snap 9] /Shared/docs/report.docx
 #   [snap 5] /Shared/docs/report.docx   <- the same file, duplicated per snapshot
+```
+When you give a snapshot-age limit on its own, `--all-snapshots` is implied - so
+"search the snapshots from the last hour" is just:
+```bash
+./grumpwalk.py --host cluster --path /Shared --name 'report.docx' --snapshots-newer-than 1h
 ```
 
 ### How do I get just the latest version of each match (no duplicates)?
@@ -974,6 +1003,21 @@ confirmation - preview with `--dry-run` first:
 ```
 Without `--clobber`, files that still exist live are skipped (only deleted ones
 are recreated) - a safe way to undelete without rolling anything back.
+
+To restore a single known file, point `--path` straight at it (no `--name`
+needed) - `--path` accepts a file, not just a directory:
+```bash
+./grumpwalk.py --host cluster --snapshot 5 \
+  --path /Shared/docs/report.docx --restore-in-place --yes
+```
+To restore several files at once, repeat `--name` - the patterns are OR'd, so this
+restores everything named `cat`, `dog`, or `pig` anywhere under `--path`:
+```bash
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name cat --name dog --name pig --restore-in-place --yes
+```
+Any other filters narrow the set further (AND), e.g. add `--type file --older-than 30`
+to restore only files, only those older than 30 days, among the names matched.
 
 If a restore is interrupted, just run it again: already-restored files are skipped
 (checked before any data moves) and only the rest are written. A snapshot never

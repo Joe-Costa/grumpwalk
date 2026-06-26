@@ -1481,6 +1481,20 @@ class AsyncQumuloClient:
         collected_results = [] if collect_results else None
         results_lock = asyncio.Lock()
 
+        # If the root path is a single file or symlink (not a directory), operate on
+        # just that object instead of trying to enumerate it as a directory (which
+        # would match nothing). This lets --path point straight at a file.
+        root_attr = await self.get_file_attr(session, path, snapshot_id=snapshot_id)
+        if root_attr is not None and root_attr.get("type") != "FS_FILE_TYPE_DIRECTORY":
+            root_attr.setdefault("path", path)
+            root_attr.setdefault("name", path.rstrip("/").rsplit("/", 1)[-1])
+            if file_filter is None or file_filter(root_attr):
+                if output_callback is not None:
+                    await output_callback(root_attr)
+                if collected_results is not None:
+                    collected_results.append(root_attr)
+            return collected_results if collected_results is not None else []
+
         # Bounded work queue: (path, depth) tuples
         queue = asyncio.Queue(maxsize=50_000)
         await queue.put((path, 0))

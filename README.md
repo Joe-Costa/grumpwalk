@@ -314,7 +314,7 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 
 ### Connection
 - `--host HOST` - Qumulo cluster hostname or IP (required)
-- `--path PATH` - Path to search (required for walk mode)
+- `--path PATH` - Path to act on: a directory (walked recursively) or a single file/symlink (acted on directly). Required for walk mode
 - `--port PORT` - API port (default: 8000)
 - `--credentials-store PATH` - Credentials file path
 - `--update-atime` - Allow access times (atime) to be updated by grumpwalk's reads. By default, on clusters that support it (Qumulo Core 7.9.0+), grumpwalk suppresses atime updates so a crawl does not disturb access-time metadata. This flag restores normal atime behavior.
@@ -430,6 +430,7 @@ Move, server-side copy, and/or rename objects matching the filters, modeled on P
 
   Use `--rename-to` alone to rename in place, or with `--move-to`/`--copy-to` to transfer and rename in one pass.
 - `--clobber` - Overwrite an existing destination entry (default: skip with a warning). Two matched sources mapping to the same target are always skipped, even with `--clobber`. For `--copy-to`, an existing target *directory* is skipped (no merge).
+- `--skip-unchanged` - With `--copy-to`, incremental sync: skip destination files that already match the source's size and modification time, and copy only new or changed files. Re-runnable for keeping a destination in step with a changing source. Implies `--preserve-all`. (To simply *resume* an interrupted copy, no flag is needed - re-run the command and only the missing files are copied.)
 - `--include-directories` - Also move/copy matched directories (the whole subtree). For `--copy-to`, the directory is recreated under DEST and its files, subdirectories, and symlinks are copied recursively. Descendants that travel with a transferred directory are pruned (not transferred twice), and transferring a directory into its own subtree is refused. Default: only files and symlinks are moved/copied.
 - `--move-concurrency N` / `--copy-concurrency N` - Concurrent move / copy operations (default: auto-tuned).
 - `--yes` - Skip the confirmation prompt. Required for non-interactive runs (grumpwalk refuses without confirmation otherwise).
@@ -440,10 +441,11 @@ Move, server-side copy, and/or rename objects matching the filters, modeled on P
 
 Search, copy, and restore data from Qumulo snapshots (Qumulo has no native restore call). Snapshot reads find files as they were at snapshot time, **including files deleted since**.
 
-- `--list-snapshots` - List snapshots (id, timestamp, name, source path) and exit.
+- `--list-snapshots` - List snapshots (id, timestamp, name, source path) and exit. Add `--path` to list only snapshots whose source covers that path (the path itself or an ancestor) - the ones you can search or restore it from. Replication snapshots and snapshots being deleted are hidden by default.
+- `--include-replication-snapshots` - Include Qumulo replication-system snapshots (`replication_from_*`/`replication_to_*`) in listing and search. Excluded by default, since they are not useful for restoring data. (Snapshots being deleted are always hidden.)
 - `--snapshot ID` - Run the crawl/search in snapshot ID's context; composes with every filter and output mode.
 - `--all-snapshots` - Search across all snapshots (used instead of `--path`); with `--path`, only snapshots whose source covers it. Each match is annotated with its snapshot. Search-only.
-- `--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION` - Limit the snapshot set by snapshot age (UTC). Accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. Distinct from `--older-than`/`--newer-than`, which filter files.
+- `--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION` - Limit the snapshot set by snapshot age (UTC). Accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. On their own they imply `--all-snapshots` (search across the snapshots in that window); also work with `--list-snapshots`/`--in-the-last-snapshots`. Distinct from `--older-than`/`--newer-than`, which filter files.
 - `--in-the-last-snapshots N` - Search the N most recent snapshots and show only the newest result per path (dedupes the same file across snapshots). Composes with the filters and snapshot-age limits. Search-only.
 - `--snapshot ID --copy-to DEST` - Copy the snapshot version of matched files (incl. deleted) to a live DEST. Reuses the full copy feature (`--rename-to`, `--preserve-*`, `--include-directories`, `--create-destination-directory`).
 - `--snapshot ID --restore-in-place` - Restore matched files to their original live paths (undelete / roll back): recreate files/dirs deleted since the snapshot, and with `--clobber` overwrite the current live version. Destructive - needs `--yes`/confirmation; preview with `--dry-run`. With `--include-directories` (or `--type directory`) a matched directory is restored as a full subtree - the directory and every descendant, including empty subdirectories; restoring into a directory that still exists live merges, with per-file conflict handling. Without those flags, directories are skipped and only files are restored.
@@ -669,7 +671,7 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--fields-list` - List all available field names and exit
 - `--unix-time` - Output timestamps as unix epoch seconds instead of ISO 8601
 - `--limit N` - Stop after N matches
-- `--progress` - Show real-time progress to the terminal (stderr)
+- `--progress` - Show real-time progress to the terminal (stderr). During `--copy-to` and snapshot restores it reports files done, data copied, transfer rate, and ETA
 - `--verbose` - Detailed diagnostic output to the terminal (stderr)
 - `--log-file FILE` - Write log output to file with timezone-aware timestamps (independent of --verbose/--progress)
 - `--log-level LEVEL` - Minimum level for --log-file: DEBUG, INFO (default), or ERROR
