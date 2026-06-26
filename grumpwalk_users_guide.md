@@ -1134,12 +1134,12 @@ Notes:
 - An interrupted `--delta` restore is safe to re-run: the next run diffs against a
   fresh temporary snapshot and patches whatever is still out of date.
 
-### How do I revert a whole directory to how it was at a snapshot ("undo all changes")?
+### How do I restore a whole directory to how it was at a snapshot ("undo all changes")?
 
-Use `--revert`. Point it at a directory and a snapshot, and grumpwalk makes that
-directory **exactly** match the snapshot - undoing every change since:
+Use `--revert`. Point it at a directory and a snapshot, and grumpwalk brings the
+directory's contents back to the snapshot:
 ```bash
-# Preview first - lists everything that will be recreated, restored, and DELETED
+# Preview first - lists everything that will be recreated and restored
 ./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project --revert --delta --dry-run
 
 # Do it
@@ -1147,8 +1147,17 @@ directory **exactly** match the snapshot - undoing every change since:
 ```
 Unlike `--restore-in-place` (which puts back files you select), `--revert` is a
 whole-directory "roll back in time": it recreates files and folders **deleted** since
-the snapshot, restores **modified** files, and **deletes** files and folders **created**
-since the snapshot. When it finishes, the directory is byte-identical to the snapshot.
+the snapshot and restores **modified** files to their snapshot version. By default,
+files and folders **created since** the snapshot are **left in place** - so you undo
+the bad changes without losing new work.
+
+If you want an *exact* rollback - the directory byte-identical to the snapshot, with
+anything added since removed too - add `--delete-new`:
+```bash
+# Exact mirror: also delete files/folders created after the snapshot
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project --revert --delete-new --dry-run
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project --revert --delete-new --delta --yes
+```
 
 What makes it fast: grumpwalk doesn't crawl the whole directory. It takes a temporary
 snapshot of the live tree and asks the cluster for the **diff** between it and your
@@ -1158,13 +1167,15 @@ touches only those few hundred. Add `--delta` and the modified files are patched
 byte range too (see the previous question).
 
 Important notes:
-- `--revert` **deletes data created since the snapshot** - that's what "revert" means.
-  It's destructive, so it requires `--yes` (or an interactive confirmation), and the
-  confirmation/`--dry-run` output spells out exactly what will be deleted. Always
+- By default `--revert` **keeps** files created since the snapshot; `--delete-new`
+  removes them for an exact mirror. Either way it **overwrites modified files** with
+  their snapshot version, so it's destructive to current changes and requires `--yes`
+  (or an interactive confirmation). The confirmation and `--dry-run` output spell out
+  exactly what will be recreated, restored, and (with `--delete-new`) deleted - always
   `--dry-run` first if you're unsure.
 - It's a **whole-directory** operation - `--name`, `--type`, `--owner` and the other
-  match filters do not apply (use `--restore-in-place` with filters to revert a
-  selected subset of files without removing anything).
+  match filters do not apply (use `--restore-in-place` with filters to restore a
+  selected subset of files).
 - It needs the **snapshot-write** privilege (to take the temporary snapshot, which is
   deleted automatically when the run finishes).
 - Re-running it is safe and idempotent: a second run finds nothing left to change.

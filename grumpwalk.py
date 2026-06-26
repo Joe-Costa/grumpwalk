@@ -4754,21 +4754,22 @@ async def _revert_restore_modified(client, session, path, snap_id, now_snap, arg
 
 
 async def revert_to_snapshot(client, session, args) -> dict:
-    """Revert the directory at --path to its EXACT state in --snapshot.
+    """Restore the directory at --path to its state in --snapshot.
 
     Uses the snapshot tree diff (changes-since, against a temporary snapshot of the
     live tree) to find only what changed under --path, then applies the inverse of
     each change: recreate files/dirs deleted since (repopulating deleted directories
-    from the snapshot subtree), restore modified files (delta-patched with --delta,
-    else whole-file), and DELETE files/dirs created since. The result is byte-
-    identical to the snapshot. Destructive (it deletes data added after the snapshot):
-    requires --yes, and --dry-run previews the plan including the deletions.
+    from the snapshot subtree) and restore modified files (delta-patched with --delta,
+    else whole-file). Files/dirs CREATED since the snapshot are kept by default
+    (non-destructive to new data); with --delete-new they are also removed, making the
+    directory byte-identical to the snapshot (an exact rollback). Overwrites modified
+    files, so it requires --yes; --dry-run previews the full plan.
 
     This is a whole-directory operation; content filters (--name/--type/--owner) do
     not apply. Discovery is proportional to the number of changes, not the tree size.
     """
     stats = {"diff_changes": 0, "recreated_files": 0, "recreated_dirs": 0, "patched": 0,
-             "deleted_files": 0, "deleted_dirs": 0, "failed": 0, "errors": []}
+             "deleted_files": 0, "deleted_dirs": 0, "kept_new": 0, "failed": 0, "errors": []}
     snap_id = args.snapshot
     snap = await client.get_snapshot(session, snap_id)
     if snap is None:
@@ -4826,14 +4827,21 @@ async def revert_to_snapshot(client, session, args) -> dict:
                                "nothing to revert.")
             return stats
 
+        delete_new = args.delete_new
+        new_count = len(standalone_cre_files) + len(cre_dir_roots)
+
         log_stderr("INFO", f"Revert plan for {path} -> snapshot {snap_id}:")
         log_stderr("INFO", f"  recreate: {len(del_dir_roots)} deleted dir subtree(s), "
                            f"{len(standalone_del_files)} deleted file(s)")
         log_stderr("INFO", f"  restore : {len(modified_files)} modified file(s)"
                            + (" (delta)" if args.delta else " (whole-file)"))
-        log_stderr("INFO", f"  DELETE  : {len(standalone_cre_files)} created file(s), "
-                           f"{len(cre_dir_roots)} created dir subtree(s) "
-                           "(data added since the snapshot)")
+        if delete_new:
+            log_stderr("INFO", f"  DELETE  : {len(standalone_cre_files)} created file(s), "
+                               f"{len(cre_dir_roots)} created dir subtree(s) "
+                               "(data added since the snapshot)")
+        else:
+            log_stderr("INFO", f"  keep    : {new_count} object(s) created since the snapshot "
+                               "left in place (use --delete-new for an exact rollback)")
 
         if args.dry_run:
             for d in del_dir_roots:
@@ -4842,10 +4850,16 @@ async def revert_to_snapshot(client, session, args) -> dict:
                 log_stderr("DRY RUN", f"recreate file {f}")
             for f in modified_files:
                 log_stderr("DRY RUN", f"{'delta-restore' if args.delta else 'restore'} {f}")
-            for f in standalone_cre_files:
-                log_stderr("DRY RUN", f"DELETE created file {f}")
-            for d in cre_dir_roots:
-                log_stderr("DRY RUN", f"DELETE created dir subtree {d}")
+            if delete_new:
+                for f in standalone_cre_files:
+                    log_stderr("DRY RUN", f"DELETE created file {f}")
+                for d in cre_dir_roots:
+                    log_stderr("DRY RUN", f"DELETE created dir subtree {d}")
+            else:
+                for f in standalone_cre_files:
+                    log_stderr("DRY RUN", f"keep created file {f}")
+                for d in cre_dir_roots:
+                    log_stderr("DRY RUN", f"keep created dir subtree {d}")
             return stats
 
         if not args.yes:
@@ -4854,10 +4868,16 @@ async def revert_to_snapshot(client, session, args) -> dict:
                                     "mode; pass --yes")
                 sys.exit(1)
             print(f"\nAbout to revert {path} to snapshot {snap_id}.", file=sys.stderr)
-            print(f"  This will DELETE {len(standalone_cre_files)} file(s) and "
-                  f"{len(cre_dir_roots)} director(ies) created since the snapshot,", file=sys.stderr)
-            print(f"  restore {len(modified_files)} modified file(s), and recreate "
-                  f"{len(standalone_del_files) + len(del_dir_roots)} deleted item(s).", file=sys.stderr)
+            if delete_new:
+                print(f"  This will DELETE {len(standalone_cre_files)} file(s) and "
+                      f"{len(cre_dir_roots)} director(ies) created since the snapshot,",
+                      file=sys.stderr)
+            print(f"  restore {len(modified_files)} modified file(s) to the snapshot version "
+                  f"and recreate {len(standalone_del_files) + len(del_dir_roots)} deleted item(s).",
+                  file=sys.stderr)
+            if not delete_new and new_count:
+                print(f"  {new_count} object(s) created since the snapshot will be KEPT "
+                      "(pass --delete-new to remove them).", file=sys.stderr)
             if input("Proceed? [y]es / [N]o: ").strip().lower() not in ("y", "yes"):
                 log_stderr("INFO", "Aborted by user.")
                 return stats
@@ -4875,19 +4895,22 @@ async def revert_to_snapshot(client, session, args) -> dict:
                                                    created_set, stats)
         for f in modified_files:
             await _revert_restore_modified(client, session, f, snap_id, now_snap, args, stats)
-        for f in standalone_cre_files:
-            ok, err2 = await client.delete_entry(session, f.rstrip("/"))
-            if ok:
-                stats["deleted_files"] += 1
-            else:
-                stats["failed"] += 1
-                _mv_record_error(stats, f, f"delete failed: {err2}")
-        for root in cre_dir_roots:
-            _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
-            if ok:
-                stats["deleted_dirs"] += 1
-            else:
-                stats["failed"] += 1
+        if delete_new:
+            for f in standalone_cre_files:
+                ok, err2 = await client.delete_entry(session, f.rstrip("/"))
+                if ok:
+                    stats["deleted_files"] += 1
+                else:
+                    stats["failed"] += 1
+                    _mv_record_error(stats, f, f"delete failed: {err2}")
+            for root in cre_dir_roots:
+                _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
+                if ok:
+                    stats["deleted_dirs"] += 1
+                else:
+                    stats["failed"] += 1
+        else:
+            stats["kept_new"] = new_count
     finally:
         ok, derr = await client.delete_snapshot(session, now_snap)
         if not ok:
@@ -6848,8 +6871,12 @@ async def main_async(args):
                 print(f"Files recreated:       {stats['recreated_files']:,}", file=sys.stderr)
                 print(f"Directories recreated: {stats['recreated_dirs']:,}", file=sys.stderr)
                 print(f"Files restored:        {stats['patched']:,}", file=sys.stderr)
-                print(f"Files deleted:         {stats['deleted_files']:,}", file=sys.stderr)
-                print(f"Dir subtrees deleted:  {stats['deleted_dirs']:,}", file=sys.stderr)
+                if args.delete_new:
+                    print(f"Files deleted:         {stats['deleted_files']:,}", file=sys.stderr)
+                    print(f"Dir subtrees deleted:  {stats['deleted_dirs']:,}", file=sys.stderr)
+                else:
+                    print(f"New objects kept:      {stats['kept_new']:,} "
+                          "(use --delete-new for an exact rollback)", file=sys.stderr)
                 print(f"Failed:                {stats['failed']:,}", file=sys.stderr)
             if stats["errors"]:
                 print("\nErrors encountered:", file=sys.stderr)
@@ -10819,13 +10846,22 @@ Examples:
     snapshots.add_argument(
         "--revert",
         action="store_true",
-        help="With --snapshot, revert the directory at --path to its EXACT state in "
-             "that snapshot. Uses the snapshot tree diff (changes-since) to find only "
-             "what changed, then recreates files/dirs deleted since, restores modified "
-             "files (add --delta to patch them by byte range), and DELETES files/dirs "
-             "created since. Whole-directory operation (ignores name/type/owner filters). "
-             "Destructive - deletes data added after the snapshot: needs --yes; use "
-             "--dry-run to preview, which lists the deletions.",
+        help="With --snapshot, restore the directory at --path to its state in that "
+             "snapshot. Uses the snapshot tree diff (changes-since) to find only what "
+             "changed, then recreates files/dirs deleted since and restores modified "
+             "files to the snapshot version (add --delta to patch them by byte range). "
+             "By default files/dirs CREATED since the snapshot are KEPT (non-destructive "
+             "to new data); add --delete-new for an exact byte-identical rollback. "
+             "Whole-directory operation (ignores name/type/owner filters). Overwrites "
+             "modified files, so it needs --yes; use --dry-run to preview.",
+    )
+    snapshots.add_argument(
+        "--delete-new",
+        action="store_true",
+        help="With --revert, ALSO delete files and directories created since the "
+             "snapshot, making --path byte-identical to the snapshot (an exact "
+             "rollback/mirror). Without it, new objects are left in place. Destructive: "
+             "--dry-run lists exactly what would be deleted.",
     )
     snapshots.add_argument(
         "--rename-on-conflict",
@@ -11279,6 +11315,9 @@ Examples:
         if args.all_snapshots:
             print("Error: --revert needs a specific --snapshot, not --all-snapshots", file=sys.stderr)
             sys.exit(1)
+    if args.delete_new and not args.revert:
+        print("Error: --delete-new only applies to --revert", file=sys.stderr)
+        sys.exit(1)
     if args.delta:
         if not (args.restore_in_place or args.revert):
             print("Error: --delta requires --restore-in-place or --revert", file=sys.stderr)
@@ -11536,12 +11575,29 @@ Examples:
     # Validate extended attribute arguments
     validate_attribute_args(args)
 
-    if args.older_than and args.newer_than and args.newer_than >= args.older_than:
-        print(
-            "Error: --newer-than must be less than --older-than for a valid time range",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # A two-sided time window keeps files between the bounds: timestamp older than the
+    # --older-than age AND newer than the --newer-than age. That is only non-empty when
+    # the --newer-than value is GREATER than the --older-than value (e.g. older-than 7 +
+    # newer-than 30 = files 7-30 days old). Validate each same-field pair; cross-field
+    # combinations (e.g. --accessed-older-than 90 --modified-newer-than 7) are unrelated
+    # and untouched.
+    _time_ranges = [
+        (args.older_than, args.newer_than, "--older-than", "--newer-than",
+         " (e.g. --older-than 7 --newer-than 30 selects files 7-30 days old)"),
+        (args.accessed_older_than, args.accessed_newer_than,
+         "--accessed-older-than", "--accessed-newer-than", ""),
+        (args.modified_older_than, args.modified_newer_than,
+         "--modified-older-than", "--modified-newer-than", ""),
+        (args.created_older_than, args.created_newer_than,
+         "--created-older-than", "--created-newer-than", ""),
+        (args.changed_older_than, args.changed_newer_than,
+         "--changed-older-than", "--changed-newer-than", ""),
+    ]
+    for _older, _newer, _older_flag, _newer_flag, _hint in _time_ranges:
+        if _older and _newer and _newer <= _older:
+            print(f"Error: {_newer_flag} must be greater than {_older_flag} for a valid "
+                  f"time range{_hint}", file=sys.stderr)
+            sys.exit(1)
 
     # Check for mutually exclusive CSV and JSON output
     if args.csv_out and (args.json or args.json_out):
