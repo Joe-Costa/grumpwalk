@@ -898,6 +898,22 @@ put files back where they *were* - at their original nested paths - use
 `--restore-in-place` (next question), which never flattens and never collides on
 same-named files.
 
+**Copy and rename in one pass.** Add `--rename-to` to give the copies new names as
+they land - handy for staging a snapshot version next to the live file, or tagging
+a restore by snapshot/date. The snapshot version is what gets copied:
+```bash
+# Copy each *.docx out of snapshot 5, renaming report.docx -> report_snap5.docx
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name '*.docx' --copy-to /Shared/restore-staging \
+  --rename-to '{.docx|_snap5.docx}' --create-destination-directory --yes
+```
+The rename uses the full `--rename-to` syntax (`{old|new}`, `*`/`?` wildcards,
+whole-name templates) and composes with `--preserve-all`, `--include-directories`,
+and `--clobber`. The flatten/collision rule above still applies, though:
+`--rename-to` only disambiguates same-named matches when the new names actually
+differ, so it won't rescue two files both named `dog` - use `--restore-in-place`
+for that.
+
 ### How do I restore files back to where they were (undelete / roll back)?
 
 `--restore-in-place` writes each matched file back to its original path,
