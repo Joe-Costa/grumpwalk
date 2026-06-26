@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.2.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.3.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -436,6 +436,31 @@ Move, server-side copy, and/or rename objects matching the filters, modeled on P
 
 **Important:** Always use `--dry-run` first to preview the full `source -> target` plan before applying.
 
+### Snapshot Options
+
+Search, copy, and restore data from Qumulo snapshots (Qumulo has no native restore call). Snapshot reads find files as they were at snapshot time, **including files deleted since**.
+
+- `--list-snapshots` - List snapshots (id, timestamp, name, source path) and exit.
+- `--snapshot ID` - Run the crawl/search in snapshot ID's context; composes with every filter and output mode.
+- `--all-snapshots` - Search across all snapshots (used instead of `--path`); with `--path`, only snapshots whose source covers it. Each match is annotated with its snapshot. Search-only.
+- `--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION` - Limit the snapshot set by snapshot age (UTC). Accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. Distinct from `--older-than`/`--newer-than`, which filter files.
+- `--in-the-last-snapshots N` - Search the N most recent snapshots and show only the newest result per path (dedupes the same file across snapshots). Composes with the filters and snapshot-age limits. Search-only.
+- `--snapshot ID --copy-to DEST` - Copy the snapshot version of matched files (incl. deleted) to a live DEST. Reuses the full copy feature (`--rename-to`, `--preserve-*`, `--include-directories`, `--create-destination-directory`).
+- `--snapshot ID --restore-in-place` - Restore matched files to their original live paths (undelete / roll back): recreate files/dirs deleted since the snapshot, and with `--clobber` overwrite the current live version. Destructive - needs `--yes`/confirmation; preview with `--dry-run`. With `--include-directories` (or `--type directory`) a matched directory is restored as a full subtree - the directory and every descendant, including empty subdirectories; restoring into a directory that still exists live merges, with per-file conflict handling. Without those flags, directories are skipped and only files are restored.
+- `--rename-on-conflict` - On a name conflict (during copy/restore), write the item under a `_restored_<date>_<time>` suffix instead of skipping (default) or overwriting (`--clobber`). Mutually exclusive with `--clobber`; customize with `--conflict-suffix`.
+
+```bash
+# Find report.docx in any snapshot from the last week
+./grumpwalk.py --host HOST --all-snapshots --snapshots-newer-than 7 --name 'report.docx'
+
+# Restore everything matching, from a chosen snapshot, back to where it was
+./grumpwalk.py --host HOST --snapshot 5 --path /Shared --name '*.docx' --restore-in-place --clobber --yes
+
+# Restore an entire deleted directory (subtree, including empty subdirs)
+./grumpwalk.py --host HOST --snapshot 5 --path /Shared --max-depth 1 --name 'project-x' \
+    --type directory --restore-in-place --yes
+```
+
 ### Owner/Group Change Options
 
 Selective ownership changes - find files by current owner/group and change to a new owner/group.
@@ -639,7 +664,8 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--json-out FILE` - JSON output to file
 - `--csv-out FILE` - CSV output to file
 - `--all-attributes` - Include all file attributes in output
-- `--fields FIELD[,FIELD,...]` - Select specific output fields (aliases: `owner_id`, `group_id`, `attr.*`; dot notation supported). Use `--fields-list` to see all available fields
+- `--show-details` - Show attributes of matched results instead of just paths (snapshot search and the live walk). Defaults to `path`, human-readable `size`, and `change_time` (ctime); renders an aligned table, or honors `--csv-out`/`--json-out`/`--json` (size stays raw bytes there). Multi-snapshot search adds a `SNAPSHOT` column. `--limit` caps the rows shown
+- `--fields FIELD[,FIELD,...]` - Select specific output fields (aliases: `owner_id`, `group_id`, `attr.*`; dot notation supported). `--fields all` selects every attribute (implies `--show-details`). Use `--fields-list` to see all available fields
 - `--fields-list` - List all available field names and exit
 - `--unix-time` - Output timestamps as unix epoch seconds instead of ISO 8601
 - `--limit N` - Stop after N matches

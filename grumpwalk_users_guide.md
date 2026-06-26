@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.2.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.3.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -15,16 +15,17 @@ A practical guide with recipes for common storage administration tasks using gru
 5. [Data Lifecycle Management](#data-lifecycle-management)
 6. [Object Tagging](#object-tagging)
 7. [Moving, Copying, and Renaming Files](#moving-copying-and-renaming-files)
-8. [User and Access Management](#user-and-access-management)
-9. [Domain Migration](#domain-migration)
-10. [Compliance and Auditing](#compliance-and-auditing)
-11. [Security and Incident Response](#security-and-incident-response)
-12. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
-13. [Media and Creative Workflows](#media-and-creative-workflows)
-14. [Reporting and Analytics](#reporting-and-analytics)
-15. [Performance Optimization](#performance-optimization)
-16. [Scripting and Automation](#scripting-and-automation)
-17. [Combining Filters with Actions](#combining-filters-with-actions)
+8. [Recovering Data from Snapshots](#recovering-data-from-snapshots)
+9. [User and Access Management](#user-and-access-management)
+10. [Domain Migration](#domain-migration)
+11. [Compliance and Auditing](#compliance-and-auditing)
+12. [Security and Incident Response](#security-and-incident-response)
+13. [Duplicate and Similar File Detection](#duplicate-and-similar-file-detection)
+14. [Media and Creative Workflows](#media-and-creative-workflows)
+15. [Reporting and Analytics](#reporting-and-analytics)
+16. [Performance Optimization](#performance-optimization)
+17. [Scripting and Automation](#scripting-and-automation)
+18. [Combining Filters with Actions](#combining-filters-with-actions)
 
 ---
 
@@ -639,7 +640,8 @@ just like `mv a/x.log b/x.log /archive/`:
 ```
 On a name collision the object is skipped with a warning; add `--clobber` to
 overwrite. If two different matches would land on the same name, both are
-skipped (overwriting one move with another is never intended).
+skipped **even with `--clobber`** (overwriting one move with another is never
+intended) - the summary reports this as "Multiple sources to one target".
 
 ### How do I rename files in place?
 
@@ -704,9 +706,23 @@ a partial destination:
   --name '*.pdf' --created --newer-than 7 \
   --copy-to /review --yes
 ```
-`--copy-to` composes with `--rename-to` (copy and rename in one pass) and uses
-the same collision rules as move: skip on a name clash unless `--clobber`.
-`--copy-to` and `--move-to` cannot be used together.
+`--copy-to` **flattens** its matches into DEST exactly like `--move-to` (and like
+`cp a/x b/x DEST/`): each match lands at `DEST/<name>`, so the source's
+subdirectory structure is dropped. It composes with `--rename-to` (copy and
+rename in one pass), and `--copy-to` and `--move-to` cannot be used together.
+
+Two collision rules apply (identical to `--move-to`):
+
+- A match whose name already exists in DEST is **skipped**, unless `--clobber`
+  overwrites it.
+- If two matches would land on the **same** name in DEST - e.g. `a/dog` and
+  `b/dog` both targeting `DEST/dog` - **both are skipped, even with `--clobber`**
+  (silently letting one overwrite the other is never intended). The summary
+  reports this as "Multiple sources to one target". To get them all copied,
+  give them distinct names with `--rename-to`, narrow the match so only one
+  wins, or copy the parent directory with `--include-directories` to keep the
+  tree intact. (To put snapshot files back at their *original* paths rather than
+  flatten them into one directory, use `--restore-in-place` instead.)
 
 ### Does a copy keep the original's owner and permissions?
 
@@ -775,6 +791,143 @@ permissions/owner) before anything is changed.
 > exists, they are ignored (grumpwalk prints a warning) and the existing
 > directory's owner and permissions are left unchanged - the copy/move still
 > proceeds into it.
+
+---
+
+## Recovering Data from Snapshots
+
+You can search a snapshot with your normal filters and copy matching files back out.
+Snapshot reads see files as they were at snapshot time - **including files that
+have since been deleted**.
+
+### How do I see what snapshots exist?
+
+```bash
+./grumpwalk.py --host cluster --list-snapshots
+#     ID  TIMESTAMP (UTC)        NAME             SOURCE
+#      5  2026-06-22 21:16:00    Shared_Shared    /Shared
+# Narrow by snapshot age:
+./grumpwalk.py --host cluster --list-snapshots --snapshots-newer-than 7
+```
+
+### How do I search inside a snapshot?
+
+Add `--snapshot ID` to any normal crawl - every filter and output mode works:
+```bash
+# Large .docx files owned by alice, as they were in snapshot 5
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name '*.docx' --owner alice --larger-than 1MB
+```
+
+### How do I find a file across all snapshots (I don't know which one has it)?
+
+`--all-snapshots` searches every snapshot; each match is tagged with its snapshot.
+Use `--path` to restrict to snapshots that cover that path, and the snapshot-age
+flags to bound the set. Snapshot ages are in **UTC** and accept days or hours -
+`5`/`5d` = 5 days, `12h` = 12 hours:
+```bash
+./grumpwalk.py --host cluster --all-snapshots --path /Shared \
+  --name 'report.docx' --snapshots-newer-than 30d
+#   [snap 9] /Shared/docs/report.docx
+#   [snap 5] /Shared/docs/report.docx   <- the same file, duplicated per snapshot
+```
+
+### How do I get just the latest version of each match (no duplicates)?
+
+A file that hasn't changed appears in every snapshot, so `--all-snapshots` repeats
+it. `--in-the-last-snapshots N` searches the **N most recent** snapshots and shows
+only the **newest** result for each path:
+```bash
+# The latest recoverable version of each report, looking back over the 5 newest snapshots
+./grumpwalk.py --host cluster --in-the-last-snapshots 5 --path /Shared --name 'report.docx'
+#   [snap 9] /Shared/docs/report.docx        (one line per file, newest snapshot wins)
+```
+It composes with the snapshot-age limits, e.g. `--in-the-last-snapshots 10 --snapshots-newer-than 12h`.
+
+### How do I see the size, age, and other attributes of matches (not just paths)?
+
+By default a search prints one path per line. Add `--show-details` to get an
+aligned table with the **size (human-readable)** and **change_time (ctime)** of
+each match - this works for snapshot search and for the live walk:
+```bash
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared --name '*.docx' --show-details
+#   PATH                       SIZE     CHANGE_TIME
+#   /Shared/docs/report.docx   1.4 MiB  2026-06-20T08:02:11Z
+```
+Choose your own columns with `--fields`, or get everything with `--fields all`
+(which implies `--show-details`):
+```bash
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared --name '*.docx' \
+  --show-details --fields path,size,owner_name,modification_time
+```
+In a multi-snapshot search (`--all-snapshots` / `--in-the-last-snapshots`) the
+table gains a leading `SNAPSHOT` column showing which snapshot each row came from.
+It also writes to files - `--csv-out FILE` or `--json-out FILE` (and `--json` to
+stdout); in those machine formats `size` stays raw bytes rather than human-readable.
+Note: `--all-attributes` does nothing for snapshot search - use `--fields all`.
+
+### How do I copy files out of a snapshot?
+
+Combine `--snapshot` with `--copy-to`. It copies the snapshot version (including
+deleted files) into a live staging directory and never touches the originals:
+```bash
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name '*.docx' --copy-to /Shared/restore-staging \
+  --create-destination-directory --preserve-all --yes
+```
+Like any `--copy-to`, this **flattens**: every match lands at `DEST/<name>`, not
+at its original sub-path. So two snapshot files with the same name (say
+`a/b/c/d/dog` and `a/b/c/d/e/dog`) both target `DEST/dog`, collide, and are both
+skipped ("Multiple sources to one target"). Even a single file copied this way
+lands at the top of DEST, not back in its old subdirectory. When the goal is to
+put files back where they *were* - at their original nested paths - use
+`--restore-in-place` (next question), which never flattens and never collides on
+same-named files.
+
+### How do I restore files back to where they were (undelete / roll back)?
+
+`--restore-in-place` writes each matched file back to its original path,
+recreating files and parent directories deleted since the snapshot. This
+overwrites live data, so it needs `--clobber` (to replace existing files) plus
+confirmation - preview with `--dry-run` first:
+```bash
+# Preview
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name '*.docx' --restore-in-place --clobber --dry-run
+
+# Do it
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
+  --name '*.docx' --restore-in-place --clobber --yes
+```
+Without `--clobber`, files that still exist live are skipped (only deleted ones
+are recreated) - a safe way to undelete without rolling anything back.
+
+### How do I restore an entire directory (not just its files)?
+
+By default `--restore-in-place` restores files and recreates only the directories
+that contain them, so empty subdirectories are left out. To bring back a whole
+directory as it was - including non-matching files and empty subdirectories - add
+`--include-directories`, or select directories with `--type directory`:
+```bash
+# Restore the whole project-x directory from the snapshot (subtree, empty dirs and all)
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared --max-depth 1 \
+  --name 'project-x' --type directory --restore-in-place --yes
+
+# Or: restore everything under a path, directories included
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project-x \
+  --restore-in-place --include-directories --yes
+```
+If the directory still exists live, the restore **merges** into it: existing files
+follow the conflict strategy (skip / `--clobber` / `--rename-on-conflict`), missing
+files and subdirectories are recreated, and the live directory is left in place.
+
+### What if a name already exists at the destination?
+
+Three strategies, anywhere a copy/restore writes: the default **skips** the
+conflict; `--clobber` **overwrites**; and `--rename-on-conflict` writes the item
+under a `_restored_<date>_<time>` suffix (e.g. `report_restored_2026-06-25_14-30-05.docx`),
+so you keep both. The stamp is the grumpwalk host's local time, stamped once per
+run; customize it with `--conflict-suffix`.
 
 ---
 
@@ -1851,6 +2004,19 @@ Output:
 ```bash
 ./grumpwalk.py --host cluster --path /data \
   --fields path,size,modification_time --type file
+```
+Bare `--fields` (above) streams a tab-separated projection with raw byte sizes.
+For a readable **aligned table with human-readable sizes**, add `--show-details`
+(or use it alone for the default `path,size,change_time` columns). `--show-details`
+is also what enables attribute output for **snapshot search**, where bare `--fields`
+implies it:
+```bash
+./grumpwalk.py --host cluster --path /data --show-details --fields path,size,owner_name
+```
+Get every attribute with `--fields all` (implies `--show-details`):
+```bash
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared --name '*.docx' \
+  --fields all --csv-out report.csv
 ```
 
 Full dot notation also works for any nested field:

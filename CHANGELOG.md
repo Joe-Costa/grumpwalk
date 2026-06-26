@@ -5,6 +5,23 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-06-25
+
+### Added
+
+- **Snapshots: search, copy, and restore.** Qumulo provides no native snapshot-restore call, so grumpwalk lists snapshots and uses the read endpoints' `?snapshot=` parameter (to crawl/search a snapshot) together with `copy-chunk`'s `source_snapshot` field (to copy a file's snapshot version into a live target). All existing filters and output apply in snapshot context.
+- **`--list-snapshots`** - List available snapshots (id, timestamp, name, resolved source path) and exit. Honors `--snapshots-newer-than`/`--snapshots-older-than`.
+- **`--snapshot ID`** - Run the crawl/search in the context of snapshot ID (every read uses `?snapshot=ID`). Finds files as they were at snapshot time, **including files deleted since**. Composes with every universal filter and with `--copy-to`/`--restore-in-place`.
+- **`--all-snapshots`** - Search across ALL snapshots instead of one. Each match is annotated with its snapshot (a `snapshot` field in `--json`, a `[snap N]` prefix otherwise). Used in place of `--path`; if `--path` is given, only snapshots whose source covers that path are searched (reliable `source_file_id` containment, not a read-probe). Search-only.
+- **`--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION`** - With `--all-snapshots`/`--in-the-last-snapshots`/`--list-snapshots`, limit the snapshot set by each snapshot's own age (distinct from `--older-than`/`--newer-than`, which filter files). DURATION accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. Ages are computed in UTC against the snapshots' UTC timestamps.
+- **`--in-the-last-snapshots N`** - Search the N most recent snapshots (by UTC timestamp) and show only the **newest** matching result for each path, deduplicating the same file across snapshots. Composes with all filters and the snapshot-age limits. Search-only.
+- **`--snapshot ID --copy-to DEST`** - Copy the snapshot version of matched files (incl. deleted ones) into a live destination. Reuses the full copy feature (`--rename-to`, `--preserve-permissions`/`--preserve-all` reading the snapshot's metadata, `--include-directories`, `--create-destination-directory`).
+- **`--snapshot ID --restore-in-place`** - Restore matched files to their ORIGINAL live paths (undelete / roll back): recreate files and parent directories deleted since the snapshot, and with `--clobber` overwrite the current live version. Destructive: requires confirmation / `--yes`; `--dry-run` previews the plan.
+  - **Directory restore** - With `--include-directories` (or `--type directory`), a matched directory is restored as a complete subtree: the directory and every descendant - including files that did not match the filter and **empty subdirectories** - are recreated at their original paths. Restoring into a directory that still exists live merges (existing files honor the skip/`--clobber`/`--rename-on-conflict` strategy; the directory itself is left in place). Without these flags, matched directories are skipped and only files are restored (their containing directories are recreated as needed) - the prior behavior, unchanged.
+- **`--rename-on-conflict`** - Third conflict strategy alongside the default (skip) and `--clobber` (overwrite): on a name conflict, write the item under a `_restored_<local-date>_<HH-MM-SS>` suffix (stamped once per run; customizable via `--conflict-suffix` with `{date}`/`{time}`/`{datetime}`/`{snapshot}`). Mutually exclusive with `--clobber`.
+- **`--show-details`** - Show the attributes of matched results instead of just their paths, for **snapshot search** (`--snapshot`/`--all-snapshots`/`--in-the-last-snapshots`) and the live filtered walk. Defaults to `path`, human-readable `size`, and `change_time` (ctime). Renders an aligned table to stdout, or honors `--csv-out` / `--json-out` / `--json` (in those machine formats `size` stays raw bytes). In multi-snapshot search each row carries the source snapshot (a `SNAPSHOT` column / `snapshot` field). `--limit` caps the rows shown.
+  - **`--fields` chooses the columns**, and the new value **`--fields all`** selects every attribute (and implies `--show-details`). `--fields all` supersedes `--all-attributes` for snapshot search, where `--all-attributes` previously had no effect. Resolved-name fields (`owner_name`/`group_name`) trigger identity resolution. In the live walk, bare `--fields` keeps its existing streaming projection for backward compatibility; pair it with `--show-details` for the aligned table.
+
 ## [3.2.0] - 2026-06-24
 
 ### Added

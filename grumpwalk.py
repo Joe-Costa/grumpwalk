@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 import argparse
 import asyncio
@@ -69,6 +69,8 @@ from modules import (
     parse_field_specs,
     extract_fields,
     convert_timestamps_to_epoch,
+    resolve_detail_field_specs,
+    emit_detail_output,
     build_renamer,
     RenamePatternError,
 )
@@ -3156,29 +3158,31 @@ def _preserve_flags(args):
     return (bool(args.preserve_permissions or args.preserve_all), bool(args.preserve_all))
 
 
-async def _preserve_early(client, session, source_path, target_path, preserve_all, is_symlink=False):
+async def _preserve_early(client, session, source_path, target_path, preserve_all,
+                          is_symlink=False, snapshot_id=None):
     """Preserve attributes that are safe to apply before a directory's children.
 
     Always copies owner/group; for non-symlinks also the ACL/mode, and with
     preserve_all the GENERIC user-metadata tags. DOS extended attributes and
-    timestamps are deferred to _preserve_late so they are applied last.
+    timestamps are deferred to _preserve_late so they are applied last. The
+    SOURCE is read with snapshot_id (snapshot context); the target is always live.
     Best-effort: returns a short problem string, or None.
     """
     problems = []
-    og = await client.get_file_owner_group(session, source_path)
+    og = await client.get_file_owner_group(session, source_path, snapshot_id=snapshot_id)
     if og:
         ok, err = await client.set_file_owner_group(
             session, target_path, owner=og.get("owner"), group=og.get("group"))
         if not ok:
             problems.append(f"owner/group: {err}")
     if not is_symlink:
-        acl = await client.get_file_acl(session, source_path)
+        acl = await client.get_file_acl(session, source_path, snapshot_id=snapshot_id)
         if acl:
             ok, err = await client.set_file_acl(session, target_path, acl)
             if not ok:
                 problems.append(f"acl: {err}")
         if preserve_all:
-            tags = await client.get_file_user_metadata(session, source_path)
+            tags = await client.get_file_user_metadata(session, source_path, snapshot_id=snapshot_id)
             if tags:
                 for key, value in tags.items():
                     ok, err = await client.set_file_user_metadata(session, target_path, key, value)
@@ -3187,7 +3191,7 @@ async def _preserve_early(client, session, source_path, target_path, preserve_al
     return "; ".join(problems) if problems else None
 
 
-async def _preserve_late(client, session, source_path, target_path, is_symlink=False):
+async def _preserve_late(client, session, source_path, target_path, is_symlink=False, snapshot_id=None):
     """Preserve attributes that must be applied LAST (only for --preserve-all).
 
     DOS extended attributes (non-symlinks) and timestamps (modification/access/
@@ -3197,7 +3201,7 @@ async def _preserve_late(client, session, source_path, target_path, is_symlink=F
     Best-effort: returns a short problem string, or None.
     """
     problems = []
-    src = await client.get_file_attr(session, source_path)
+    src = await client.get_file_attr(session, source_path, snapshot_id=snapshot_id)
     if not src:
         return "could not read source attributes"
     if not is_symlink:
@@ -3223,15 +3227,80 @@ async def _preserve_object(client, session, source_path, target_path, args, is_s
     do_preserve, preserve_all = _preserve_flags(args)
     if not do_preserve:
         return None
+    snap = getattr(args, "snapshot", None)
     warns = []
-    early = await _preserve_early(client, session, source_path, target_path, preserve_all, is_symlink)
+    early = await _preserve_early(client, session, source_path, target_path, preserve_all,
+                                  is_symlink, snapshot_id=snap)
     if early:
         warns.append(early)
     if preserve_all:
-        late = await _preserve_late(client, session, source_path, target_path, is_symlink)
+        late = await _preserve_late(client, session, source_path, target_path, is_symlink, snapshot_id=snap)
         if late:
             warns.append(late)
     return "; ".join(warns) if warns else None
+
+
+def _conflict_stamp(args):
+    """The conflict-rename suffix for this run, computed ONCE in local time.
+
+    Default '_restored_<YYYY-MM-DD>_<HH-MM-SS>'. Customizable via --conflict-suffix
+    with {date}/{time}/{datetime}/{snapshot} placeholders. Stamped once so every
+    item renamed in one run shares the suffix (identifies the batch).
+    """
+    cached = getattr(args, "_conflict_stamp_cache", None)
+    if cached is None:
+        now = datetime.now()  # local time of the grumpwalk host
+        d, t = now.strftime("%Y-%m-%d"), now.strftime("%H-%M-%S")
+        snap = getattr(args, "snapshot", None)
+        template = args.conflict_suffix or "_restored_{datetime}"
+        try:
+            cached = template.format(date=d, time=t, datetime=f"{d}_{t}",
+                                     snapshot=("" if snap is None else snap))
+        except (KeyError, IndexError):
+            cached = f"_restored_{d}_{t}"
+        args._conflict_stamp_cache = cached
+    return cached
+
+
+def _suffix_name(name, suffix, counter=0):
+    """Insert suffix before the final extension; add _N when counter > 0.
+
+    'report.docx' + '_restored_..' -> 'report_restored_...docx'; a name without an
+    extension (or a leading-dot dotfile) gets the suffix appended.
+    """
+    extra = f"_{counter + 1}" if counter else ""
+    dot = name.rfind(".")
+    if dot > 0:
+        return f"{name[:dot]}{suffix}{extra}{name[dot:]}"
+    return f"{name}{suffix}{extra}"
+
+
+async def _rename_into_place(client, session, temp_path, dest_parent, new_name, args):
+    """Rename a freshly-written temp object to new_name in dest_parent, applying the
+    skip / --clobber / --rename-on-conflict strategy.
+
+    Returns (status, final_name, message): status in copied/skipped_exists/failed.
+    On any non-success the temp is left for the caller to delete.
+    """
+    ok, ec, err = await client.rename_entry(session, temp_path, dest_parent, new_name,
+                                            clobber=args.clobber)
+    if ok:
+        return ("copied", new_name, None)
+    if ec != "fs_entry_exists_error":
+        return ("failed", None, f"rename into place failed: {err}")
+    # Destination exists and we did not clobber.
+    if not args.rename_on_conflict:
+        return ("skipped_exists", None, None)
+    suffix = _conflict_stamp(args)
+    for counter in range(1000):
+        candidate = _suffix_name(new_name, suffix, counter)
+        ok, ec, err = await client.rename_entry(session, temp_path, dest_parent, candidate,
+                                                clobber=False)
+        if ok:
+            return ("renamed", candidate, None)
+        if ec != "fs_entry_exists_error":
+            return ("failed", None, f"rename-on-conflict failed: {err}")
+    return ("failed", None, "rename-on-conflict exhausted")
 
 
 async def _copy_one_file(client, session, p, args, idx):
@@ -3244,30 +3313,34 @@ async def _copy_one_file(client, session, p, args, idx):
     last. Returns (status, message): status is copied/skipped_exists/failed.
     """
     src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
+    snap = getattr(args, "snapshot", None)
     temp_name = f".grumpwalk-copytmp.{os.getpid()}.{idx}.{new_name}"
     ok, ec, err = await client.create_entry(session, dest_parent, temp_name, "CREATE_FILE")
     if not ok:
         return ("failed", f"create temp failed: {err}")
     temp_path = _mv_join(dest_parent, temp_name)
-    ok, err = await client.copy_file_data(session, src, temp_path)
+    ok, err = await client.copy_file_data(session, src, temp_path, source_snapshot=snap)
     if not ok:
         await client.delete_entry(session, temp_path)
         return ("failed", f"copy failed: {err}")
-    ok, ec, err = await client.rename_entry(
-        session, temp_path, dest_parent, new_name, clobber=args.clobber)
-    if not ok:
-        await client.delete_entry(session, temp_path)
-        if ec == "fs_entry_exists_error":
-            return ("skipped_exists", None)
-        return ("failed", f"rename into place failed: {err}")
-    preserve_warn = await _preserve_object(client, session, src, p["target"], args)
-    return ("copied", preserve_warn)
+    status, final_name, msg = await _rename_into_place(client, session, temp_path,
+                                                       dest_parent, new_name, args)
+    if status in ("copied", "renamed"):
+        preserve_warn = await _preserve_object(
+            client, session, src, _mv_join(dest_parent, final_name), args)
+        note = preserve_warn
+        if status == "renamed":
+            note = f"renamed to {final_name} (conflict)" + (f"; {note}" if note else "")
+        return ("copied", note)
+    await client.delete_entry(session, temp_path)
+    return (status, msg)
 
 
 async def _copy_one_symlink(client, session, p, args):
     """Recreate a symlink at the destination (read target + CREATE_SYMLINK)."""
     src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
-    target_of = await client.read_symlink(session, src)
+    snap = getattr(args, "snapshot", None)
+    target_of = await client.read_symlink(session, src, snapshot_id=snap)
     if target_of is None:
         return ("failed", "could not read symlink target")
     if args.clobber:
@@ -3290,7 +3363,8 @@ async def _copy_tree(client, session, source_dir, target_dir, args, stats):
     each object. Per-object failures are recorded and do not abort the tree.
     """
     do_preserve, preserve_all = _preserve_flags(args)
-    children = await client.enumerate_directory(session, source_dir)
+    snap = getattr(args, "snapshot", None)
+    children = await client.enumerate_directory(session, source_dir, snapshot_id=snap)
     for child in children:
         cpath = child.get("path", "").rstrip("/")
         if not cpath:
@@ -3305,12 +3379,12 @@ async def _copy_tree(client, session, source_dir, target_dir, args, stats):
                 continue
             ctarget = _mv_join(target_dir, cname)
             if do_preserve:
-                await _preserve_early(client, session, cpath, ctarget, preserve_all)
+                await _preserve_early(client, session, cpath, ctarget, preserve_all, snapshot_id=snap)
             await _copy_tree(client, session, cpath, ctarget, args, stats)
             if preserve_all:
-                await _preserve_late(client, session, cpath, ctarget)  # after children
+                await _preserve_late(client, session, cpath, ctarget, snapshot_id=snap)  # after children
         elif ctype == _FS_TYPE_SYMLINK:
-            target_of = await client.read_symlink(session, cpath)
+            target_of = await client.read_symlink(session, cpath, snapshot_id=snap)
             if target_of is None:
                 stats["tree_failed"] += 1
                 _mv_record_error(stats, cpath, "could not read symlink target")
@@ -3331,7 +3405,7 @@ async def _copy_tree(client, session, source_dir, target_dir, args, stats):
                 _mv_record_error(stats, cpath, f"create failed: {err}")
                 continue
             ctarget = _mv_join(target_dir, cname)
-            ok, err = await client.copy_file_data(session, cpath, ctarget)
+            ok, err = await client.copy_file_data(session, cpath, ctarget, source_snapshot=snap)
             if not ok:
                 stats["tree_failed"] += 1
                 _mv_record_error(stats, cpath, f"copy failed: {err}")
@@ -3350,11 +3424,12 @@ async def _copy_one_dir(client, session, p, args, stats):
         return ("failed", f"mkdir failed: {err}")
     target_dir = _mv_join(dest_parent, new_name)
     do_preserve, preserve_all = _preserve_flags(args)
+    snap = getattr(args, "snapshot", None)
     if do_preserve:
-        await _preserve_early(client, session, src, target_dir, preserve_all)
+        await _preserve_early(client, session, src, target_dir, preserve_all, snapshot_id=snap)
     await _copy_tree(client, session, src, target_dir, args, stats)
     if preserve_all:
-        await _preserve_late(client, session, src, target_dir)  # after children
+        await _preserve_late(client, session, src, target_dir, snapshot_id=snap)  # after children
     return ("copied", None)
 
 
@@ -3516,6 +3591,25 @@ async def copy_objects(client, session, args, file_filter) -> dict:
             log_stderr("ERROR", f"Invalid --rename-to pattern: {e}")
             sys.exit(1)
 
+    # Copy from a snapshot: validate it, default --path to its source, check coverage.
+    src_snapshot = getattr(args, "snapshot", None)
+    if src_snapshot is not None:
+        snap = await client.get_snapshot(session, src_snapshot)
+        if snap is None:
+            log_stderr("ERROR", f"Snapshot {src_snapshot} not found")
+            sys.exit(1)
+        snap_src = await client.resolve_id_to_path(session, snap.get("source_file_id"))
+        if not args.path:
+            if snap_src is None:
+                log_stderr("ERROR", f"Snapshot {src_snapshot} source no longer exists; "
+                                    "specify --path within the snapshot")
+                sys.exit(1)
+            args.path = snap_src.rstrip("/") or "/"
+        elif snap_src is not None and not _path_within(args.path, snap_src):
+            log_stderr("ERROR", f"Snapshot {src_snapshot} (source {snap_src}) does not cover "
+                                f"{args.path} -- a read there would return LIVE data.")
+            sys.exit(1)
+
     if not args.copy_to.startswith("/"):
         log_stderr("ERROR", "--copy-to must be an absolute path")
         sys.exit(1)
@@ -3545,6 +3639,7 @@ async def copy_objects(client, session, args, file_filter) -> dict:
         omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
         collect_results=True, verbose=args.verbose,
         max_entries_per_dir=args.max_entries_per_dir,
+        snapshot_id=getattr(args, "snapshot", None),
     )
     if progress:
         print(file=sys.stderr)
@@ -3700,6 +3795,468 @@ async def copy_objects(client, session, args, file_filter) -> dict:
     if args.progress:
         print(file=sys.stderr)
 
+    return stats
+
+
+# ============================================================================
+# SNAPSHOTS: search and restore data from Qumulo snapshots
+# ============================================================================
+
+def _parse_snapshot_time(ts_str):
+    """Parse a snapshot RFC 3339 timestamp into an aware UTC datetime, or None.
+
+    Qumulo timestamps carry nanosecond precision, which datetime.fromisoformat
+    cannot parse; the fractional part is truncated to microseconds first.
+    """
+    if not ts_str:
+        return None
+    s = ts_str.replace("Z", "+00:00")
+    if "." in s:
+        head, rest = s.split(".", 1)
+        frac, tz = rest, ""
+        for marker in ("+", "-"):
+            if marker in rest:
+                frac, tzrest = rest.split(marker, 1)
+                tz = marker + tzrest
+                break
+        s = f"{head}.{frac[:6]}{tz}"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _path_within(path, root):
+    """True if path equals root or is a descendant of root."""
+    p = path.rstrip("/") or "/"
+    r = root.rstrip("/") or "/"
+    return r == "/" or p == r or p.startswith(r + "/")
+
+
+async def _resolve_snapshot_source(client, session, snap, cache):
+    """Resolve a snapshot's source_file_id to a live path (cached). None if unresolvable.
+
+    Uses a LIVE read (no snapshot context). Returns None when the source directory
+    no longer exists live (deleted/moved), so coverage cannot be confirmed.
+    """
+    sid = snap.get("source_file_id")
+    if sid in cache:
+        return cache[sid]
+    raw = await client.resolve_id_to_path(session, sid)
+    path = raw.rstrip("/") if raw else None
+    if raw is not None and path == "":
+        path = "/"
+    cache[sid] = path
+    return path
+
+
+def _parse_age_to_hours(value):
+    """Parse a snapshot-age threshold to hours.
+
+    Accepts a bare number (days, for back-compat) or a number with a unit:
+    '5'/'5d'/'5 days' -> 120h; '12h'/'12 hours' -> 12h. Returns float hours, or
+    None if the input is not a valid non-negative number with an optional d/h unit.
+    """
+    if value is None:
+        return None
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$", str(value))
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit in ("", "d", "day", "days"):
+        return num * 24.0
+    if unit in ("h", "hr", "hrs", "hour", "hours"):
+        return num
+    return None
+
+
+def _filter_snapshots_by_age(snapshots, newer_hours, older_hours):
+    """Filter snapshots by their own age (UTC), not file age.
+
+    Snapshot timestamps are UTC and 'now' is taken in UTC, so the age is timezone-
+    correct regardless of the grumpwalk host's local time. newer_hours/older_hours
+    are float hours (or None). Snapshots with an unparseable timestamp are dropped.
+    """
+    now = datetime.now(timezone.utc)
+    out = []
+    for snap in snapshots:
+        ts = _parse_snapshot_time(snap.get("timestamp"))
+        if ts is None:
+            continue
+        age_hours = (now - ts).total_seconds() / 3600.0
+        if newer_hours is not None and age_hours > newer_hours:
+            continue
+        if older_hours is not None and age_hours < older_hours:
+            continue
+        out.append(snap)
+    return out
+
+
+async def list_snapshots_mode(client, session, args):
+    """--list-snapshots: print available snapshots (age-filtered) to stdout."""
+    snaps = _filter_snapshots_by_age(
+        await client.list_snapshots(session),
+        args.snapshots_newer_hours, args.snapshots_older_hours)
+    if not snaps:
+        log_stderr("INFO", "No snapshots match.")
+        return
+    cache = {}
+    print(f"{'ID':>6}  {'TIMESTAMP (UTC)':<21}  {'NAME':<22}  SOURCE")
+    for snap in sorted(snaps, key=lambda s: s.get("id", 0)):
+        src = await _resolve_snapshot_source(client, session, snap, cache)
+        ts = (snap.get("timestamp") or "")[:19].replace("T", " ")
+        name = (snap.get("name") or "")[:22]
+        print(f"{snap.get('id'):>6}  {ts:<21}  {name:<22}  {src or '<source deleted/moved>'}")
+
+
+def _emit_snapshot_match(entry, snap, args, annotate):
+    """Emit one snapshot search match: NDJSON with --json, else a path line."""
+    if getattr(args, "json", False):
+        out = dict(entry)
+        out["snapshot"] = {"id": snap.get("id"), "name": snap.get("name"),
+                           "timestamp": snap.get("timestamp")}
+        print(json.dumps(out))
+    else:
+        path = entry.get("path", "")
+        print(f"[snap {snap.get('id')}] {path}" if annotate else path)
+
+
+def _snapshot_sort_key(snap):
+    """UTC datetime for ordering snapshots by recency (oldest sentinel if unparseable)."""
+    return _parse_snapshot_time(snap.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+async def _select_search_snapshots(client, session, args):
+    """Resolve which snapshots to crawl: list of (snapshot, root_path).
+
+    Multi-snapshot search (--all-snapshots or --in-the-last-snapshots): every
+    age-passing snapshot whose source covers --path (or rooted at its source when
+    --path is omitted). With --in-the-last-snapshots N the covering snapshots are
+    ordered newest-first (by UTC timestamp) and trimmed to the N most recent.
+    --snapshot ID: just that one, rooted at --path (or its source); aborts if
+    --path is outside the snapshot (would read live).
+    """
+    cache = {}
+    pairs = []
+    if args.all_snapshots or args.in_the_last_snapshots:
+        snaps = _filter_snapshots_by_age(
+            await client.list_snapshots(session),
+            args.snapshots_newer_hours, args.snapshots_older_hours)
+        for snap in snaps:
+            src = await _resolve_snapshot_source(client, session, snap, cache)
+            if args.path:
+                if src is None or not _path_within(args.path, src):
+                    continue
+                pairs.append((snap, args.path.rstrip("/") or "/"))
+            elif src is not None:
+                pairs.append((snap, src))
+        if args.in_the_last_snapshots:
+            # Newest-first, keep the N most recent (so dedup keeps the newest version).
+            pairs.sort(key=lambda pr: _snapshot_sort_key(pr[0]), reverse=True)
+            pairs = pairs[:args.in_the_last_snapshots]
+        else:
+            pairs.sort(key=lambda pr: pr[0].get("id", 0))
+    else:
+        snap = await client.get_snapshot(session, args.snapshot)
+        if snap is None:
+            log_stderr("ERROR", f"Snapshot {args.snapshot} not found")
+            sys.exit(1)
+        src = await _resolve_snapshot_source(client, session, snap, cache)
+        if args.path and src is not None and not _path_within(args.path, src):
+            log_stderr("ERROR", f"Snapshot {args.snapshot} (source {src}) does not cover "
+                                f"{args.path} -- a read there would return LIVE data, not the "
+                                f"snapshot. Use a --path within {src}.")
+            sys.exit(1)
+        root = (args.path.rstrip("/") if args.path else src) or "/"
+        pairs.append((snap, root))
+    return pairs
+
+
+async def search_snapshots(client, session, args, file_filter):
+    """Search one or all snapshots. Streams path/JSON lines, or - when
+    --show-details/--fields is set - collects matches and renders an aligned
+    detail table (or --csv-out/--json-out/--json). Returns count."""
+    pairs = await _select_search_snapshots(client, session, args)
+    if not pairs:
+        log_stderr("INFO", "No snapshots to search (after age/coverage filters).")
+        return 0
+    multi = args.all_snapshots or bool(args.in_the_last_snapshots)
+    # --in-the-last-snapshots: pairs are newest-first, so the first time a path is
+    # seen it is its newest version; later (older) occurrences are suppressed.
+    dedupe = bool(args.in_the_last_snapshots)
+    detail = args.show_details or bool(args.fields)
+    seen = set()
+    total = 0
+    records = [] if detail else None
+    for snap, root in pairs:
+        if args.limit and total >= args.limit:
+            break
+        if multi or args.verbose:
+            log_stderr("INFO", f"Searching snapshot {snap.get('id')} "
+                               f"({(snap.get('timestamp') or '')[:19]} UTC) at {root}")
+        entries = await client.walk_tree_async(
+            session, root, args.max_depth, file_filter=file_filter,
+            omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
+            collect_results=True, verbose=args.verbose,
+            max_entries_per_dir=args.max_entries_per_dir, snapshot_id=snap.get("id"))
+        for e in entries:
+            if args.limit and total >= args.limit:
+                break
+            if dedupe:
+                key = e.get("path")
+                if key in seen:
+                    continue
+                seen.add(key)
+            if detail:
+                e["snapshot"] = {"id": snap.get("id"), "name": snap.get("name"),
+                                 "timestamp": snap.get("timestamp")}
+                records.append(e)
+            else:
+                _emit_snapshot_match(e, snap, args, multi)
+            total += 1
+    if detail:
+        specs, is_all = resolve_detail_field_specs(args.fields)
+        emit_detail_output(records, specs, is_all, snapshot_col=multi,
+                           unix_time=args.unix_time, want_json=args.json,
+                           json_out=args.json_out, csv_out=args.csv_out)
+        if args.csv_out:
+            log_stderr("INFO", f"Wrote {total:,} result(s) to {args.csv_out}")
+        elif args.json_out:
+            log_stderr("INFO", f"Wrote {total:,} result(s) to {args.json_out}")
+    return total
+
+
+async def _ensure_restore_parent(client, session, parent, args, created):
+    """Ensure parent exists live (mkdir -p), recreating dirs deleted since the
+    snapshot and restoring their snapshot metadata when --preserve. Cached via
+    `created`. Returns True on success.
+    """
+    if parent in created or parent == "/":
+        return True
+    missing = []
+    p = parent
+    while p != "/":
+        if (await client.get_file_attr(session, p)) is not None:  # live
+            break
+        missing.append(p)
+        p = _mv_parent_of(p)
+    missing.reverse()
+    snap = getattr(args, "snapshot", None)
+    do_preserve, preserve_all = _preserve_flags(args)
+    for m in missing:
+        ok, ec, err = await client.create_entry(
+            session, _mv_parent_of(m), _mv_basename(m), "CREATE_DIRECTORY")
+        if not ok and ec != "fs_entry_exists_error":
+            return False
+        if do_preserve:
+            await _preserve_early(client, session, m, m, preserve_all, snapshot_id=snap)
+            if preserve_all:
+                await _preserve_late(client, session, m, m, snapshot_id=snap)
+        created.add(m)
+    created.add(parent)
+    return True
+
+
+def _type_is_directory(args) -> bool:
+    """True when --type selects directories (directory/dir/d)."""
+    return getattr(args, "type", None) in ("directory", "dir", "d")
+
+
+async def _collect_snapshot_subtree(client, session, dir_path, snapshot_id):
+    """Recursively enumerate dir_path within the snapshot.
+
+    Returns (files, dirs): files is a list of (path, is_symlink) for every file and
+    symlink in the subtree; dirs is a list of every descendant directory path (not
+    dir_path itself). Used to restore an entire directory to its original location,
+    including files that did not match the filter and empty subdirectories.
+
+    Enumeration is sequential (one listing per directory); a large subtree means many
+    API calls. Per-directory listing errors are surfaced by walk_tree's caller; here a
+    failed listing simply yields no children for that node.
+    """
+    files = []
+    dirs = []
+    stack = [dir_path]
+    while stack:
+        d = stack.pop()
+        children = await client.enumerate_directory(session, d, snapshot_id=snapshot_id)
+        for child in children:
+            cpath = child.get("path", "").rstrip("/")
+            if not cpath:
+                continue
+            ctype = child.get("type")
+            if ctype == _FS_TYPE_DIR:
+                dirs.append(cpath)
+                stack.append(cpath)
+            else:
+                files.append((cpath, ctype == _FS_TYPE_SYMLINK))
+    return files, dirs
+
+
+async def restore_in_place(client, session, args, file_filter) -> dict:
+    """Restore matched snapshot files/symlinks to their ORIGINAL live paths.
+
+    Recreates parent directories deleted since the snapshot, then writes each file
+    via temp + atomic rename (the skip/--clobber/--rename-on-conflict strategy).
+
+    By default directories are skipped (their files are restored individually,
+    recreating only the dirs that contain files). With --include-directories or
+    --type directory, each matched directory is restored as a full subtree: the
+    directory and every descendant - including non-matching files and EMPTY
+    subdirectories - are recreated at their original paths, and the per-file
+    conflict strategy still applies to files that already exist live. Destructive
+    when overwriting live data: needs confirmation/--yes.
+    """
+    stats = {"total_matched": 0, "planned": 0, "planned_dirs": 0, "restored": 0,
+             "dirs_created": 0, "skipped_exists": 0, "skipped_directory": 0,
+             "failed": 0, "errors": []}
+    snap_id = args.snapshot
+
+    snap = await client.get_snapshot(session, snap_id)
+    if snap is None:
+        log_stderr("ERROR", f"Snapshot {snap_id} not found")
+        sys.exit(1)
+    snap_src = await client.resolve_id_to_path(session, snap.get("source_file_id"))
+    if not args.path:
+        if snap_src is None:
+            log_stderr("ERROR", f"Snapshot {snap_id} source no longer exists; specify --path")
+            sys.exit(1)
+        args.path = snap_src.rstrip("/") or "/"
+    elif snap_src is not None and not _path_within(args.path, snap_src):
+        log_stderr("ERROR", f"Snapshot {snap_id} (source {snap_src}) does not cover {args.path}")
+        sys.exit(1)
+
+    log_stderr("INFO", f"Scanning snapshot {snap_id} at {args.path} for matches...")
+    entries = await client.walk_tree_async(
+        session, args.path, args.max_depth, file_filter=file_filter,
+        omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path, collect_results=True,
+        verbose=args.verbose, max_entries_per_dir=args.max_entries_per_dir, snapshot_id=snap_id)
+    stats["total_matched"] = len(entries)
+
+    restore_dirs = bool(args.include_directories) or _type_is_directory(args)
+    matched_dirs = set()
+    if restore_dirs:
+        for e in entries:
+            if e.get("type") == _FS_TYPE_DIR:
+                p = e.get("path", "").rstrip("/")
+                if p:
+                    matched_dirs.add(p)
+
+    def _under_matched(path):
+        parent = _mv_parent_of(path)
+        while parent != "/":
+            if parent in matched_dirs:
+                return True
+            parent = _mv_parent_of(parent)
+        return False
+
+    file_targets = {}   # path -> is_symlink (dedup by destination path)
+    dir_targets = set()  # directory paths to recreate (subtree, incl. empty dirs)
+    for e in entries:
+        path = e.get("path", "").rstrip("/")
+        if not path:
+            continue
+        etype = e.get("type")
+        if etype == _FS_TYPE_DIR:
+            if not restore_dirs:
+                stats["skipped_directory"] += 1
+                continue
+            if _under_matched(path):
+                continue  # covered by an ancestor matched directory
+            sub_files, sub_dirs = await _collect_snapshot_subtree(
+                client, session, path, snap_id)
+            dir_targets.add(path)
+            dir_targets.update(sub_dirs)
+            for fp, is_sl in sub_files:
+                file_targets[fp] = is_sl
+        else:
+            if restore_dirs and _under_matched(path):
+                continue  # restored as part of its matched ancestor directory
+            file_targets[path] = (etype == _FS_TYPE_SYMLINK)
+
+    targets = sorted(file_targets.items())  # [(path, is_symlink), ...]
+    stats["planned"] = len(targets)
+    stats["planned_dirs"] = len(dir_targets)
+
+    sorted_dirs = sorted(dir_targets, key=lambda d: (d.count("/"), d))
+
+    if args.dry_run:
+        for d in sorted_dirs:
+            log_stderr("DRY RUN", f"restore dir snapshot {snap_id}:{d} -> {d}")
+        for path, _ in targets:
+            log_stderr("DRY RUN", f"restore snapshot {snap_id}:{path} -> {path}")
+        if stats["skipped_directory"]:
+            log_stderr("INFO", f"{stats['skipped_directory']} matched director(ies) skipped "
+                               "(pass --include-directories or --type directory to restore "
+                               "directory subtrees)")
+        return stats
+    if not targets and not dir_targets:
+        log_stderr("INFO", "Nothing to restore after planning.")
+        return stats
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log_stderr("ERROR", "Refusing to restore in place without confirmation in "
+                                "non-interactive mode; pass --yes")
+            sys.exit(1)
+        mode = ("overwriting live versions" if args.clobber else
+                "renaming on conflict" if args.rename_on_conflict else
+                "skipping files that still exist live")
+        dir_note = f" and recreate {len(dir_targets):,} director(ies)" if dir_targets else ""
+        print(f"\nAbout to restore {len(targets):,} file(s){dir_note} from snapshot {snap_id} to "
+              f"their original paths ({mode}):", file=sys.stderr)
+        for path, _ in targets[:5]:
+            print(f"  {path}", file=sys.stderr)
+        if len(targets) > 5:
+            print(f"  ... and {len(targets) - 5:,} more", file=sys.stderr)
+        if input("Proceed? [y]es / [N]o: ").strip().lower() not in ("y", "yes"):
+            log_stderr("INFO", "Aborted by user.")
+            return stats
+
+    sem = asyncio.Semaphore(max(1, args.copy_concurrency))
+    created = set()
+
+    # Recreate directories first, shallow-first, so parents exist before children and
+    # empty subdirectories are restored even when they contain no files.
+    for d in sorted_dirs:
+        existed = (await client.get_file_attr(session, d)) is not None
+        if await _ensure_restore_parent(client, session, d, args, created):
+            if not existed:
+                stats["dirs_created"] += 1
+        else:
+            stats["failed"] += 1
+            _mv_record_error(stats, d, "could not recreate directory")
+            log_stderr("WARN" if args.continue_on_error else "ERROR",
+                       f"Failed to recreate directory {d}")
+
+    async def _run(path, is_symlink, idx):
+        async with sem:
+            parent = _mv_parent_of(path)
+            if not await _ensure_restore_parent(client, session, parent, args, created):
+                return path, ("failed", f"could not recreate parent {parent}")
+            p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path), "target": path}
+            if is_symlink:
+                return path, await _copy_one_symlink(client, session, p, args)
+            return path, await _copy_one_file(client, session, p, args, idx)
+
+    tasks = [asyncio.create_task(_run(path, sl, i)) for i, (path, sl) in enumerate(targets)]
+    for fut in asyncio.as_completed(tasks):
+        path, (status, msg) = await fut
+        if status == "copied":
+            stats["restored"] += 1
+            if args.verbose:
+                log_stderr("RESTORED", f"{path}" + (f" ({msg})" if msg else ""))
+        elif status == "skipped_exists":
+            stats["skipped_exists"] += 1
+            log_stderr("SKIP", f"{path} exists live (use --clobber or --rename-on-conflict)")
+        else:
+            stats["failed"] += 1
+            _mv_record_error(stats, path, msg or "restore failed")
+            log_stderr("WARN" if args.continue_on_error else "ERROR", f"Failed to restore {path}: {msg}")
     return stats
 
 
@@ -5619,6 +6176,61 @@ async def main_async(args):
                     f"Inheritance propagation complete: {', '.join(summary_parts)}",
                     newline_before=True)
 
+        return
+
+    # SNAPSHOT: list snapshots
+    if args.list_snapshots:
+        async with client.create_session() as session:
+            await list_snapshots_mode(client, session, args)
+        return
+
+    # SNAPSHOT SEARCH: --snapshot ID (alone) or --all-snapshots, search-only
+    if args.all_snapshots or args.in_the_last_snapshots or \
+            (args.snapshot is not None and not (args.copy_to or args.restore_in_place)):
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+            file_filter = create_file_filter(args, owner_auth_ids)
+            count = await search_snapshots(client, session, args, file_filter)
+            log_stderr("INFO", f"{count:,} match(es) found")
+        return
+
+    # SNAPSHOT RESTORE IN PLACE: restore matched snapshot files to original paths
+    if args.restore_in_place:
+        async with client.create_session() as session:
+            owner_auth_ids = None
+            if args.owners:
+                print("\nResolving owner identities...", file=sys.stderr)
+                owner_auth_ids = await resolve_owner_filters(client, session, args, parse_trustee)
+            file_filter = create_file_filter(args, owner_auth_ids)
+            stats = await restore_in_place(client, session, args, file_filter)
+            dry = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nSNAPSHOT RESTORE SUMMARY{dry}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Snapshot:          {args.snapshot}", file=sys.stderr)
+            print(f"Path:              {args.path}", file=sys.stderr)
+            print(f"Matched:           {stats['total_matched']:,}", file=sys.stderr)
+            label = "Would restore:" if args.dry_run else "Restored:"
+            print(f"{label:<19}{(stats['planned'] if args.dry_run else stats['restored']):,}", file=sys.stderr)
+            if stats["planned_dirs"]:
+                dlabel = "  Directories (would recreate):" if args.dry_run else "  Directories recreated:"
+                dcount = stats["planned_dirs"] if args.dry_run else stats["dirs_created"]
+                print(f"{dlabel} {dcount:,}", file=sys.stderr)
+            if stats["skipped_directory"]:
+                print(f"  Directories skipped (files restored individually): {stats['skipped_directory']:,}", file=sys.stderr)
+            if stats["skipped_exists"]:
+                print(f"  Skipped (exists live): {stats['skipped_exists']:,}", file=sys.stderr)
+            if not args.dry_run:
+                print(f"Failed:            {stats['failed']:,}", file=sys.stderr)
+            if stats["errors"]:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats["errors"][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+            if stats["failed"] > 0:
+                sys.exit(1)
         return
 
     # COPY MODE: server-side copy matching objects (POSIX cp style)
@@ -7599,7 +8211,9 @@ async def main_async(args):
     # resolve_links with stdout still needs collection for backward compatibility
     resolve_links_needs_collection = args.resolve_links and not (args.csv_out or args.json_out)
 
-    collect_results = features_requiring_collection or resolve_links_needs_collection
+    # --show-details collects matches and renders a table/CSV/JSON after the walk.
+    collect_results = features_requiring_collection or resolve_links_needs_collection \
+        or args.show_details
 
     # Create output callback for streaming results
     output_callback = None
@@ -7608,7 +8222,8 @@ async def main_async(args):
 
     # STREAMING FILE OUTPUT: Use StreamingFileOutputHandler for --csv-out / --json-out
     # This writes entries to file as they arrive, avoiding OOM with large result sets
-    if (args.csv_out or args.json_out) and not features_requiring_collection:
+    if (args.csv_out or args.json_out) and not features_requiring_collection \
+            and not args.show_details:
         output_format = "json" if args.json_out else "csv"
         output_path = args.json_out if args.json_out else args.csv_out
 
@@ -7646,7 +8261,8 @@ async def main_async(args):
         await streaming_file_handler.open()
 
     # STDOUT STREAMING: existing logic for stdout output
-    elif not args.owner_report and not args.acl_report and not args.find_similar and not resolve_links_needs_collection:
+    elif not args.owner_report and not args.acl_report and not args.find_similar \
+            and not resolve_links_needs_collection and not args.show_details:
         if args.show_owner or args.show_group:
             # Use batched output handler for streaming with identity resolution
             output_format = "json" if args.json else "text"
@@ -7775,6 +8391,49 @@ async def main_async(args):
             pass  # Will be reported after handler close
         else:
             log_stderr("INFO", f"Tree walk completed, collected {len(matching_files)} matching files")
+
+    # --show-details: render collected matches as a table/CSV/JSON and return.
+    if args.show_details:
+        if args.limit:
+            matching_files = matching_files[:args.limit]
+        specs, is_all = resolve_detail_field_specs(args.fields)
+        wanted = {dn for dn, _ in specs}
+        if (("owner_name" in wanted or "group_name" in wanted)
+                and matching_files and not args.dont_resolve_ids):
+            auth_ids = set()
+            for e in matching_files:
+                if "owner_name" in wanted:
+                    aid = (e.get("owner_details") or {}).get("auth_id") or e.get("owner")
+                    if aid:
+                        auth_ids.add(aid)
+                if "group_name" in wanted:
+                    aid = (e.get("group_details") or {}).get("auth_id") or e.get("group")
+                    if aid:
+                        auth_ids.add(aid)
+            icache = {}
+            if auth_ids:
+                async with client.create_session() as session:
+                    icache = await client.resolve_multiple_identities(
+                        session, list(auth_ids),
+                        show_progress=args.verbose or args.progress)
+            for e in matching_files:
+                if "owner_name" in wanted:
+                    aid = (e.get("owner_details") or {}).get("auth_id") or e.get("owner")
+                    e["owner_name"] = (format_owner_name(icache[aid]) if aid in icache
+                                       else format_raw_id(e.get("owner_details") or {}, e.get("owner", "")))
+                if "group_name" in wanted:
+                    aid = (e.get("group_details") or {}).get("auth_id") or e.get("group")
+                    e["group_name"] = (format_owner_name(icache[aid]) if aid in icache
+                                       else format_raw_id(e.get("group_details") or {}, e.get("group", "")))
+        emit_detail_output(matching_files, specs, is_all, snapshot_col=False,
+                           unix_time=args.unix_time, want_json=args.json,
+                           json_out=args.json_out, csv_out=args.csv_out)
+        if args.csv_out:
+            log_stderr("INFO", f"Wrote {len(matching_files):,} result(s) to {args.csv_out}")
+        elif args.json_out:
+            log_stderr("INFO", f"Wrote {len(matching_files):,} result(s) to {args.json_out}")
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return
 
     # Flush any remaining batched output
     if batched_handler:
@@ -8936,12 +9595,22 @@ Examples:
         help="Include all file attributes in JSON output",
     )
     output.add_argument(
+        "--show-details",
+        action="store_true",
+        help="Show attributes of matched results instead of just paths "
+             "(works for the live walk and for snapshot search). Defaults to "
+             "path, human-readable size, and change_time (ctime). Choose columns "
+             "with --fields; use --fields all for every attribute. Renders an "
+             "aligned table to stdout, or honors --csv-out / --json-out / --json.",
+    )
+    output.add_argument(
         "--fields",
         metavar="FIELD[,FIELD,...]",
         help="Comma-separated list of fields to include in output. "
              "Supports dot notation (owner_details.id_value) and aliases: "
              "owner_id, owner_type, group_id, group_type, attr.<name>. "
-             "Cannot be combined with --all-attributes. "
+             "The special value 'all' selects every attribute (implies "
+             "--show-details). Cannot be combined with --all-attributes. "
              "Use --fields-list to see all available fields.",
     )
     class _FieldsListAction(argparse.Action):
@@ -9378,6 +10047,74 @@ Examples:
     )
 
     # ============================================================================
+    # FEATURE: SNAPSHOTS
+    # ============================================================================
+    snapshots = parser.add_argument_group('Feature: Snapshots',
+        'Search, and copy/restore data from, Qumulo snapshots')
+    snapshots.add_argument(
+        "--list-snapshots",
+        action="store_true",
+        help="List available snapshots (id, name, timestamp, source path) and exit. "
+             "Honors --snapshots-newer-than/--snapshots-older-than to bound the list.",
+    )
+    snapshots.add_argument(
+        "--snapshot",
+        type=int,
+        metavar="ID",
+        help="Run the crawl/search in the context of snapshot ID (all reads use it). "
+             "Composes with every filter. With --copy-to or --restore-in-place, copies "
+             "the snapshot version of matched files (incl. files deleted since).",
+    )
+    snapshots.add_argument(
+        "--all-snapshots",
+        action="store_true",
+        help="Search across ALL snapshots instead of a single --snapshot. Each match is "
+             "annotated with its snapshot. Use in place of --path (or with --path to "
+             "restrict to snapshots whose source covers that path). Search-only.",
+    )
+    snapshots.add_argument(
+        "--snapshots-newer-than",
+        metavar="DURATION",
+        help="Only consider snapshots taken within the last DURATION. Accepts days or "
+             "hours: '5' or '5d' = 5 days, '12h' = 12 hours (filters snapshots by their "
+             "UTC timestamp, not files). Use with --all-snapshots/--in-the-last-snapshots/"
+             "--list-snapshots.",
+    )
+    snapshots.add_argument(
+        "--snapshots-older-than",
+        metavar="DURATION",
+        help="Only consider snapshots older than DURATION ('5'/'5d' = days, '12h' = hours).",
+    )
+    snapshots.add_argument(
+        "--in-the-last-snapshots",
+        type=int,
+        metavar="N",
+        help="Search the N most recent snapshots (by UTC timestamp) and show only the "
+             "NEWEST matching result for each path (dedupes across the N snapshots). "
+             "Composes with the filters and snapshot-age limits. Search-only.",
+    )
+    snapshots.add_argument(
+        "--restore-in-place",
+        action="store_true",
+        help="With --snapshot, restore each matched file to its ORIGINAL live path "
+             "(undelete/roll back): recreate files/dirs deleted since the snapshot, and "
+             "(with --clobber) overwrite live versions. Destructive: needs --yes / confirmation.",
+    )
+    snapshots.add_argument(
+        "--rename-on-conflict",
+        action="store_true",
+        help="On a name conflict during copy/restore, write the item under a new name with "
+             "a '_restored_<date>_<time>' suffix instead of skipping (default) or "
+             "overwriting (--clobber). Mutually exclusive with --clobber.",
+    )
+    snapshots.add_argument(
+        "--conflict-suffix",
+        metavar="TEMPLATE",
+        help="Customize the --rename-on-conflict suffix. Placeholders: {date}, {time}, "
+             "{datetime}, {snapshot}. Default: '_restored_{datetime}'.",
+    )
+
+    # ============================================================================
     # FEATURE: EXTENDED ATTRIBUTE MANAGEMENT
     # ============================================================================
     attr_management = parser.add_argument_group('Feature: Extended Attribute Management',
@@ -9703,13 +10440,62 @@ Examples:
     args = parser.parse_args()
 
     # Validate arguments
-    # Check that either --path OR (--source-acl/--source-acl-file + --acl-target) are provided
+    # Check that either --path OR (--source-acl/--source-acl-file + --acl-target) are provided.
+    # Snapshot modes supply their own root: --list-snapshots needs no path,
+    # --all-snapshots replaces --path, and --snapshot defaults to the snapshot source.
     acl_cloning_mode = (args.source_acl or args.source_acl_file) and args.acl_target
-    if not args.path and not acl_cloning_mode:
+    snapshot_root_mode = (args.list_snapshots or args.all_snapshots or args.in_the_last_snapshots
+                          or args.snapshot is not None)
+    if not args.path and not acl_cloning_mode and not snapshot_root_mode:
         print(
             "Error: Either --path is required OR a source (--source-acl or --source-acl-file) and --acl-target for ACL cloning",
             file=sys.stderr,
         )
+        sys.exit(1)
+
+    # Snapshot-mode validation
+    multi_snapshot = bool(args.all_snapshots or args.in_the_last_snapshots)
+    if args.all_snapshots and args.snapshot is not None:
+        print("Error: --all-snapshots and --snapshot cannot be combined; choose one", file=sys.stderr)
+        sys.exit(1)
+    if args.in_the_last_snapshots is not None:
+        if args.in_the_last_snapshots <= 0:
+            print("Error: --in-the-last-snapshots must be a positive integer", file=sys.stderr)
+            sys.exit(1)
+        if args.snapshot is not None:
+            print("Error: --in-the-last-snapshots searches multiple snapshots; do not combine with --snapshot",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.copy_to or args.restore_in_place:
+            print("Error: --in-the-last-snapshots is search-only; pick a specific --snapshot to copy/restore",
+                  file=sys.stderr)
+            sys.exit(1)
+    # Parse snapshot-age durations (days by default; Nd / Nh units) to hours.
+    args.snapshots_newer_hours = None
+    args.snapshots_older_hours = None
+    for flag, raw, dest in (("--snapshots-newer-than", args.snapshots_newer_than, "snapshots_newer_hours"),
+                            ("--snapshots-older-than", args.snapshots_older_than, "snapshots_older_hours")):
+        if raw is None:
+            continue
+        if not multi_snapshot and not args.list_snapshots:
+            print(f"Error: {flag} requires --all-snapshots, --in-the-last-snapshots, or --list-snapshots",
+                  file=sys.stderr)
+            sys.exit(1)
+        hours = _parse_age_to_hours(raw)
+        if hours is None:
+            print(f"Error: invalid {flag} '{raw}'; use N or Nd for days, Nh for hours (e.g. 5, 5d, 12h)",
+                  file=sys.stderr)
+            sys.exit(1)
+        setattr(args, dest, hours)
+    if args.all_snapshots and (args.copy_to or args.restore_in_place):
+        print("Error: --all-snapshots is search-only; pick a specific --snapshot to copy/restore",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.restore_in_place and args.snapshot is None:
+        print("Error: --restore-in-place requires --snapshot", file=sys.stderr)
+        sys.exit(1)
+    if args.clobber and args.rename_on_conflict:
+        print("Error: --clobber and --rename-on-conflict cannot be combined", file=sys.stderr)
         sys.exit(1)
 
     # Validate owner/group flags (only work with --source-acl, not --source-acl-file)
@@ -9874,13 +10660,26 @@ Examples:
                 print(f"Error: invalid --rename-to pattern: {e}", file=sys.stderr)
                 sys.exit(1)
         _transfer_conflicts("--move-to/--rename-to")
-    elif args.clobber or args.include_directories or args.yes:
+    elif (args.clobber or args.include_directories or args.yes) \
+            and not (args.restore_in_place or args.snapshot is not None):
         print("Error: --clobber/--include-directories/--yes require --move-to, --copy-to, or --rename-to",
               file=sys.stderr)
         sys.exit(1)
 
     # Validate and parse --fields
-    if args.fields:
+    # '--fields all' is a detail-mode selector (every attribute), not a literal
+    # field name, and implies --show-details.
+    args.fields_all = bool(args.fields) and args.fields.strip().lower() == "all"
+    if args.fields_all:
+        args.show_details = True
+        args.parsed_fields = None
+        if args.all_attributes:
+            print("Error: --fields cannot be combined with --all-attributes", file=sys.stderr)
+            sys.exit(1)
+        if args.owner_report or args.acl_report:
+            print("Error: --fields does not apply to --owner-report or --acl-report", file=sys.stderr)
+            sys.exit(1)
+    elif args.fields:
         args.parsed_fields = parse_field_specs(args.fields)
 
         if args.all_attributes:
@@ -9899,6 +10698,28 @@ Examples:
             args.show_group = True
     else:
         args.parsed_fields = None
+
+    # --show-details applies only to result-producing searches (the live filtered
+    # walk and snapshot search), not to mutating actions or specialized reports.
+    if args.show_details:
+        _detail_incompat = [
+            name for flag, name in (
+                (args.copy_to, "--copy-to"), (args.move_to, "--move-to"),
+                (args.rename_to, "--rename-to"), (args.restore_in_place, "--restore-in-place"),
+                (args.owner_report, "--owner-report"), (args.acl_report, "--acl-report"),
+                (args.find_similar, "--find-similar"), (args.list_snapshots, "--list-snapshots"),
+                (args.show_dir_stats, "--show-dir-stats"),
+                (args.source_acl, "--source-acl"), (args.acl_target, "--acl-target"),
+            ) if flag
+        ]
+        if _detail_incompat:
+            print(f"Error: --show-details cannot be combined with {', '.join(_detail_incompat)}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.all_attributes:
+            print("Error: --show-details ignores --all-attributes; use '--fields all' "
+                  "for every attribute", file=sys.stderr)
+            sys.exit(1)
 
     # Validate extended attribute arguments
     validate_attribute_args(args)

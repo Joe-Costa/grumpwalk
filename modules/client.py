@@ -210,12 +210,64 @@ class AsyncQumuloClient:
             return {"skip-atime-update": "true"}
         return {}
 
+    @staticmethod
+    def _snapshot_query_params(snapshot_id) -> dict:
+        """Query params to read in the context of a snapshot, or {} for live.
+
+        Pass snapshot_id=None (the default everywhere) for a normal live read.
+        The value is the snapshot's integer id as a string. NOTE: this only
+        belongs on READ endpoints (entries/, info/attributes, aggregates/,
+        info/acl, data) -- it must never be added to a write, and out-of-scope
+        paths silently fall back to live data, so callers must confirm coverage
+        first (see source_file_id containment).
+        """
+        return {"snapshot": str(snapshot_id)} if snapshot_id is not None else {}
+
+    async def list_snapshots(self, session: aiohttp.ClientSession) -> List[dict]:
+        """List all snapshots via GET /v2/snapshots/.
+
+        Returns the list of snapshot objects (id, name, timestamp, expiration,
+        source_file_id, directory_name, ...), or an empty list on error.
+        """
+        url = f"{self.base_url}/v2/snapshots/"
+        try:
+            async with session.get(url, ssl=self.ssl_context) as response:
+                if response.status != 200:
+                    return []
+                data = await response.json()
+                return data.get("entries", []) if isinstance(data, dict) else (data or [])
+        except aiohttp.ClientError:
+            return []
+
+    async def get_snapshot(self, session: aiohttp.ClientSession, snapshot_id) -> Optional[dict]:
+        """Fetch a single snapshot's metadata, or None if it does not exist."""
+        url = f"{self.base_url}/v2/snapshots/{snapshot_id}"
+        try:
+            async with session.get(url, ssl=self.ssl_context) as response:
+                return await response.json() if response.status == 200 else None
+        except aiohttp.ClientError:
+            return None
+
+    async def resolve_id_to_path(self, session: aiohttp.ClientSession, file_id) -> Optional[str]:
+        """Resolve a file ID to its current live path, or None if it no longer exists.
+
+        Unlike get_file_attr (which assumes a path and prepends '/'), this uses the
+        numeric id directly as the {ref}, so it works for snapshot source_file_ids.
+        """
+        url = f"{self.base_url}/v1/files/{quote(str(file_id), safe='')}/info/attributes"
+        try:
+            async with session.get(url, ssl=self.ssl_context) as response:
+                return (await response.json()).get("path") if response.status == 200 else None
+        except aiohttp.ClientError:
+            return None
+
     async def get_directory_page(
         self,
         session: aiohttp.ClientSession,
         path: str,
         limit: int = 1000,
         after_token: Optional[str] = None,
+        snapshot_id: Optional[int] = None,
     ) -> dict:
         """
         Fetch a single page of directory contents from Qumulo API.
@@ -240,6 +292,7 @@ class AsyncQumuloClient:
             if after_token:
                 params["after"] = after_token
             params.update(self._atime_query_params())
+            params.update(self._snapshot_query_params(snapshot_id))
 
             async with session.get(
                 url, params=params, ssl=self.ssl_context
@@ -252,6 +305,7 @@ class AsyncQumuloClient:
         session: aiohttp.ClientSession,
         path: str,
         max_entries: Optional[int] = None,
+        snapshot_id: Optional[int] = None,
     ) -> List[dict]:
         """
         Enumerate all entries in a directory, following pagination.
@@ -260,6 +314,7 @@ class AsyncQumuloClient:
             session: aiohttp ClientSession
             path: Directory path
             max_entries: Optional limit on total entries to fetch
+            snapshot_id: If set, read the directory as of this snapshot
 
         Returns:
             List of all file/directory entries
@@ -269,7 +324,7 @@ class AsyncQumuloClient:
 
         while True:
             response = await self.get_directory_page(
-                session, path, limit=1000, after_token=after_token
+                session, path, limit=1000, after_token=after_token, snapshot_id=snapshot_id
             )
 
             files = response.get("files", [])
@@ -288,7 +343,8 @@ class AsyncQumuloClient:
         return all_entries
 
     async def enumerate_directory_streaming(
-        self, session: aiohttp.ClientSession, path: str, callback, should_continue=None
+        self, session: aiohttp.ClientSession, path: str, callback, should_continue=None,
+        snapshot_id: Optional[int] = None,
     ) -> int:
         """
         Stream directory entries without accumulating in memory.
@@ -316,7 +372,7 @@ class AsyncQumuloClient:
                 break
 
             response = await self.get_directory_page(
-                session, path, limit=1000, after_token=after_token
+                session, path, limit=1000, after_token=after_token, snapshot_id=snapshot_id
             )
 
             files = response.get("files", [])
@@ -334,7 +390,7 @@ class AsyncQumuloClient:
         return total_entries
 
     async def get_directory_aggregates(
-        self, session: aiohttp.ClientSession, path: str
+        self, session: aiohttp.ClientSession, path: str, snapshot_id: Optional[int] = None
     ) -> dict:
         """
         Get directory aggregate statistics.
@@ -358,7 +414,9 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v1/files/{encoded_path}/aggregates/"
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=self._snapshot_query_params(snapshot_id), ssl=self.ssl_context
+                ) as response:
                     response.raise_for_status()
                     return await response.json()
             except aiohttp.ClientError as e:
@@ -405,7 +463,7 @@ class AsyncQumuloClient:
                 return {}
 
     async def get_file_acl(
-        self, session: aiohttp.ClientSession, path: str
+        self, session: aiohttp.ClientSession, path: str, snapshot_id: Optional[int] = None
     ) -> Optional[dict]:
         """
         Get the Access Control List (ACL) for a file or directory.
@@ -414,6 +472,7 @@ class AsyncQumuloClient:
         Args:
             session: aiohttp ClientSession
             path: File or directory path
+            snapshot_id: If set, read the ACL as of this snapshot
 
         Returns:
             Dictionary containing ACL data with 'aces', 'control', 'posix_special_permissions',
@@ -427,7 +486,9 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v2/files/{encoded_path}/info/acl"
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=self._snapshot_query_params(snapshot_id), ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
@@ -507,7 +568,8 @@ class AsyncQumuloClient:
     async def get_file_attr(
         self,
         session: aiohttp.ClientSession,
-        path: str
+        path: str,
+        snapshot_id: Optional[int] = None,
     ) -> Optional[dict]:
         """
         Get file attributes including file ID using v1 attributes API.
@@ -515,6 +577,7 @@ class AsyncQumuloClient:
         Args:
             session: aiohttp ClientSession
             path: Path to the file/directory
+            snapshot_id: If set, read the attributes as of this snapshot
 
         Returns:
             Dictionary with file attributes including 'id', 'name', 'type', etc. or None if failed
@@ -527,7 +590,9 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=self._snapshot_query_params(snapshot_id), ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
@@ -538,7 +603,8 @@ class AsyncQumuloClient:
     async def get_file_owner_group(
         self,
         session: aiohttp.ClientSession,
-        path: str
+        path: str,
+        snapshot_id: Optional[int] = None,
     ) -> Optional[dict]:
         """
         Get owner and group information for a file or directory using v1 attributes API.
@@ -546,6 +612,7 @@ class AsyncQumuloClient:
         Args:
             session: aiohttp ClientSession
             path: Path to the file/directory
+            snapshot_id: If set, read as of this snapshot
 
         Returns:
             Dictionary with 'owner', 'owner_details', 'group', 'group_details' or None if failed
@@ -558,7 +625,9 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v1/files/{encoded_path}/info/attributes"
 
             try:
-                async with session.get(url, ssl=self.ssl_context) as response:
+                async with session.get(
+                    url, params=self._snapshot_query_params(snapshot_id), ssl=self.ssl_context
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         return {
@@ -685,7 +754,7 @@ class AsyncQumuloClient:
                 return (False, str(e))
 
     async def get_file_user_metadata(
-        self, session: aiohttp.ClientSession, path: str
+        self, session: aiohttp.ClientSession, path: str, snapshot_id: Optional[int] = None
     ) -> Optional[Dict[str, str]]:
         """
         Get all GENERIC user-metadata (custom tags) for a file or directory.
@@ -696,6 +765,7 @@ class AsyncQumuloClient:
         Args:
             session: aiohttp ClientSession
             path: File or directory path
+            snapshot_id: If set, read the tags as of this snapshot
 
         Returns:
             Dict mapping tag key to its decoded string value. An empty dict when
@@ -708,6 +778,7 @@ class AsyncQumuloClient:
 
             encoded_path = quote(path, safe="")
             url = f"{self.base_url}/v1/files/{encoded_path}/user-metadata/GENERIC/"
+            snap_params = self._snapshot_query_params(snapshot_id)
 
             tags: Dict[str, str] = {}
             seen_urls: Set[str] = set()
@@ -715,7 +786,7 @@ class AsyncQumuloClient:
             try:
                 while url and url not in seen_urls:
                     seen_urls.add(url)
-                    async with session.get(url, ssl=self.ssl_context) as response:
+                    async with session.get(url, params=snap_params, ssl=self.ssl_context) as response:
                         if response.status == 404:
                             # Object exists but currently carries no GENERIC tags.
                             return tags
@@ -942,7 +1013,8 @@ class AsyncQumuloClient:
                 return (0, None, str(e))
 
     async def copy_file_data(
-        self, session: aiohttp.ClientSession, source_path: str, target_path: str
+        self, session: aiohttp.ClientSession, source_path: str, target_path: str,
+        source_snapshot: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
         """Server-side copy of a file's data into an existing target file.
 
@@ -952,6 +1024,11 @@ class AsyncQumuloClient:
         source_offset/length, which is fed back as the next request. The target
         file must already exist (a missing target returns fs_no_such_entry_error).
 
+        source_snapshot (an int) reads the SOURCE from that snapshot version --
+        the correct way to restore from a snapshot (works for modified and
+        deleted files). Note: this is a BODY field; the ?snapshot= query parameter
+        does NOT redirect copy-chunk's source (it reads live).
+
         Returns (success, error_message).
         """
         if not source_path.startswith("/"):
@@ -960,6 +1037,8 @@ class AsyncQumuloClient:
             target_path = "/" + target_path
 
         body = {"source_path": source_path, "source_offset": "0", "target_offset": "0"}
+        if source_snapshot is not None:
+            body["source_snapshot"] = int(source_snapshot)
         prev_offset = -1
         # Generous runaway guard; each iteration must advance the source offset.
         for _ in range(1_000_000):
@@ -1083,13 +1162,16 @@ class AsyncQumuloClient:
             except aiohttp.ClientError as e:
                 return (False, str(e))
 
-    async def read_symlink(self, session: aiohttp.ClientSession, path: str) -> Optional[str]:
+    async def read_symlink(
+        self, session: aiohttp.ClientSession, path: str, snapshot_id: Optional[int] = None
+    ) -> Optional[str]:
         """
         Read the target of a symlink.
 
         Args:
             session: aiohttp ClientSession
             path: Path to the symlink
+            snapshot_id: If set, read the symlink as of this snapshot
 
         Returns:
             The target path that the symlink points to, or None if read fails
@@ -1100,10 +1182,12 @@ class AsyncQumuloClient:
 
             encoded_path = quote(path, safe='')
             url = f"{self.base_url}/v1/files/{encoded_path}/data"
+            params = dict(self._atime_query_params())
+            params.update(self._snapshot_query_params(snapshot_id))
 
             try:
                 async with session.get(
-                    url, params=self._atime_query_params(), ssl=self.ssl_context
+                    url, params=params, ssl=self.ssl_context
                 ) as response:
                     if response.status == 200:
                         # Read the symlink target (returns as plain text)
@@ -1170,6 +1254,7 @@ class AsyncQumuloClient:
         verbose: bool = False,
         progress: Optional["ProgressTracker"] = None,
         output_callback=None,
+        snapshot_id: Optional[int] = None,
     ) -> tuple:
         """
         Automatically choose between batch mode and streaming mode based on directory size.
@@ -1280,10 +1365,11 @@ class AsyncQumuloClient:
 
             # Stream directory entries with early exit check
             should_continue = lambda: not progress or progress.can_output()
-            await self.enumerate_directory_streaming(session, path, process_page, should_continue)
+            await self.enumerate_directory_streaming(
+                session, path, process_page, should_continue, snapshot_id=snapshot_id)
         else:
             # Use batch mode - existing behavior
-            entries = await self.enumerate_directory(session, path)
+            entries = await self.enumerate_directory(session, path, snapshot_id=snapshot_id)
             total_processed = len(entries)
 
             for entry in entries:
@@ -1349,6 +1435,7 @@ class AsyncQumuloClient:
         size_filter_info: Optional[Dict] = None,
         owner_filter_info: Optional[Dict] = None,
         output_callback=None,
+        snapshot_id: Optional[int] = None,
     ) -> List[dict]:
         """
         Walk directory tree using bounded-memory BFS with async worker pool.
@@ -1404,7 +1491,7 @@ class AsyncQumuloClient:
                 return
 
             # Get directory aggregates for pre-flight intelligence
-            aggregates = await self.get_directory_aggregates(session, dir_path)
+            aggregates = await self.get_directory_aggregates(session, dir_path, snapshot_id=snapshot_id)
 
             # Check for errors in aggregates response
             has_aggregates_error = "error" in aggregates
@@ -1508,6 +1595,7 @@ class AsyncQumuloClient:
                     session, dir_path, aggregates,
                     file_filter, owner_stats, collect_results,
                     verbose, progress, output_callback,
+                    snapshot_id=snapshot_id,
                 )
             )
 

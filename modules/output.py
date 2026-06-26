@@ -440,6 +440,7 @@ def print_field_list():
     for name, desc in FIELD_DESCRIPTIONS:
         print(f"  {name:<{max_name}}  {desc}")
     print(f"\nDot notation is also supported for nested fields (e.g., owner_details.id_value).")
+    print(f"The special value 'all' selects every field above (and implies --show-details).")
     print(f"Example: --fields path,size,owner_id,group_id,modification_time")
 
 
@@ -524,6 +525,165 @@ def extract_fields(entry, field_specs):
         else:
             result[display_name] = entry.get(resolve_path)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Detail output for --show-details (collected, rendered as a table / CSV / JSON)
+# ---------------------------------------------------------------------------
+
+DEFAULT_DETAIL_FIELDS = ["path", "size", "change_time"]
+
+# Concrete field set for "--fields all": every documented field read directly
+# from the entry. Excludes the *_id/_type aliases (which duplicate
+# owner_details/group_details), the resolved *_name fields (which need identity
+# resolution), and the attr.<name> placeholder.
+_ALIAS_OR_RESOLVED_FIELDS = {
+    "owner_id", "owner_type", "group_id", "group_type", "owner_name", "group_name",
+}
+ALL_DETAIL_FIELDS = [
+    name for name, _ in FIELD_DESCRIPTIONS
+    if name not in _ALIAS_OR_RESOLVED_FIELDS and not name.startswith("attr.")
+]
+
+
+def human_size(value):
+    """Render a byte count as a short binary-unit string: '16 B', '1.4 GiB'."""
+    if value is None:
+        return ""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(n)} B"
+    s = f"{n:.1f}"
+    if s.endswith(".0"):
+        s = s[:-2]
+    return f"{s} {units[i]}"
+
+
+def resolve_detail_field_specs(fields_arg):
+    """Return (field_specs, is_all) for --show-details / --fields.
+
+    fields_arg is the raw --fields string (or None). 'all' (case-insensitive)
+    selects every attribute; None falls back to the default detail set
+    (path, size, change_time).
+    """
+    if fields_arg and fields_arg.strip().lower() == "all":
+        return [(n, n) for n in ALL_DETAIL_FIELDS], True
+    if fields_arg:
+        return parse_field_specs(fields_arg), False
+    return [(n, n) for n in DEFAULT_DETAIL_FIELDS], False
+
+
+def _detail_columns(field_specs, is_all):
+    return [(n, n) for n in ALL_DETAIL_FIELDS] if is_all else field_specs
+
+
+def _detail_cell(value, human=False):
+    """Render one value for a text/CSV cell."""
+    if value is None:
+        return ""
+    if human:
+        return human_size(value)
+    if isinstance(value, (dict, list)):
+        return json_parser.dumps(value)
+    return str(value)
+
+
+def _detail_work_entry(entry, unix_time):
+    """Return the entry to read from, applying --unix-time on a copy (never mutating
+    the caller's entry)."""
+    if unix_time:
+        work = dict(entry)
+        convert_timestamps_to_epoch(work)
+        return work
+    return entry
+
+
+def _render_detail_table(fh, records, field_specs, is_all, snapshot_col, unix_time):
+    if not records:
+        return  # nothing matched; keep stdout clean (count is logged to stderr)
+    cols = _detail_columns(field_specs, is_all)
+    headers = (["SNAPSHOT"] if snapshot_col else []) + [dn.upper() for dn, _ in cols]
+    rows = []
+    for e in records:
+        work = _detail_work_entry(e, unix_time)
+        proj = extract_fields(work, cols)
+        cells = []
+        if snapshot_col:
+            cells.append(str((e.get("snapshot") or {}).get("id", "")))
+        for dn, _ in cols:
+            cells.append(_detail_cell(proj.get(dn), human=(dn == "size")))
+        rows.append(cells)
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(r):
+            if len(c) > widths[i]:
+                widths[i] = len(c)
+    line = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(line.format(*headers), file=fh)
+    for r in rows:
+        print(line.format(*r), file=fh)
+
+
+def _write_detail_ndjson(fh, records, field_specs, is_all, snapshot_col, unix_time):
+    for e in records:
+        work = _detail_work_entry(e, unix_time)
+        if is_all:
+            out = {k: v for k, v in work.items() if k != "snapshot"}
+        else:
+            out = extract_fields(work, field_specs)
+        if snapshot_col:
+            out = {"snapshot": e.get("snapshot"), **out}
+        try:
+            fh.write(json_parser.dumps(out, escape_forward_slashes=False) + "\n")
+        except TypeError:
+            fh.write(json_parser.dumps(out) + "\n")
+
+
+def _write_detail_csv(path, records, field_specs, is_all, snapshot_col, unix_time):
+    import csv
+    cols = _detail_columns(field_specs, is_all)
+    headers = (["snapshot_id"] if snapshot_col else []) + [dn for dn, _ in cols]
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(headers)
+        for e in records:
+            work = _detail_work_entry(e, unix_time)
+            proj = extract_fields(work, cols)
+            row = []
+            if snapshot_col:
+                row.append((e.get("snapshot") or {}).get("id", ""))
+            for dn, _ in cols:
+                row.append(_detail_cell(proj.get(dn)))  # raw size in CSV
+            writer.writerow(row)
+
+
+def emit_detail_output(records, field_specs, is_all, snapshot_col=False,
+                       unix_time=False, want_json=False, json_out=None, csv_out=None):
+    """Render collected detail records to one target.
+
+    records: list of entry dicts (each may carry a 'snapshot' dict for annotation).
+    Target priority: csv_out, then json_out, then want_json (stdout NDJSON),
+    else an aligned table to stdout. Size is human-readable only in the table;
+    CSV/JSON keep raw bytes. Returns the number of records emitted.
+    """
+    if csv_out:
+        _write_detail_csv(csv_out, records, field_specs, is_all, snapshot_col, unix_time)
+    elif json_out:
+        with open(json_out, "w") as fh:
+            _write_detail_ndjson(fh, records, field_specs, is_all, snapshot_col, unix_time)
+    elif want_json:
+        _write_detail_ndjson(sys.stdout, records, field_specs, is_all, snapshot_col, unix_time)
+    else:
+        _render_detail_table(sys.stdout, records, field_specs, is_all, snapshot_col, unix_time)
+    return len(records)
 
 
 TIMESTAMP_FIELDS = {"creation_time", "modification_time", "access_time", "change_time"}

@@ -30,6 +30,8 @@ from .output import (
     parse_field_specs,
     extract_fields,
     convert_timestamps_to_epoch,
+    resolve_detail_field_specs,
+    emit_detail_output,
 )
 
 # Import credentials and cache handling
@@ -93,6 +95,8 @@ __all__ = [
     "parse_field_specs",
     "extract_fields",
     "convert_timestamps_to_epoch",
+    "resolve_detail_field_specs",
+    "emit_detail_output",
     # Credentials
     "CREDENTIALS_FILENAME",
     "CREDENTIALS_VERSION",
