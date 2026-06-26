@@ -261,6 +261,50 @@ class AsyncQumuloClient:
         except aiohttp.ClientError:
             return None
 
+    async def create_snapshot(
+        self,
+        session: aiohttp.ClientSession,
+        source_file_id,
+        name: str = "grumpwalk-delta",
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Create a manual, non-expiring snapshot of source_file_id's subtree.
+
+        Used by delta restore to capture the live ("now") state so a byte-range
+        diff against the good snapshot can be computed. Returns (snapshot_id,
+        error_message); snapshot_id is None on failure. Requires the
+        PRIVILEGE_SNAPSHOT_WRITE privilege.
+        """
+        url = f"{self.base_url}/v3/snapshots/"
+        body = {"source_file_id": str(source_file_id), "name": name, "expiration": ""}
+        try:
+            async with self.semaphore:
+                async with session.post(url, json=body, ssl=self.ssl_context) as response:
+                    text = await response.text()
+                    if response.status in (200, 201):
+                        try:
+                            return (json.loads(text).get("id"), None)
+                        except ValueError:
+                            return (None, "could not parse create-snapshot response")
+                    return (None, text[:200] or f"HTTP {response.status}")
+        except aiohttp.ClientError as e:
+            return (None, str(e))
+
+    async def delete_snapshot(
+        self, session: aiohttp.ClientSession, snapshot_id
+    ) -> Tuple[bool, Optional[str]]:
+        """Delete a snapshot by id. Used to clean up the temporary "now" snapshot
+        that delta restore creates. Returns (success, error_message)."""
+        url = f"{self.base_url}/v2/snapshots/{snapshot_id}"
+        try:
+            async with self.semaphore:
+                async with session.delete(url, ssl=self.ssl_context) as response:
+                    if response.status in (200, 204):
+                        return (True, None)
+                    text = await response.text()
+                    return (False, text[:200] or f"HTTP {response.status}")
+        except aiohttp.ClientError as e:
+            return (False, str(e))
+
     async def get_directory_page(
         self,
         session: aiohttp.ClientSession,
@@ -1060,6 +1104,157 @@ class AsyncQumuloClient:
             prev_offset = offset
             body = resp
         return (False, "copy-chunk did not converge")
+
+    async def get_file_byte_diff(
+        self,
+        session: aiohttp.ClientSession,
+        newer_snapshot_id,
+        older_snapshot_id,
+        file_id,
+    ) -> Tuple[Optional[List[Tuple[int, int]]], Optional[str]]:
+        """Changed byte regions of one file between two snapshots.
+
+        GET /v2/snapshots/{newer}/changes-since/{older}/files/{ref} reports the
+        regions that differ as FILE_REGION_DATA (changed data) or
+        FILE_REGION_HOLE (sparse) entries, paginated. Returns
+        (list_of_(offset, size)_data_regions, error_message). The list is the
+        data regions only -- the overlapping byte ranges that must be re-copied
+        from the good snapshot. A truncated tail (when the good version is larger
+        than live) is NOT reported here and must be handled by the caller.
+        """
+        regions: List[Tuple[int, int]] = []
+        url = (
+            f"{self.base_url}/v2/snapshots/{newer_snapshot_id}"
+            f"/changes-since/{older_snapshot_id}/files/{quote(str(file_id), safe='')}"
+        )
+        try:
+            while url:
+                async with self.semaphore:
+                    async with session.get(url, ssl=self.ssl_context) as response:
+                        if response.status != 200:
+                            text = await response.text()
+                            return (None, text[:200] or f"HTTP {response.status}")
+                        data = await response.json()
+                for entry in data.get("entries", []):
+                    if entry.get("type") == "FILE_REGION_DATA":
+                        regions.append((int(entry["offset"]), int(entry["size"])))
+                nxt = (data.get("paging") or {}).get("next")
+                if not nxt:
+                    break
+                url = nxt if nxt.startswith("http") else f"{self.base_url}{nxt}"
+        except (aiohttp.ClientError, ValueError, KeyError) as e:
+            return (None, str(e))
+        return (regions, None)
+
+    async def get_tree_diff(
+        self,
+        session: aiohttp.ClientSession,
+        newer_snapshot_id,
+        older_snapshot_id,
+    ) -> Tuple[List[dict], Optional[str]]:
+        """All path-level changes between two snapshots (changes-since at the tree
+        level). Returns (entries, error) where each entry is
+        {"op": "CREATE"|"MODIFY"|"DELETE", "path": str}, following pagination.
+
+        Conventions reported by the API: directory paths carry a TRAILING SLASH
+        (the file/dir discriminator), and a created or deleted directory is
+        reported as a SINGLE entry -- its descendants are NOT listed, so a deleted
+        directory must be repopulated from the snapshot subtree and a created
+        directory removed recursively. The diff is a NET endpoint comparison, which
+        is exactly right for "revert to snapshot": a file created and deleted
+        between the two snapshots is absent from both and correctly reported as no
+        change. `entries` holds whatever was collected even if a page later fails.
+        """
+        entries: List[dict] = []
+        url = (
+            f"{self.base_url}/v2/snapshots/{newer_snapshot_id}"
+            f"/changes-since/{older_snapshot_id}?limit=1000"
+        )
+        try:
+            while url:
+                async with self.semaphore:
+                    async with session.get(url, ssl=self.ssl_context) as response:
+                        if response.status != 200:
+                            text = await response.text()
+                            return (entries, text[:200] or f"HTTP {response.status}")
+                        data = await response.json()
+                for e in data.get("entries", []):
+                    path, op = e.get("path"), e.get("op")
+                    if path and op:
+                        entries.append({"op": op, "path": path})
+                nxt = (data.get("paging") or {}).get("next")
+                if not nxt:
+                    break
+                nxt = nxt if nxt.startswith("http") else f"{self.base_url}{nxt}"
+                if nxt == url:           # guard against a self-referential final page
+                    break
+                url = nxt
+        except (aiohttp.ClientError, ValueError) as e:
+            return (entries, str(e))
+        return (entries, None)
+
+    async def set_file_size(
+        self, session: aiohttp.ClientSession, path: str, size: int
+    ) -> Tuple[bool, Optional[str]]:
+        """Truncate or extend a file to `size` bytes via PATCH attributes.
+
+        Extending creates a sparse (zero-filled) tail; delta restore then copies
+        the real bytes over it. Returns (success, error_message)."""
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{self.base_url}/v1/files/{quote(path, safe='')}/info/attributes"
+        try:
+            async with self.semaphore:
+                async with session.patch(
+                    url, json={"size": str(size)}, ssl=self.ssl_context
+                ) as response:
+                    if response.status == 200:
+                        return (True, None)
+                    text = await response.text()
+                    return (False, text[:200] or f"HTTP {response.status}")
+        except aiohttp.ClientError as e:
+            return (False, str(e))
+
+    async def copy_file_range(
+        self,
+        session: aiohttp.ClientSession,
+        source_path: str,
+        target_path: str,
+        source_snapshot: int,
+        offset: int,
+        length: int,
+    ) -> Tuple[bool, Optional[str]]:
+        """Server-side copy of [offset, offset+length) from source_snapshot's
+        source_path into target_path at the same offset.
+
+        copy-chunk's `length` bounds the copy to a single region; the call is
+        looped because the server may bound each chunk further. Both offsets are
+        held equal so the byte range lands at the same place in the target.
+        Returns (success, error_message)."""
+        if not source_path.startswith("/"):
+            source_path = "/" + source_path
+        if not target_path.startswith("/"):
+            target_path = "/" + target_path
+        body = {
+            "source_path": source_path,
+            "source_snapshot": int(source_snapshot),
+            "source_offset": str(offset),
+            "target_offset": str(offset),
+            "length": str(length),
+        }
+        prev_offset = -1
+        for _ in range(1_000_000):
+            status, resp, err = await self._copy_chunk(session, target_path, body)
+            if status != 200:
+                return (False, err or f"copy-chunk HTTP {status}")
+            if not isinstance(resp, dict) or int(resp.get("length") or 0) <= 0:
+                return (True, None)
+            nxt = int(resp.get("source_offset") or 0)
+            if nxt <= prev_offset:
+                return (False, "copy-chunk range made no progress")
+            prev_offset = nxt
+            body = resp
+        return (False, "copy-chunk range did not converge")
 
     async def delete_file_user_metadata(
         self,

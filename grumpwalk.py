@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 
 import argparse
 import asyncio
@@ -4126,10 +4126,114 @@ def _detail_needs_capacity(specs):
     return any(resolve_path == "total_capacity" for _, resolve_path in specs)
 
 
+async def _inc_walk(client, session, path, snap_id, args, file_filter):
+    """Walk one path (a single file, or a directory subtree) in a snapshot with the
+    search filter, reusing the exact same walk + filter as a full crawl so the
+    entries are byte-for-byte what a full crawl would produce. A file path yields
+    [entry] or []; a directory path yields its matching descendants."""
+    return await client.walk_tree_async(
+        session, path, args.max_depth, file_filter=file_filter,
+        omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
+        collect_results=True, verbose=False,
+        max_entries_per_dir=args.max_entries_per_dir, snapshot_id=snap_id)
+
+
+async def _inc_eval_dir_self(client, session, M, dpath, snap_id, file_filter):
+    """Evaluate a directory node itself against the filter and update the match set.
+    A subtree walk returns a directory's descendants but not the directory itself,
+    so a directory that matches by its own attributes (e.g. name, --type directory)
+    is checked here."""
+    a = await client.get_file_attr(session, dpath, snapshot_id=snap_id)
+    if a is None:
+        M.pop(dpath, None)
+        return
+    if not a.get("path"):
+        a = dict(a)
+        a["path"] = dpath
+    if file_filter is None or file_filter(a):
+        M[dpath] = a
+    else:
+        M.pop(dpath, None)
+
+
+async def _inc_apply_diff(client, session, M, newer_id, older_id, root, args, file_filter):
+    """Replay the consecutive tree diff (older -> newer) onto match set M.
+
+    Each changed path is re-evaluated with the same walk + filter as a full crawl:
+    a changed file is re-walked (added/updated/removed), a created directory has its
+    whole subtree walked (the diff reports only the directory node, not descendants)
+    and the directory itself evaluated, a deleted directory drops itself and every
+    match beneath it, and a modified directory re-evaluates only itself.
+    """
+    entries, err = await client.get_tree_diff(session, newer_id, older_id)
+    if err:
+        log_stderr("WARN", f"Tree diff {older_id}->{newer_id} may be incomplete: {err}")
+    base = root.rstrip("/") + "/"
+    for e in entries:
+        p, op = e.get("path"), e.get("op")
+        if not p or not (p.startswith(base) or p.rstrip("/") == root):
+            continue
+        if p.endswith("/"):                       # directory node
+            d = p.rstrip("/")
+            if op == "DELETE":
+                M.pop(d, None)
+                for k in [k for k in M if k.startswith(d + "/")]:
+                    del M[k]
+            elif op == "CREATE":
+                await _inc_eval_dir_self(client, session, M, d, newer_id, file_filter)
+                for se in await _inc_walk(client, session, d, newer_id, args, file_filter):
+                    M[se["path"]] = se
+            else:                                 # MODIFY: only the directory itself
+                await _inc_eval_dir_self(client, session, M, d, newer_id, file_filter)
+        else:                                     # file node
+            if op == "DELETE":
+                M.pop(p, None)
+            else:                                 # CREATE / MODIFY
+                res = await _inc_walk(client, session, p, newer_id, args, file_filter)
+                if res:
+                    M[p] = res[0]
+                else:
+                    M.pop(p, None)
+
+
+async def _incremental_match_sets(client, session, args, file_filter, pairs):
+    """Compute each snapshot's match set with one baseline crawl + consecutive tree
+    diffs, instead of crawling every snapshot.
+
+    Returns {snapshot_id: [entry, ...]} for every snapshot in `pairs`. The oldest
+    covered snapshot is crawled in full; each later snapshot's match set is derived
+    from the previous one by replaying the tree diff and re-checking only the changed
+    paths with the same walk + filter -- so the result is identical to crawling each
+    snapshot, but the unchanged majority of the tree is never re-walked. All pairs
+    share the same root (--path is required with --incremental).
+    """
+    ordered = sorted(pairs, key=lambda pr: _snapshot_sort_key(pr[0]))  # oldest first
+    base_snap, root = ordered[0]
+    log_stderr("INFO", f"Incremental search: baseline crawl of snapshot {base_snap.get('id')} "
+                       f"at {root}, then {len(ordered) - 1} consecutive diff(s)")
+    base_entries = await _inc_walk(client, session, root, base_snap.get("id"), args, file_filter)
+    M = {e["path"]: e for e in base_entries}
+    # Each snapshot keeps its OWN copy of every entry: an unchanged file shares one
+    # dict across all snapshots in M, and the emit/detail path annotates entries with
+    # their snapshot in place -- copying here keeps per-snapshot annotations independent.
+    out = {base_snap.get("id"): [dict(e) for e in M.values()]}
+    prev = base_snap
+    for snap, _root in ordered[1:]:
+        await _inc_apply_diff(client, session, M, snap.get("id"), prev.get("id"),
+                              root, args, file_filter)
+        out[snap.get("id")] = [dict(e) for e in M.values()]
+        prev = snap
+    return out
+
+
 async def search_snapshots(client, session, args, file_filter):
     """Search one or all snapshots. Streams path/JSON lines, or - when
     --show-details/--fields is set - collects matches and renders an aligned
-    detail table (or --csv-out/--json-out/--json). Returns count."""
+    detail table (or --csv-out/--json-out/--json). Returns count.
+
+    With --incremental, a multi-snapshot search crawls only the oldest covered
+    snapshot in full and derives the rest from consecutive tree diffs (identical
+    results, far fewer calls when snapshots are mostly alike)."""
     pairs = await _select_search_snapshots(client, session, args)
     if not pairs:
         log_stderr("INFO", "No snapshots to search (after age/coverage filters).")
@@ -4139,20 +4243,27 @@ async def search_snapshots(client, session, args, file_filter):
     # seen it is its newest version; later (older) occurrences are suppressed.
     dedupe = bool(args.in_the_last_snapshots)
     detail = args.show_details or bool(args.fields)
+    incremental = getattr(args, "incremental", False) and multi
+    precomputed = None
+    if incremental:
+        precomputed = await _incremental_match_sets(client, session, args, file_filter, pairs)
     seen = set()
     total = 0
     records = [] if detail else None
     for snap, root in pairs:
         if args.limit and total >= args.limit:
             break
-        if multi or args.verbose:
+        if (multi or args.verbose) and not incremental:
             log_stderr("INFO", f"Searching snapshot {snap.get('id')} "
                                f"({(snap.get('timestamp') or '')[:19]} UTC) at {root}")
-        entries = await client.walk_tree_async(
-            session, root, args.max_depth, file_filter=file_filter,
-            omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
-            collect_results=True, verbose=args.verbose,
-            max_entries_per_dir=args.max_entries_per_dir, snapshot_id=snap.get("id"))
+        if precomputed is not None:
+            entries = precomputed.get(snap.get("id"), [])
+        else:
+            entries = await client.walk_tree_async(
+                session, root, args.max_depth, file_filter=file_filter,
+                omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
+                collect_results=True, verbose=args.verbose,
+                max_entries_per_dir=args.max_entries_per_dir, snapshot_id=snap.get("id"))
         for e in entries:
             if args.limit and total >= args.limit:
                 break
@@ -4250,6 +4361,72 @@ async def _collect_snapshot_subtree(client, session, dir_path, snapshot_id):
     return files, dirs
 
 
+async def _delta_restore_file(client, session, path, good_snap, now_snap, progress=None):
+    """Patch a live file in place to its good_snap version, copying ONLY the byte
+    ranges that differ (the diff of now_snap vs good_snap).
+
+    Returns (status, message). status is:
+      copied   - file patched to the snapshot version
+      recreate - file no longer exists live; the caller must whole-file restore it
+                 (there is nothing to diff against)
+      failed   - an API call failed (message has the reason)
+
+    Size changes are handled: the file is first resized to the good size (truncate
+    or extend), every changed region within the overlap is copied from good_snap,
+    and -- because the diff only covers the overlapping range -- a file that shrank
+    live (good is larger) has its truncated tail [live_size, good_size) copied
+    explicitly, since the diff never reports it.
+    """
+    good_attr = await client.get_file_attr(session, path, snapshot_id=good_snap)
+    if good_attr is None:
+        return ("failed", "file not present in snapshot")
+    live_attr = await client.get_file_attr(session, path)  # live version
+    if live_attr is None:
+        return ("recreate", None)  # deleted live -> whole-file restore by caller
+
+    good_size = int(good_attr.get("size") or 0)
+    live_size = int(live_attr.get("size") or 0)
+    file_id = good_attr.get("id")
+
+    regions, err = await client.get_file_byte_diff(session, now_snap, good_snap, file_id)
+    if regions is None:
+        return ("failed", f"byte-range diff failed: {err}")
+
+    if good_size != live_size:
+        ok, err = await client.set_file_size(session, path, good_size)
+        if not ok:
+            return ("failed", f"set-size failed: {err}")
+
+    copied = 0
+    for off, sz in regions:
+        if off >= good_size:
+            continue  # region lies entirely beyond the restored size
+        length = min(sz, good_size - off)
+        if length <= 0:
+            continue
+        ok, err = await client.copy_file_range(session, path, path, good_snap, off, length)
+        if not ok:
+            return ("failed", f"range copy failed at offset {off}: {err}")
+        copied += length
+
+    if good_size > live_size:
+        length = good_size - live_size
+        ok, err = await client.copy_file_range(session, path, path, good_snap, live_size, length)
+        if not ok:
+            return ("failed", f"tail copy failed: {err}")
+        copied += length
+
+    if progress is not None:
+        # The bar's total is the sum of restored (good) sizes. Count the bytes we
+        # actually copied as real movement (feeds the rate), then settle the
+        # untouched remainder so the file's full size lands on the bar.
+        moved = min(copied, good_size)
+        progress.advance_bytes(moved, moved=True)
+        if good_size > moved:
+            progress.advance_bytes(good_size - moved, moved=False)
+    return ("copied", f"delta {copied:,}/{good_size:,} bytes")
+
+
 async def restore_in_place(client, session, args, file_filter) -> dict:
     """Restore matched snapshot files/symlinks to their ORIGINAL live paths.
 
@@ -4265,8 +4442,8 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
     when overwriting live data: needs confirmation/--yes.
     """
     stats = {"total_matched": 0, "planned": 0, "planned_dirs": 0, "restored": 0,
-             "dirs_created": 0, "skipped_exists": 0, "skipped_directory": 0,
-             "failed": 0, "errors": []}
+             "delta_patched": 0, "dirs_created": 0, "skipped_exists": 0,
+             "skipped_directory": 0, "failed": 0, "errors": []}
     snap_id = args.snapshot
 
     snap = await client.get_snapshot(session, snap_id)
@@ -4338,10 +4515,11 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
     sorted_dirs = sorted(dir_targets, key=lambda d: (d.count("/"), d))
 
     if args.dry_run:
+        verb = "delta-restore" if args.delta else "restore"
         for d in sorted_dirs:
             log_stderr("DRY RUN", f"restore dir snapshot {snap_id}:{d} -> {d}")
         for path, _ in targets:
-            log_stderr("DRY RUN", f"restore snapshot {snap_id}:{path} -> {path}")
+            log_stderr("DRY RUN", f"{verb} snapshot {snap_id}:{path} -> {path}")
         if stats["skipped_directory"]:
             log_stderr("INFO", f"{stats['skipped_directory']} matched director(ies) skipped "
                                "(pass --include-directories or --type directory to restore "
@@ -4356,7 +4534,8 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
             log_stderr("ERROR", "Refusing to restore in place without confirmation in "
                                 "non-interactive mode; pass --yes")
             sys.exit(1)
-        mode = ("overwriting live versions" if args.clobber else
+        mode = ("delta-patching modified files in place, recreating deleted ones" if args.delta else
+                "overwriting live versions" if args.clobber else
                 "renaming on conflict" if args.rename_on_conflict else
                 "skipping files that still exist live")
         dir_note = f" and recreate {len(dir_targets):,} director(ies)" if dir_targets else ""
@@ -4373,57 +4552,347 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
     sem = asyncio.Semaphore(max(1, args.copy_concurrency))
     created = set()
 
-    # Recreate directories first, shallow-first, so parents exist before children and
-    # empty subdirectories are restored even when they contain no files.
-    for d in sorted_dirs:
-        existed = (await client.get_file_attr(session, d)) is not None
+    # Delta restore diffs each live file against the snapshot, which needs a second
+    # snapshot capturing the CURRENT live state. Create a temporary one of the same
+    # source subtree; if it cannot be made (no privilege, or the source is gone),
+    # degrade gracefully to whole-file restore for this run.
+    now_snap = None
+    if args.delta:
+        src_id = snap.get("source_file_id")
+        now_snap, derr = await client.create_snapshot(
+            session, src_id, name=f"grumpwalk-delta-{snap_id}")
+        if now_snap is None:
+            log_stderr("WARN", f"Could not create temporary snapshot for delta restore "
+                               f"({derr}); falling back to whole-file restore")
+        else:
+            log_stderr("INFO", f"Created temporary snapshot {now_snap} of the live tree "
+                               "to compute byte-range diffs")
+
+    try:
+        # Recreate directories first, shallow-first, so parents exist before children and
+        # empty subdirectories are restored even when they contain no files.
+        for d in sorted_dirs:
+            existed = (await client.get_file_attr(session, d)) is not None
+            if await _ensure_restore_parent(client, session, d, args, created):
+                if not existed:
+                    stats["dirs_created"] += 1
+            else:
+                stats["failed"] += 1
+                _mv_record_error(stats, d, "could not recreate directory")
+                log_stderr("WARN" if args.continue_on_error else "ERROR",
+                           f"Failed to recreate directory {d}")
+
+        restore_progress = None
+        if args.progress and targets:
+            total_bytes = sum(int(sz or 0) for _, (is_sl, sz) in targets if not is_sl)
+            restore_progress = CopyProgress(len(targets), total_bytes, label="RESTORE")
+
+        async def _run(path, is_symlink, size, idx):
+            async with sem:
+                parent = _mv_parent_of(path)
+                if not await _ensure_restore_parent(client, session, parent, args, created):
+                    return path, ("failed", f"could not recreate parent {parent}"), False
+                p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path),
+                     "target": path, "src_size": size}
+                if is_symlink:
+                    return path, await _copy_one_symlink(client, session, p, args), False
+                if now_snap is not None and not is_symlink:
+                    status, msg = await _delta_restore_file(
+                        client, session, path, snap_id, now_snap, progress=restore_progress)
+                    if status != "recreate":
+                        return path, (status, msg), True
+                    # File no longer exists live -> nothing to diff; whole-file restore.
+                return path, await _copy_one_file(
+                    client, session, p, args, idx, progress=restore_progress), False
+
+        tasks = [asyncio.create_task(_run(path, sl, sz, i))
+                 for i, (path, (sl, sz)) in enumerate(targets)]
+        for fut in asyncio.as_completed(tasks):
+            path, (status, msg), was_delta = await fut
+            if restore_progress is not None:
+                restore_progress.file_done()
+            if status == "copied":
+                stats["restored"] += 1
+                if was_delta:
+                    stats["delta_patched"] += 1
+                if args.verbose:
+                    log_stderr("RESTORED", f"{path}" + (f" ({msg})" if msg else ""),
+                               newline_before=args.progress)
+            elif status == "skipped_exists":
+                stats["skipped_exists"] += 1
+                log_stderr("SKIP", f"{path} exists live (use --clobber or --rename-on-conflict)",
+                           newline_before=args.progress)
+            else:
+                stats["failed"] += 1
+                _mv_record_error(stats, path, msg or "restore failed")
+                log_stderr("WARN" if args.continue_on_error else "ERROR",
+                           f"Failed to restore {path}: {msg}", newline_before=args.progress)
+        if restore_progress is not None:
+            restore_progress.finish()
+    finally:
+        if now_snap is not None:
+            ok, derr = await client.delete_snapshot(session, now_snap)
+            if not ok:
+                log_stderr("WARN", f"Could not delete temporary snapshot {now_snap}: {derr} "
+                                   "(remove it manually with: qq snapshot_delete --id "
+                                   f"{now_snap})")
+    return stats
+
+
+def _revert_under_any(path, dirs):
+    """True if `path` lies under any directory in `dirs` (trailing slashes ignored).
+    Used to collapse subtree create/delete to their topmost root, since the tree
+    diff reports a created/deleted directory but not its descendants."""
+    base = path.rstrip("/")
+    return any(base != d.rstrip("/") and base.startswith(d.rstrip("/") + "/") for d in dirs)
+
+
+async def _delete_live_tree(client, session, dir_path, stats):
+    """Recursively delete a live directory and everything under it (revert of a
+    CREATEd directory). Enumerates the whole subtree, deletes files/symlinks first,
+    then directories deepest-first so each is empty when removed. Returns
+    (deleted_object_count, ok)."""
+    files, subdirs, stack = [], [], [dir_path]
+    while stack:
+        d = stack.pop()
+        for child in await client.enumerate_directory(session, d):
+            cpath = child.get("path", "").rstrip("/")
+            if not cpath:
+                continue
+            if child.get("type") == _FS_TYPE_DIR:
+                subdirs.append(cpath)
+                stack.append(cpath)
+            else:
+                files.append(cpath)
+    ok = True
+    deleted = 0
+    for f in files:
+        good, err = await client.delete_entry(session, f)
+        if good:
+            deleted += 1
+        else:
+            ok = False
+            _mv_record_error(stats, f, f"delete failed: {err}")
+    # directories deepest-first (root deleted last)
+    for d in sorted(subdirs + [dir_path], key=lambda x: (-x.count("/"), -len(x))):
+        good, err = await client.delete_entry(session, d)
+        if good:
+            deleted += 1
+        else:
+            ok = False
+            _mv_record_error(stats, d, f"rmdir failed: {err}")
+    return deleted, ok
+
+
+async def _revert_recreate_file(client, session, path, is_symlink, size, args, created, stats):
+    """Recreate a single deleted file/symlink at its original path from the snapshot."""
+    parent = _mv_parent_of(path)
+    if not await _ensure_restore_parent(client, session, parent, args, created):
+        stats["failed"] += 1
+        _mv_record_error(stats, path, f"could not recreate parent {parent}")
+        return
+    p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path),
+         "target": path, "src_size": size}
+    if is_symlink:
+        status, msg = await _copy_one_symlink(client, session, p, args)
+    else:
+        status, msg = await _copy_one_file(client, session, p, args, 0)
+    if status in ("copied", "renamed"):
+        stats["recreated_files"] += 1
+    else:
+        stats["failed"] += 1
+        _mv_record_error(stats, path, msg or "recreate failed")
+
+
+async def _revert_recreate_standalone_file(client, session, path, snap_id, args, created, stats):
+    """Recreate a deleted file whose containing directory still exists (the tree
+    diff lists it directly). Reads its snapshot attrs to handle symlinks."""
+    a = await client.get_file_attr(session, path, snapshot_id=snap_id)
+    if a is None:
+        stats["failed"] += 1
+        _mv_record_error(stats, path, "not present in snapshot")
+        return
+    await _revert_recreate_file(
+        client, session, path, a.get("type") == _FS_TYPE_SYMLINK, a.get("size"),
+        args, created, stats)
+
+
+async def _revert_recreate_dir_subtree(client, session, dir_path, snap_id, args, created, stats):
+    """Recreate a deleted directory and ALL its snapshot contents. The tree diff
+    reports only the directory node, so the subtree is walked in the snapshot and
+    every descendant directory and file is recreated."""
+    sub_files, sub_dirs = await _collect_snapshot_subtree(client, session, dir_path, snap_id)
+    for d in sorted([dir_path] + sub_dirs, key=lambda x: (x.count("/"), x)):
         if await _ensure_restore_parent(client, session, d, args, created):
-            if not existed:
-                stats["dirs_created"] += 1
+            stats["recreated_dirs"] += 1
         else:
             stats["failed"] += 1
             _mv_record_error(stats, d, "could not recreate directory")
-            log_stderr("WARN" if args.continue_on_error else "ERROR",
-                       f"Failed to recreate directory {d}")
+    for fpath, is_sl, sz in sub_files:
+        await _revert_recreate_file(client, session, fpath, is_sl, sz, args, created, stats)
 
-    restore_progress = None
-    if args.progress and targets:
-        total_bytes = sum(int(sz or 0) for _, (is_sl, sz) in targets if not is_sl)
-        restore_progress = CopyProgress(len(targets), total_bytes, label="RESTORE")
 
-    async def _run(path, is_symlink, size, idx):
-        async with sem:
-            parent = _mv_parent_of(path)
-            if not await _ensure_restore_parent(client, session, parent, args, created):
-                return path, ("failed", f"could not recreate parent {parent}")
-            p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path),
-                 "target": path, "src_size": size}
-            if is_symlink:
-                return path, await _copy_one_symlink(client, session, p, args)
-            return path, await _copy_one_file(client, session, p, args, idx, progress=restore_progress)
+async def _revert_restore_modified(client, session, path, snap_id, now_snap, args, stats):
+    """Restore a modified file to its snapshot version: delta-patch (--delta) or
+    whole-file overwrite."""
+    if args.delta:
+        status, msg = await _delta_restore_file(client, session, path, snap_id, now_snap)
+        if status == "recreate":
+            # The file disappeared between the diff and now; recreate it whole-file.
+            await _revert_recreate_standalone_file(client, session, path, snap_id, args, set(), stats)
+            return
+    else:
+        parent = _mv_parent_of(path)
+        p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path),
+             "target": path, "src_size": None}
+        status, msg = await _copy_one_file(client, session, p, args, 0)
+    if status in ("copied", "renamed"):
+        stats["patched"] += 1
+    else:
+        stats["failed"] += 1
+        _mv_record_error(stats, path, msg or "restore failed")
 
-    tasks = [asyncio.create_task(_run(path, sl, sz, i))
-             for i, (path, (sl, sz)) in enumerate(targets)]
-    for fut in asyncio.as_completed(tasks):
-        path, (status, msg) = await fut
-        if restore_progress is not None:
-            restore_progress.file_done()
-        if status == "copied":
-            stats["restored"] += 1
-            if args.verbose:
-                log_stderr("RESTORED", f"{path}" + (f" ({msg})" if msg else ""),
-                           newline_before=args.progress)
-        elif status == "skipped_exists":
-            stats["skipped_exists"] += 1
-            log_stderr("SKIP", f"{path} exists live (use --clobber or --rename-on-conflict)",
-                       newline_before=args.progress)
-        else:
-            stats["failed"] += 1
-            _mv_record_error(stats, path, msg or "restore failed")
-            log_stderr("WARN" if args.continue_on_error else "ERROR",
-                       f"Failed to restore {path}: {msg}", newline_before=args.progress)
-    if restore_progress is not None:
-        restore_progress.finish()
+
+async def revert_to_snapshot(client, session, args) -> dict:
+    """Revert the directory at --path to its EXACT state in --snapshot.
+
+    Uses the snapshot tree diff (changes-since, against a temporary snapshot of the
+    live tree) to find only what changed under --path, then applies the inverse of
+    each change: recreate files/dirs deleted since (repopulating deleted directories
+    from the snapshot subtree), restore modified files (delta-patched with --delta,
+    else whole-file), and DELETE files/dirs created since. The result is byte-
+    identical to the snapshot. Destructive (it deletes data added after the snapshot):
+    requires --yes, and --dry-run previews the plan including the deletions.
+
+    This is a whole-directory operation; content filters (--name/--type/--owner) do
+    not apply. Discovery is proportional to the number of changes, not the tree size.
+    """
+    stats = {"diff_changes": 0, "recreated_files": 0, "recreated_dirs": 0, "patched": 0,
+             "deleted_files": 0, "deleted_dirs": 0, "failed": 0, "errors": []}
+    snap_id = args.snapshot
+    snap = await client.get_snapshot(session, snap_id)
+    if snap is None:
+        log_stderr("ERROR", f"Snapshot {snap_id} not found")
+        sys.exit(1)
+    path = (args.path or "").rstrip("/") or "/"
+    snap_src = await client.resolve_id_to_path(session, snap.get("source_file_id"))
+    if snap_src is not None and not _path_within(path, snap_src):
+        log_stderr("ERROR", f"Snapshot {snap_id} (source {snap_src}) does not cover {path}")
+        sys.exit(1)
+
+    snap_attr = await client.get_file_attr(session, path, snapshot_id=snap_id)
+    if snap_attr is None:
+        log_stderr("ERROR", f"{path} did not exist in snapshot {snap_id}; nothing to revert to")
+        sys.exit(1)
+    if snap_attr.get("type") != _FS_TYPE_DIR:
+        log_stderr("ERROR", f"--revert operates on a directory; {path} is a file in snapshot "
+                            f"{snap_id} (use --restore-in-place --snapshot {snap_id} --path {path})")
+        sys.exit(1)
+
+    now_snap, derr = await client.create_snapshot(
+        session, snap.get("source_file_id"), name=f"grumpwalk-revert-{snap_id}")
+    if now_snap is None:
+        log_stderr("ERROR", f"Could not create temporary snapshot for revert ({derr}); "
+                            "--revert needs the snapshot-write privilege")
+        sys.exit(1)
+
+    try:
+        log_stderr("INFO", f"Diffing {path} against snapshot {snap_id}...")
+        entries, err = await client.get_tree_diff(session, now_snap, snap_id)
+        if err:
+            log_stderr("WARN", f"Tree diff may be incomplete: {err}")
+        base = path.rstrip("/") + "/"
+        changes = [e for e in entries
+                   if e["path"].startswith(base) or e["path"].rstrip("/") == path]
+        stats["diff_changes"] = len(changes)
+
+        deleted = [e["path"] for e in changes if e["op"] == "DELETE"]
+        modified = [e["path"] for e in changes if e["op"] == "MODIFY"]
+        created = [e["path"] for e in changes if e["op"] == "CREATE"]
+        deleted_dirs = [p for p in deleted if p.endswith("/")]
+        deleted_files = [p for p in deleted if not p.endswith("/")]
+        created_dirs = [p for p in created if p.endswith("/")]
+        created_files = [p for p in created if not p.endswith("/")]
+        modified_files = [p for p in modified if not p.endswith("/")]
+
+        del_dir_roots = sorted([d for d in deleted_dirs if not _revert_under_any(d, deleted_dirs)],
+                               key=lambda x: x.count("/"))
+        cre_dir_roots = [d for d in created_dirs if not _revert_under_any(d, created_dirs)]
+        standalone_del_files = [p for p in deleted_files if not _revert_under_any(p, deleted_dirs)]
+        standalone_cre_files = [p for p in created_files if not _revert_under_any(p, created_dirs)]
+
+        if not changes:
+            log_stderr("INFO", f"No differences between {path} and snapshot {snap_id}; "
+                               "nothing to revert.")
+            return stats
+
+        log_stderr("INFO", f"Revert plan for {path} -> snapshot {snap_id}:")
+        log_stderr("INFO", f"  recreate: {len(del_dir_roots)} deleted dir subtree(s), "
+                           f"{len(standalone_del_files)} deleted file(s)")
+        log_stderr("INFO", f"  restore : {len(modified_files)} modified file(s)"
+                           + (" (delta)" if args.delta else " (whole-file)"))
+        log_stderr("INFO", f"  DELETE  : {len(standalone_cre_files)} created file(s), "
+                           f"{len(cre_dir_roots)} created dir subtree(s) "
+                           "(data added since the snapshot)")
+
+        if args.dry_run:
+            for d in del_dir_roots:
+                log_stderr("DRY RUN", f"recreate dir subtree {d} (from snapshot {snap_id})")
+            for f in standalone_del_files:
+                log_stderr("DRY RUN", f"recreate file {f}")
+            for f in modified_files:
+                log_stderr("DRY RUN", f"{'delta-restore' if args.delta else 'restore'} {f}")
+            for f in standalone_cre_files:
+                log_stderr("DRY RUN", f"DELETE created file {f}")
+            for d in cre_dir_roots:
+                log_stderr("DRY RUN", f"DELETE created dir subtree {d}")
+            return stats
+
+        if not args.yes:
+            if not sys.stdin.isatty():
+                log_stderr("ERROR", "Refusing to revert without confirmation in non-interactive "
+                                    "mode; pass --yes")
+                sys.exit(1)
+            print(f"\nAbout to revert {path} to snapshot {snap_id}.", file=sys.stderr)
+            print(f"  This will DELETE {len(standalone_cre_files)} file(s) and "
+                  f"{len(cre_dir_roots)} director(ies) created since the snapshot,", file=sys.stderr)
+            print(f"  restore {len(modified_files)} modified file(s), and recreate "
+                  f"{len(standalone_del_files) + len(del_dir_roots)} deleted item(s).", file=sys.stderr)
+            if input("Proceed? [y]es / [N]o: ").strip().lower() not in ("y", "yes"):
+                log_stderr("INFO", "Aborted by user.")
+                return stats
+
+        # Revert overwrites modified files and never renames; force those semantics.
+        args.clobber = True
+        args.rename_on_conflict = False
+        created_set = set()
+
+        for root in del_dir_roots:
+            await _revert_recreate_dir_subtree(client, session, root.rstrip("/"),
+                                               snap_id, args, created_set, stats)
+        for f in standalone_del_files:
+            await _revert_recreate_standalone_file(client, session, f, snap_id, args,
+                                                   created_set, stats)
+        for f in modified_files:
+            await _revert_restore_modified(client, session, f, snap_id, now_snap, args, stats)
+        for f in standalone_cre_files:
+            ok, err2 = await client.delete_entry(session, f.rstrip("/"))
+            if ok:
+                stats["deleted_files"] += 1
+            else:
+                stats["failed"] += 1
+                _mv_record_error(stats, f, f"delete failed: {err2}")
+        for root in cre_dir_roots:
+            _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
+            if ok:
+                stats["deleted_dirs"] += 1
+            else:
+                stats["failed"] += 1
+    finally:
+        ok, derr = await client.delete_snapshot(session, now_snap)
+        if not ok:
+            log_stderr("WARN", f"Could not delete temporary snapshot {now_snap}: {derr} "
+                               f"(remove it manually with: qq snapshot_delete --id {now_snap})")
     return stats
 
 
@@ -6353,7 +6822,8 @@ async def main_async(args):
 
     # SNAPSHOT SEARCH: --snapshot ID (alone) or --all-snapshots, search-only
     if args.all_snapshots or args.in_the_last_snapshots or \
-            (args.snapshot is not None and not (args.copy_to or args.restore_in_place)):
+            (args.snapshot is not None and
+             not (args.copy_to or args.restore_in_place or args.revert)):
         async with client.create_session() as session:
             owner_auth_ids = None
             if args.owners:
@@ -6362,6 +6832,32 @@ async def main_async(args):
             file_filter = create_file_filter(args, owner_auth_ids)
             count = await search_snapshots(client, session, args, file_filter)
             log_stderr("INFO", f"{count:,} match(es) found")
+        return
+
+    # SNAPSHOT REVERT: revert a directory to its exact state in a snapshot
+    if args.revert:
+        async with client.create_session() as session:
+            stats = await revert_to_snapshot(client, session, args)
+            dry = " (DRY RUN)" if args.dry_run else ""
+            print(f"\nSNAPSHOT REVERT SUMMARY{dry}", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print(f"Snapshot:              {args.snapshot}", file=sys.stderr)
+            print(f"Path:                  {args.path}", file=sys.stderr)
+            print(f"Changes in diff:       {stats['diff_changes']:,}", file=sys.stderr)
+            if not args.dry_run:
+                print(f"Files recreated:       {stats['recreated_files']:,}", file=sys.stderr)
+                print(f"Directories recreated: {stats['recreated_dirs']:,}", file=sys.stderr)
+                print(f"Files restored:        {stats['patched']:,}", file=sys.stderr)
+                print(f"Files deleted:         {stats['deleted_files']:,}", file=sys.stderr)
+                print(f"Dir subtrees deleted:  {stats['deleted_dirs']:,}", file=sys.stderr)
+                print(f"Failed:                {stats['failed']:,}", file=sys.stderr)
+            if stats["errors"]:
+                print("\nErrors encountered:", file=sys.stderr)
+                for error in stats["errors"][:10]:
+                    print(f"  {error['path']}: {error['message']}", file=sys.stderr)
+            save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+            if stats["failed"] > 0:
+                sys.exit(1)
         return
 
     # SNAPSHOT RESTORE IN PLACE: restore matched snapshot files to original paths
@@ -6381,6 +6877,9 @@ async def main_async(args):
             print(f"Matched:           {stats['total_matched']:,}", file=sys.stderr)
             label = "Would restore:" if args.dry_run else "Restored:"
             print(f"{label:<19}{(stats['planned'] if args.dry_run else stats['restored']):,}", file=sys.stderr)
+            if not args.dry_run and stats.get("delta_patched"):
+                print(f"  Delta-patched in place: {stats['delta_patched']:,} "
+                      "(only changed byte ranges copied)", file=sys.stderr)
             if stats["planned_dirs"]:
                 dlabel = "  Directories (would recreate):" if args.dry_run else "  Directories recreated:"
                 dcount = stats["planned_dirs"] if args.dry_run else stats["dirs_created"]
@@ -10287,11 +10786,46 @@ Examples:
              "Composes with the filters and snapshot-age limits. Search-only.",
     )
     snapshots.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Speed up a multi-snapshot search (--all-snapshots / --snapshots-newer-than / "
+             "--in-the-last-snapshots) by crawling only the OLDEST covered snapshot in full, "
+             "then using the snapshot tree diff (changes-since) between consecutive snapshots "
+             "to update the match set for each later one - re-checking only the files that "
+             "changed instead of re-crawling every snapshot. Identical results to a full "
+             "crawl of each snapshot, far fewer API calls when snapshots are mostly alike. "
+             "Requires --path; not supported with --max-depth or access-time filters (the "
+             "snapshot diff does not report atime-only changes, so a reported access_time "
+             "may be from an earlier snapshot for otherwise-unchanged entries).",
+    )
+    snapshots.add_argument(
         "--restore-in-place",
         action="store_true",
         help="With --snapshot, restore each matched file to its ORIGINAL live path "
              "(undelete/roll back): recreate files/dirs deleted since the snapshot, and "
              "(with --clobber) overwrite live versions. Destructive: needs --yes / confirmation.",
+    )
+    snapshots.add_argument(
+        "--delta",
+        action="store_true",
+        help="With --restore-in-place, patch modified files in place by copying ONLY "
+             "the byte ranges that differ from the snapshot, instead of rewriting the "
+             "whole file. Much faster for large files with localized changes (e.g. a "
+             "database or VM image). Creates a temporary snapshot of the live tree to "
+             "compute the diff and deletes it when done (needs snapshot-write privilege); "
+             "files deleted since the snapshot still restore whole-file. Patches existing "
+             "files in place (no temp-file + rename), so it overwrites live data: needs --yes.",
+    )
+    snapshots.add_argument(
+        "--revert",
+        action="store_true",
+        help="With --snapshot, revert the directory at --path to its EXACT state in "
+             "that snapshot. Uses the snapshot tree diff (changes-since) to find only "
+             "what changed, then recreates files/dirs deleted since, restores modified "
+             "files (add --delta to patch them by byte range), and DELETES files/dirs "
+             "created since. Whole-directory operation (ignores name/type/owner filters). "
+             "Destructive - deletes data added after the snapshot: needs --yes; use "
+             "--dry-run to preview, which lists the deletions.",
     )
     snapshots.add_argument(
         "--rename-on-conflict",
@@ -10656,6 +11190,35 @@ Examples:
         args.all_snapshots = True
         log_stderr("INFO", "Searching across snapshots in the given age window (--all-snapshots implied)")
 
+    if args.incremental:
+        if not (args.all_snapshots or args.in_the_last_snapshots):
+            print("Error: --incremental speeds up a multi-snapshot search; use it with "
+                  "--all-snapshots, --snapshots-newer-than/--snapshots-older-than, or "
+                  "--in-the-last-snapshots", file=sys.stderr)
+            sys.exit(1)
+        if not args.path:
+            print("Error: --incremental requires --path (the directory to search across "
+                  "snapshots)", file=sys.stderr)
+            sys.exit(1)
+        if args.max_depth is not None:
+            print("Error: --incremental is not supported with --max-depth", file=sys.stderr)
+            sys.exit(1)
+        # changes-since does not report an entry whose only change is its access time,
+        # so the incremental match set can carry a stale atime. Reject atime-based
+        # filters (which would otherwise silently diverge from a full crawl); a stale
+        # atime in OUTPUT is documented but harmless to non-atime filtering.
+        atime_filter = ((args.time_field == "access_time" and (args.older_than or args.newer_than))
+                        or args.accessed_older_than is not None
+                        or args.accessed_newer_than is not None)
+        if atime_filter:
+            print("Error: --incremental cannot be used with access-time filters "
+                  "(--accessed/--time-field access_time with --older-than/--newer-than, or "
+                  "--accessed-older-than/--accessed-newer-than): the snapshot diff does not "
+                  "report access-time-only changes, so atime is not reliable incrementally. "
+                  "Run the search without --incremental for access-time filtering.",
+                  file=sys.stderr)
+            sys.exit(1)
+
     snapshot_root_mode = (args.list_snapshots or args.all_snapshots or args.in_the_last_snapshots
                           or args.snapshot is not None)
     if not args.path and not acl_cloning_mode and not snapshot_root_mode:
@@ -10702,6 +11265,28 @@ Examples:
     if args.restore_in_place and args.snapshot is None:
         print("Error: --restore-in-place requires --snapshot", file=sys.stderr)
         sys.exit(1)
+    if args.revert:
+        if args.snapshot is None:
+            print("Error: --revert requires --snapshot", file=sys.stderr)
+            sys.exit(1)
+        if not args.path:
+            print("Error: --revert requires --path (the directory to revert)", file=sys.stderr)
+            sys.exit(1)
+        if args.restore_in_place or args.copy_to or args.move_to:
+            print("Error: --revert cannot be combined with --restore-in-place / --copy-to / "
+                  "--move-to (it is its own operation)", file=sys.stderr)
+            sys.exit(1)
+        if args.all_snapshots:
+            print("Error: --revert needs a specific --snapshot, not --all-snapshots", file=sys.stderr)
+            sys.exit(1)
+    if args.delta:
+        if not (args.restore_in_place or args.revert):
+            print("Error: --delta requires --restore-in-place or --revert", file=sys.stderr)
+            sys.exit(1)
+        if args.rename_on_conflict:
+            print("Error: --delta patches files in place and cannot be combined with "
+                  "--rename-on-conflict", file=sys.stderr)
+            sys.exit(1)
     if args.clobber and args.rename_on_conflict:
         print("Error: --clobber and --rename-on-conflict cannot be combined", file=sys.stderr)
         sys.exit(1)
@@ -10932,6 +11517,7 @@ Examples:
             name for flag, name in (
                 (args.copy_to, "--copy-to"), (args.move_to, "--move-to"),
                 (args.rename_to, "--rename-to"), (args.restore_in_place, "--restore-in-place"),
+                (args.revert, "--revert"),
                 (args.owner_report, "--owner-report"), (args.acl_report, "--acl-report"),
                 (args.find_similar, "--find-similar"), (args.list_snapshots, "--list-snapshots"),
                 (args.show_dir_stats, "--show-dir-stats"),

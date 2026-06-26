@@ -933,6 +933,42 @@ only the **newest** result for each path:
 ```
 It composes with the snapshot-age limits, e.g. `--in-the-last-snapshots 10 --snapshots-newer-than 12h`.
 
+### Searching across many snapshots is slow - can I speed it up?
+
+Yes - add `--incremental`. A normal multi-snapshot search crawls every snapshot's
+tree from scratch, even though consecutive snapshots are usually nearly identical.
+`--incremental` instead crawls only the **oldest** snapshot in full, then uses the
+snapshot diff between each consecutive pair to update the results - re-checking only
+the files that actually **changed** between snapshots, and reusing everything else:
+```bash
+# Find large files across the last week of snapshots, the fast way
+./grumpwalk.py --host cluster --path /home/data --larger-than 1GB \
+  --snapshots-newer-than 7d --incremental
+```
+You get the **exact same results** as a full search - it's a pure optimization. On a
+big tree with dense periodic snapshots (e.g. daily snapshots of a million-file
+directory) it turns N full crawls into one crawl plus N-1 small diffs, which is
+typically several times faster and climbs toward Nx as the tree grows. It's also
+complete: because it diffs *consecutive* snapshots, nothing that briefly appeared and
+vanished between them is missed (no sampling).
+
+Requirements and limits:
+- Needs `--path` (the directory to search across snapshots - it's the shared root for
+  the diffs).
+- Works with `--all-snapshots`, `--snapshots-newer-than`/`--snapshots-older-than`, and
+  `--in-the-last-snapshots`.
+- Not supported with `--max-depth`.
+- Most filters apply (`--name`, `--larger-than`, `--older-than`, `--owner`, `--type`,
+  ...) - changed files are re-checked with the very same filter, so results match a
+  full crawl exactly. The one exception is **access-time** filtering: the snapshot diff
+  doesn't report a file whose only change was its access time, so `--accessed` /
+  `--time-field access_time` (with `--older-than`/`--newer-than`) and
+  `--accessed-older-than`/`--accessed-newer-than` are rejected with `--incremental`.
+  For the same reason, a displayed `access_time` may come from an earlier snapshot for
+  a file that was otherwise unchanged; every other attribute is exact. (Tested at scale:
+  a 5-snapshot search of a 1.1-million-file directory matched a full crawl on every
+  attribute but that one, in about a third of the time.)
+
 ### How do I see the size, age, and other attributes of matches (not just paths)?
 
 By default a search prints one path per line. Add `--show-details` to get an
@@ -1060,6 +1096,78 @@ directory as it was - including non-matching files and empty subdirectories - ad
 If the directory still exists live, the restore **merges** into it: existing files
 follow the conflict strategy (skip / `--clobber` / `--rename-on-conflict`), missing
 files and subdirectories are recreated, and the live directory is left in place.
+
+### A huge file was changed in one spot - can I roll it back without recopying the whole thing?
+
+Yes - add `--delta` to `--restore-in-place`. Instead of rewriting the whole file,
+grumpwalk copies back **only the byte ranges that differ** from the snapshot. For a
+multi-gigabyte file with a localized change (a database, a VM image, a log that was
+truncated) this restores in a fraction of the time and moves far less data - in
+testing a 1 GB file with an 8 MB edit restored about 5x faster than a full-file
+restore, and the advantage grows with file size.
+```bash
+# Roll one large file back to snapshot 5, patching only what changed
+./grumpwalk.py --host cluster --snapshot 5 \
+  --path /Shared/db/main.tablespace --restore-in-place --delta --yes
+
+# Works across a match set too - patch every modified .vmdk, recreate any deleted ones
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/vms \
+  --name '*.vmdk' --restore-in-place --delta --yes
+```
+How it works: grumpwalk takes a **temporary snapshot** of the live tree, diffs it
+against the snapshot you chose (per file), copies just the changed regions back over
+the live file (server-side, on the cluster), and deletes the temporary snapshot when
+it finishes. Size changes are handled - if the file grew, the extra tail is dropped;
+if it shrank, the missing tail is copied back. Files that were **deleted** since the
+snapshot have no live version to diff, so they are restored whole-file as usual.
+
+Notes:
+- `--delta` patches files **in place** (no temp-file-and-rename), so it overwrites
+  live data and requires `--yes` (or an interactive confirmation), just like any
+  restore. Use `--dry-run` first to see the plan.
+- It needs the **snapshot-write** privilege (to create the temporary snapshot). If
+  that snapshot can't be created, grumpwalk warns and falls back to whole-file
+  restore for that run.
+- It can't be combined with `--rename-on-conflict` (there's nothing to rename when
+  you're patching the original in place). The restore summary reports how many files
+  were delta-patched.
+- An interrupted `--delta` restore is safe to re-run: the next run diffs against a
+  fresh temporary snapshot and patches whatever is still out of date.
+
+### How do I revert a whole directory to how it was at a snapshot ("undo all changes")?
+
+Use `--revert`. Point it at a directory and a snapshot, and grumpwalk makes that
+directory **exactly** match the snapshot - undoing every change since:
+```bash
+# Preview first - lists everything that will be recreated, restored, and DELETED
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project --revert --delta --dry-run
+
+# Do it
+./grumpwalk.py --host cluster --snapshot 5 --path /Shared/project --revert --delta --yes
+```
+Unlike `--restore-in-place` (which puts back files you select), `--revert` is a
+whole-directory "roll back in time": it recreates files and folders **deleted** since
+the snapshot, restores **modified** files, and **deletes** files and folders **created**
+since the snapshot. When it finishes, the directory is byte-identical to the snapshot.
+
+What makes it fast: grumpwalk doesn't crawl the whole directory. It takes a temporary
+snapshot of the live tree and asks the cluster for the **diff** between it and your
+snapshot - so the work is proportional to how much changed, not how big the directory
+is. Reverting a directory with millions of files where only a few hundred changed
+touches only those few hundred. Add `--delta` and the modified files are patched by
+byte range too (see the previous question).
+
+Important notes:
+- `--revert` **deletes data created since the snapshot** - that's what "revert" means.
+  It's destructive, so it requires `--yes` (or an interactive confirmation), and the
+  confirmation/`--dry-run` output spells out exactly what will be deleted. Always
+  `--dry-run` first if you're unsure.
+- It's a **whole-directory** operation - `--name`, `--type`, `--owner` and the other
+  match filters do not apply (use `--restore-in-place` with filters to revert a
+  selected subset of files without removing anything).
+- It needs the **snapshot-write** privilege (to take the temporary snapshot, which is
+  deleted automatically when the run finishes).
+- Re-running it is safe and idempotent: a second run finds nothing left to change.
 
 ### What if a name already exists at the destination?
 
