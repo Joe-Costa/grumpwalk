@@ -26,15 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--skip-unchanged`** - Incremental copy. With `--copy-to`, skip files already present at the destination with the same size and modification time, and copy only new or changed files. Re-run it on a schedule to keep a destination in sync with a changing source. Implies `--preserve-all`.
 - **Live progress for copy and restore** - `--progress` now shows a status line during `--copy-to` and snapshot restores: files done, data copied, transfer rate, and ETA - including progress through a single large file.
 
-### Changed
-
-- **Faster re-runs and resumes** - Re-running a `--copy-to` (or a snapshot `--restore-in-place`) now skips files already at the destination immediately instead of re-copying them. Resuming an interrupted transfer copies only what is missing - what took minutes now takes seconds.
-- **Snapshot-age filters imply a search** - `--snapshots-newer-than` / `--snapshots-older-than` used on their own now search across the snapshots in that window (implying `--all-snapshots`) instead of erroring. So `--path /Shared --name pig --snapshots-newer-than 1h` searches the last hour's snapshots directly. (Combining an age filter with a single `--snapshot ID`, or with `--copy-to`/`--restore-in-place`, gives a clear error - those need one specific snapshot.)
-- **Replication and being-deleted snapshots hidden** - `--list-snapshots` and snapshot searches (`--all-snapshots` / `--in-the-last-snapshots`) now exclude Qumulo replication-system snapshots (`replication_from_*` / `replication_to_*`) and snapshots in the process of being deleted, since neither is useful for restoring data. Use `--include-replication-snapshots` to show the replication ones (deleting snapshots are always hidden). An explicit `--snapshot ID` is never filtered.
-
-### Fixed
-
-- **Accurate copy/restore counts under heavy load** - A copy or restore that hit a transient network timeout could report a file as failed even though it had actually completed. grumpwalk now verifies and retries, so the "copied" and "failed" totals stay correct.
 
 ## [3.2.0] - 2026-06-24
 
