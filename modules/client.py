@@ -395,8 +395,9 @@ class AsyncQumuloClient:
         """
         Get directory aggregate statistics.
 
-        Returns statistics for immediate children only (non-recursive).
-        All count fields are returned as strings - use int() to convert.
+        Returns RECURSIVE totals for the entire subtree under path (e.g.
+        total_capacity, total_files, total_directories). All count/byte fields
+        are returned as strings - use int() to convert.
 
         Args:
             session: aiohttp ClientSession

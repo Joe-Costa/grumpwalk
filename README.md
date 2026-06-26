@@ -664,7 +664,7 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--json-out FILE` - JSON output to file
 - `--csv-out FILE` - CSV output to file
 - `--all-attributes` - Include all file attributes in output
-- `--show-details` - Show attributes of matched results instead of just paths (snapshot search and the live walk). Defaults to `path`, human-readable `size`, and `change_time` (ctime); renders an aligned table, or honors `--csv-out`/`--json-out`/`--json` (size stays raw bytes there). Multi-snapshot search adds a `SNAPSHOT` column. `--limit` caps the rows shown
+- `--show-details` - Show attributes of matched results instead of just paths (snapshot search and the live walk). Defaults to `path`, human-readable `size`, and `change_time` (ctime); renders an aligned table, or honors `--csv-out`/`--json-out`/`--json` (size stays raw bytes there). Multi-snapshot search adds a `SNAPSHOT` column. With `--type directory` the size column becomes the recursive aggregate `capacity` (whole-subtree, from directory aggregates). `--limit` caps the rows shown
 - `--fields FIELD[,FIELD,...]` - Select specific output fields (aliases: `owner_id`, `group_id`, `attr.*`; dot notation supported). `--fields all` selects every attribute (implies `--show-details`). Use `--fields-list` to see all available fields
 - `--fields-list` - List all available field names and exit
 - `--unix-time` - Output timestamps as unix epoch seconds instead of ISO 8601

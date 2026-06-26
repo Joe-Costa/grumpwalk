@@ -866,6 +866,20 @@ It also writes to files - `--csv-out FILE` or `--json-out FILE` (and `--json` to
 stdout); in those machine formats `size` stays raw bytes rather than human-readable.
 Note: `--all-attributes` does nothing for snapshot search - use `--fields all`.
 
+When you search for **directories** (`--type directory --show-details`), the size
+column is replaced by the directory's recursive aggregate **`capacity`** - the
+total bytes (data + metadata) of everything in its subtree, not the near-empty
+inode size - so you can see how much each directory actually holds:
+```bash
+./grumpwalk.py --host cluster --path /Shared --max-depth 1 --type directory --show-details
+#   PATH         CAPACITY   CHANGE_TIME
+#   /Shared/6/   954.3 MiB  2026-06-25T16:41:31Z
+#   /Shared/nfs/ 136 KiB    2026-06-19T15:16:09Z
+```
+The value comes from one directory-aggregates call per matched directory; it is
+available as the `total_capacity` field (alias `capacity`) and is included by
+`--fields all` for directory searches.
+
 ### How do I copy files out of a snapshot?
 
 Combine `--snapshot` with `--copy-to`. It copies the snapshot version (including

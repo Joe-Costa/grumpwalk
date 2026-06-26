@@ -382,6 +382,7 @@ FIELD_ALIASES = {
     "owner_type": "owner_details.id_type",
     "group_id": "group_details.id_value",
     "group_type": "group_details.id_type",
+    "capacity": "total_capacity",
 }
 
 FIELD_DESCRIPTIONS = [
@@ -420,6 +421,8 @@ FIELD_DESCRIPTIONS = [
     ("num_links",         "Number of hard links"),
     # Extended info
     ("child_count",       "Number of children (directories only)"),
+    ("total_capacity",    "Directory recursive aggregate capacity in bytes, data+metadata "
+                          "(directories only; fetched on demand). Alias: capacity"),
     ("symlink_target_type", "Symlink target type"),
     ("major_minor_numbers", "Device major/minor numbers (dict)"),
     ("extended_attributes", "Full DOS extended attributes dict"),
@@ -532,13 +535,21 @@ def extract_fields(entry, field_specs):
 # ---------------------------------------------------------------------------
 
 DEFAULT_DETAIL_FIELDS = ["path", "size", "change_time"]
+# For --type directory the inode `size` is uninformative; show recursive capacity.
+DEFAULT_DIR_DETAIL_SPECS = [("path", "path"), ("capacity", "total_capacity"),
+                            ("change_time", "change_time")]
+
+# Display names whose values are byte counts and render human-readable in the table.
+HUMAN_SIZE_FIELDS = {"size", "capacity", "total_capacity"}
 
 # Concrete field set for "--fields all": every documented field read directly
 # from the entry. Excludes the *_id/_type aliases (which duplicate
 # owner_details/group_details), the resolved *_name fields (which need identity
-# resolution), and the attr.<name> placeholder.
+# resolution), total_capacity (directory-only, added on demand), and the
+# attr.<name> placeholder.
 _ALIAS_OR_RESOLVED_FIELDS = {
     "owner_id", "owner_type", "group_id", "group_type", "owner_name", "group_name",
+    "total_capacity",
 }
 ALL_DETAIL_FIELDS = [
     name for name, _ in FIELD_DESCRIPTIONS
@@ -567,22 +578,28 @@ def human_size(value):
     return f"{s} {units[i]}"
 
 
-def resolve_detail_field_specs(fields_arg):
+def resolve_detail_field_specs(fields_arg, dir_default=False):
     """Return (field_specs, is_all) for --show-details / --fields.
 
     fields_arg is the raw --fields string (or None). 'all' (case-insensitive)
-    selects every attribute; None falls back to the default detail set
-    (path, size, change_time).
+    selects every attribute; None falls back to the default detail set. When
+    dir_default is True (a --type directory search) the default columns show the
+    recursive `capacity` instead of the inode `size`, and 'all' also appends it.
     """
     if fields_arg and fields_arg.strip().lower() == "all":
-        return [(n, n) for n in ALL_DETAIL_FIELDS], True
+        specs = [(n, n) for n in ALL_DETAIL_FIELDS]
+        if dir_default:
+            specs.append(("capacity", "total_capacity"))
+        return specs, True
     if fields_arg:
         return parse_field_specs(fields_arg), False
+    if dir_default:
+        return list(DEFAULT_DIR_DETAIL_SPECS), False
     return [(n, n) for n in DEFAULT_DETAIL_FIELDS], False
 
 
 def _detail_columns(field_specs, is_all):
-    return [(n, n) for n in ALL_DETAIL_FIELDS] if is_all else field_specs
+    return field_specs
 
 
 def _detail_cell(value, human=False):
@@ -619,7 +636,7 @@ def _render_detail_table(fh, records, field_specs, is_all, snapshot_col, unix_ti
         if snapshot_col:
             cells.append(str((e.get("snapshot") or {}).get("id", "")))
         for dn, _ in cols:
-            cells.append(_detail_cell(proj.get(dn), human=(dn == "size")))
+            cells.append(_detail_cell(proj.get(dn), human=(dn in HUMAN_SIZE_FIELDS)))
         rows.append(cells)
     widths = [len(h) for h in headers]
     for r in rows:

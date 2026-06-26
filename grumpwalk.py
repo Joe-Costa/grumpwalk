@@ -3976,6 +3976,33 @@ async def _select_search_snapshots(client, session, args):
     return pairs
 
 
+async def _attach_dir_capacity(client, session, records, concurrency=50):
+    """Fetch each directory record's recursive aggregate capacity and store it on
+    the entry as 'total_capacity' (bytes, data + metadata). Files are left
+    untouched. Each record is read in its own snapshot context when present. Adds
+    one aggregates call per matched directory.
+    """
+    dirs = [e for e in records if e.get("type") == _FS_TYPE_DIR]
+    if not dirs:
+        return
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(e):
+        path = e.get("path", "").rstrip("/") or "/"
+        sid = (e.get("snapshot") or {}).get("id")
+        async with sem:
+            agg = await client.get_directory_aggregates(session, path, snapshot_id=sid)
+        if isinstance(agg, dict) and "error" not in agg:
+            e["total_capacity"] = agg.get("total_capacity")
+
+    await asyncio.gather(*[_one(e) for e in dirs])
+
+
+def _detail_needs_capacity(specs):
+    """True when the resolved detail columns include the directory capacity."""
+    return any(resolve_path == "total_capacity" for _, resolve_path in specs)
+
+
 async def search_snapshots(client, session, args, file_filter):
     """Search one or all snapshots. Streams path/JSON lines, or - when
     --show-details/--fields is set - collects matches and renders an aligned
@@ -4019,7 +4046,10 @@ async def search_snapshots(client, session, args, file_filter):
                 _emit_snapshot_match(e, snap, args, multi)
             total += 1
     if detail:
-        specs, is_all = resolve_detail_field_specs(args.fields)
+        specs, is_all = resolve_detail_field_specs(args.fields, dir_default=_type_is_directory(args))
+        if _detail_needs_capacity(specs):
+            await _attach_dir_capacity(client, session, records,
+                                       concurrency=max(1, args.max_concurrent))
         emit_detail_output(records, specs, is_all, snapshot_col=multi,
                            unix_time=args.unix_time, want_json=args.json,
                            json_out=args.json_out, csv_out=args.csv_out)
@@ -8396,7 +8426,11 @@ async def main_async(args):
     if args.show_details:
         if args.limit:
             matching_files = matching_files[:args.limit]
-        specs, is_all = resolve_detail_field_specs(args.fields)
+        specs, is_all = resolve_detail_field_specs(args.fields, dir_default=_type_is_directory(args))
+        if _detail_needs_capacity(specs):
+            async with client.create_session() as session:
+                await _attach_dir_capacity(client, session, matching_files,
+                                           concurrency=max(1, args.max_concurrent))
         wanted = {dn for dn, _ in specs}
         if (("owner_name" in wanted or "group_name" in wanted)
                 and matching_files and not args.dont_resolve_ids):
