@@ -1015,7 +1015,7 @@ class AsyncQumuloClient:
 
     async def copy_file_data(
         self, session: aiohttp.ClientSession, source_path: str, target_path: str,
-        source_snapshot: Optional[int] = None,
+        source_snapshot: Optional[int] = None, on_progress=None,
     ) -> Tuple[bool, Optional[str]]:
         """Server-side copy of a file's data into an existing target file.
 
@@ -1041,16 +1041,22 @@ class AsyncQumuloClient:
         if source_snapshot is not None:
             body["source_snapshot"] = int(source_snapshot)
         prev_offset = -1
+        reported = 0  # cumulative bytes already passed to on_progress
         # Generous runaway guard; each iteration must advance the source offset.
         for _ in range(1_000_000):
             status, resp, err = await self._copy_chunk(session, target_path, body)
             if status != 200:
                 return (False, err or f"copy-chunk HTTP {status}")
             if not isinstance(resp, dict) or int(resp.get("length") or 0) <= 0:
+                # Done. The terminal response carries no usable offset, so the final
+                # segment is reported by the caller (which knows the file size).
                 return (True, None)
             offset = int(resp.get("source_offset") or 0)
             if offset <= prev_offset:
                 return (False, "copy-chunk made no progress")
+            if on_progress is not None and offset > reported:
+                on_progress(offset - reported)
+                reported = offset
             prev_offset = offset
             body = resp
         return (False, "copy-chunk did not converge")

@@ -32,6 +32,7 @@ from .output import (
     convert_timestamps_to_epoch,
     resolve_detail_field_specs,
     emit_detail_output,
+    CopyProgress,
 )
 
 # Import credentials and cache handling
@@ -97,6 +98,7 @@ __all__ = [
     "convert_timestamps_to_epoch",
     "resolve_detail_field_specs",
     "emit_detail_output",
+    "CopyProgress",
     # Credentials
     "CREDENTIALS_FILENAME",
     "CREDENTIALS_VERSION",

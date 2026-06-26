@@ -703,6 +703,91 @@ def emit_detail_output(records, field_specs, is_all, snapshot_col=False,
     return len(records)
 
 
+def _fmt_duration(seconds):
+    """Compact duration: '45s', '7m54s', '1h02m'. '--' for unknown."""
+    if seconds is None or seconds != seconds or seconds < 0:  # None / NaN / negative
+        return "--"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+class CopyProgress:
+    """Live byte-level progress for copy / restore, driven by copy-chunk offsets.
+
+    Each copy-chunk response reports the running source offset, so progress can
+    advance *within* a single large file - not just as whole files complete.
+    Aggregate (not per-file) because copies run concurrently. Renders a throttled
+    one-line status to stderr; call finish() once at the end.
+
+    Counters are updated from the single asyncio thread (the copy coroutines call
+    advance_bytes/file_done synchronously between awaits), so no locking is needed.
+    """
+
+    def __init__(self, total_files, total_bytes, label="COPY", stream=None,
+                 interval=0.5):
+        self.total_files = max(0, int(total_files))
+        self.total_bytes = max(0, int(total_bytes))
+        self.files_done = 0
+        self.bytes_done = 0   # toward the bar/%: includes skipped files settling
+        self.moved_bytes = 0  # actual data transferred: drives the rate
+        self.label = label
+        self.stream = stream or sys.stderr
+        self._interval = interval
+        self._start = time.monotonic()
+        self._last_render = 0.0
+        self._last_len = 0
+
+    def advance_bytes(self, delta, moved=True):
+        """Account for `delta` bytes of progress. moved=True for real data transfer
+        (copy-chunk advances and the tail of a finished copy); moved=False when a
+        skipped file settles to its full size (counts toward the bar, not the rate)."""
+        if delta and delta > 0:
+            self.bytes_done += delta
+            if moved:
+                self.moved_bytes += delta
+        self._maybe_render()
+
+    def file_done(self):
+        """Mark one file/symlink processed (copied, skipped, or failed)."""
+        self.files_done += 1
+        self._maybe_render()
+
+    def _maybe_render(self, force=False):
+        now = time.monotonic()
+        if not force and (now - self._last_render) < self._interval:
+            return
+        self._last_render = now
+        elapsed = max(1e-6, now - self._start)
+        rate = self.moved_bytes / elapsed
+        parts = [f"[{self.label}] {self.files_done:,}/{self.total_files:,} files"]
+        if self.total_bytes > 0:
+            pct = min(100.0, 100.0 * self.bytes_done / self.total_bytes)
+            remaining = max(0, self.total_bytes - self.bytes_done)
+            eta = remaining / rate if rate > 0 else None
+            parts.append(f"{human_size(self.bytes_done)}/{human_size(self.total_bytes)} "
+                         f"({pct:.1f}%)")
+            parts.append(f"{human_size(rate)}/s")
+            parts.append(f"ETA {_fmt_duration(eta)}")
+        else:
+            parts.append(f"{human_size(self.bytes_done)}")
+            parts.append(f"{human_size(rate)}/s")
+        line = " | ".join(parts)
+        pad = " " * max(0, self._last_len - len(line))
+        self._last_len = len(line)
+        print("\r" + line + pad, end="", file=self.stream, flush=True)
+
+    def finish(self):
+        """Force a final render and move to a fresh line."""
+        self._maybe_render(force=True)
+        print(file=self.stream)
+
+
 TIMESTAMP_FIELDS = {"creation_time", "modification_time", "access_time", "change_time"}
 
 

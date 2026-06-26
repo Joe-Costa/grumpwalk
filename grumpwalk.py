@@ -71,6 +71,7 @@ from modules import (
     convert_timestamps_to_epoch,
     resolve_detail_field_specs,
     emit_detail_output,
+    CopyProgress,
     build_renamer,
     RenamePatternError,
 )
@@ -3275,15 +3276,19 @@ def _suffix_name(name, suffix, counter=0):
     return f"{name}{suffix}{extra}"
 
 
-async def _rename_into_place(client, session, temp_path, dest_parent, new_name, args):
+async def _rename_into_place(client, session, temp_path, dest_parent, new_name, args, clobber=None):
     """Rename a freshly-written temp object to new_name in dest_parent, applying the
     skip / --clobber / --rename-on-conflict strategy.
 
-    Returns (status, final_name, message): status in copied/skipped_exists/failed.
-    On any non-success the temp is left for the caller to delete.
+    clobber overrides args.clobber when given (used by --skip-unchanged to overwrite
+    a destination whose contents changed). Returns (status, final_name, message):
+    status in copied/skipped_exists/failed. On any non-success the temp is left for
+    the caller to delete.
     """
+    if clobber is None:
+        clobber = args.clobber
     ok, ec, err = await client.rename_entry(session, temp_path, dest_parent, new_name,
-                                            clobber=args.clobber)
+                                            clobber=clobber)
     if ok:
         return ("copied", new_name, None)
     if ec != "fs_entry_exists_error":
@@ -3303,29 +3308,84 @@ async def _rename_into_place(client, session, temp_path, dest_parent, new_name, 
     return ("failed", None, "rename-on-conflict exhausted")
 
 
-async def _copy_one_file(client, session, p, args, idx):
+def _copy_unchanged(p, dest_attr):
+    """True when the destination already matches the source's size and mtime.
+
+    Qumulo returns size as a string and times as ISO strings; compare as-is. Returns
+    False if the source size/mtime are unknown (treat as changed -> copy)."""
+    src_size, src_mtime = p.get("src_size"), p.get("src_mtime")
+    if src_size is None or src_mtime is None:
+        return False
+    return (str(src_size) == str(dest_attr.get("size"))
+            and src_mtime == dest_attr.get("modification_time"))
+
+
+async def _copy_one_file(client, session, p, args, idx, progress=None):
     """Copy a single file via a temp file + atomic rename into place.
 
     Copy-chunk does not truncate, and a mid-copy failure could corrupt an
     existing destination, so the data is copied into a uniquely-named temp file
     and renamed over the final name once the copy succeeds. Attributes are then
     preserved on the final path (after the rename) so read_only/timestamps land
-    last. Returns (status, message): status is copied/skipped_exists/failed.
+    last. Returns (status, message): status is copied/skipped_unchanged/
+    skipped_exists/failed.
+
+    A destination check runs BEFORE any data is copied (server-side copy-chunk is
+    not free), so a skip costs one get_file_attr instead of a full copy-then-discard.
+
+    progress (a CopyProgress, optional) is fed per-chunk byte counts; a skip settles
+    the file's full size so the aggregate bar still completes.
     """
     src, dest_parent, new_name = p["source"], p["dest_parent"], p["new_name"]
     snap = getattr(args, "snapshot", None)
+    target = p.get("target") or _mv_join(dest_parent, new_name)
+    file_size = int(p.get("src_size") or 0)
+
+    # Pre-copy destination check. Only needed when a skip is possible: the default
+    # (no --clobber) skips existing targets, and --skip-unchanged compares them.
+    # Pure --clobber / --rename-on-conflict always write, so they skip the check.
+    skip_unchanged = getattr(args, "skip_unchanged", False)
+    overwrite = args.clobber
+    if skip_unchanged or (not args.clobber and not args.rename_on_conflict):
+        dest_attr = await client.get_file_attr(session, target)  # live destination
+        if dest_attr is not None:
+            if skip_unchanged and _copy_unchanged(p, dest_attr):
+                if progress is not None:
+                    progress.advance_bytes(file_size, moved=False)
+                return ("skipped_unchanged", None)
+            if skip_unchanged:
+                overwrite = True              # exists but changed -> overwrite
+            elif not args.clobber:
+                if progress is not None:
+                    progress.advance_bytes(file_size, moved=False)
+                return ("skipped_exists", None)  # default skip, no data copied
+
     temp_name = f".grumpwalk-copytmp.{os.getpid()}.{idx}.{new_name}"
     ok, ec, err = await client.create_entry(session, dest_parent, temp_name, "CREATE_FILE")
     if not ok:
         return ("failed", f"create temp failed: {err}")
     temp_path = _mv_join(dest_parent, temp_name)
-    ok, err = await client.copy_file_data(session, src, temp_path, source_snapshot=snap)
+
+    on_chunk = None
+    chunk_state = {"sent": 0}
+    if progress is not None:
+        def on_chunk(delta):
+            chunk_state["sent"] += delta
+            progress.advance_bytes(delta)
+
+    ok, err = await client.copy_file_data(session, src, temp_path, source_snapshot=snap,
+                                          on_progress=on_chunk)
     if not ok:
         await client.delete_entry(session, temp_path)
         return ("failed", f"copy failed: {err}")
     status, final_name, msg = await _rename_into_place(client, session, temp_path,
-                                                       dest_parent, new_name, args)
+                                                       dest_parent, new_name, args,
+                                                       clobber=overwrite)
     if status in ("copied", "renamed"):
+        if progress is not None:
+            # Settle the tail copy-chunk could not report (and small single-chunk
+            # files, which report nothing) so the byte total lands on file_size.
+            progress.advance_bytes(file_size - chunk_state["sent"])
         preserve_warn = await _preserve_object(
             client, session, src, _mv_join(dest_parent, final_name), args)
         note = preserve_warn
@@ -3579,7 +3639,7 @@ async def copy_objects(client, session, args, file_filter) -> dict:
         "skipped_directory": 0, "skipped_inside_copied_dir": 0,
         "skipped_rename_no_match": 0, "skipped_rename_invalid": 0,
         "skipped_noop": 0, "skipped_into_self": 0,
-        "skipped_target_collision": 0, "skipped_exists": 0,
+        "skipped_target_collision": 0, "skipped_exists": 0, "skipped_unchanged": 0,
         "errors": [],
     }
 
@@ -3649,6 +3709,7 @@ async def copy_objects(client, session, args, file_filter) -> dict:
 
     # Phase 2: plan.
     candidates = []  # (source, kind, old_name); kind in {file, dir, symlink}
+    src_meta = {}    # source path -> entry (size/mtime for --skip-unchanged)
     for e in entries:
         src = e.get("path", "").rstrip("/")
         if not src:
@@ -3660,6 +3721,7 @@ async def copy_objects(client, session, args, file_filter) -> dict:
             continue
         kind = "dir" if is_dir else ("symlink" if etype == _FS_TYPE_SYMLINK else "file")
         candidates.append((src, kind, _mv_basename(src)))
+        src_meta[src] = e
 
     if args.include_directories:
         copied_dirs = {src for src, kind, _ in candidates if kind == "dir"}
@@ -3699,8 +3761,11 @@ async def copy_objects(client, session, args, file_filter) -> dict:
         if kind == "dir" and (copy_to == src or copy_to.startswith(src + "/")):
             stats["skipped_into_self"] += 1
             continue
+        meta = src_meta.get(src, {})
         planned.append({"source": src, "dest_parent": copy_to,
-                        "new_name": new_name, "target": target, "kind": kind})
+                        "new_name": new_name, "target": target, "kind": kind,
+                        "src_size": meta.get("size"),
+                        "src_mtime": meta.get("modification_time")})
 
     # The destination must not sit inside a directory we copy (would recurse into
     # the growing copy).
@@ -3760,13 +3825,18 @@ async def copy_objects(client, session, args, file_filter) -> dict:
     # Phase 4: execute with bounded concurrency.
     sem = asyncio.Semaphore(max(1, args.copy_concurrency))
 
+    copy_progress = None
+    if args.progress and planned:
+        total_bytes = sum(int(p.get("src_size") or 0) for p in planned if p["kind"] == "file")
+        copy_progress = CopyProgress(len(planned), total_bytes, label="COPY")
+
     async def _run(p, idx):
         async with sem:
             if p["kind"] == "dir":
                 return p, await _copy_one_dir(client, session, p, args, stats)
             if p["kind"] == "symlink":
                 return p, await _copy_one_symlink(client, session, p, args)
-            return p, await _copy_one_file(client, session, p, args, idx)
+            return p, await _copy_one_file(client, session, p, args, idx, progress=copy_progress)
 
     tasks = [asyncio.create_task(_run(p, i)) for i, p in enumerate(planned)]
     done = 0
@@ -3780,6 +3850,11 @@ async def copy_objects(client, session, args, file_filter) -> dict:
             if message:  # preserve warning
                 log_stderr("WARN", f"{p['target']}: preserve incomplete: {message}",
                            newline_before=args.progress)
+        elif status == "skipped_unchanged":
+            stats["skipped_unchanged"] += 1
+            if args.verbose:
+                log_stderr("SKIP", f"{p['target']} unchanged (size + mtime match)",
+                           newline_before=args.progress)
         elif status == "skipped_exists":
             stats["skipped_exists"] += 1
             log_stderr("SKIP", f"{p['target']} exists (use --clobber to overwrite)",
@@ -3790,10 +3865,10 @@ async def copy_objects(client, session, args, file_filter) -> dict:
             log_stderr("WARN" if args.continue_on_error else "ERROR",
                        f"Failed: {p['source']} -> {p['target']}: {message}",
                        newline_before=args.progress)
-        if args.progress and done % 25 == 0:
-            print(f"\r[COPY] {done:,}/{len(planned):,}", end="", file=sys.stderr, flush=True)
-    if args.progress:
-        print(file=sys.stderr)
+        if copy_progress is not None:
+            copy_progress.file_done()
+    if copy_progress is not None:
+        copy_progress.finish()
 
     return stats
 
@@ -4099,8 +4174,8 @@ def _type_is_directory(args) -> bool:
 async def _collect_snapshot_subtree(client, session, dir_path, snapshot_id):
     """Recursively enumerate dir_path within the snapshot.
 
-    Returns (files, dirs): files is a list of (path, is_symlink) for every file and
-    symlink in the subtree; dirs is a list of every descendant directory path (not
+    Returns (files, dirs): files is a list of (path, is_symlink, size) for every file
+    and symlink in the subtree; dirs is a list of every descendant directory path (not
     dir_path itself). Used to restore an entire directory to its original location,
     including files that did not match the filter and empty subdirectories.
 
@@ -4123,7 +4198,7 @@ async def _collect_snapshot_subtree(client, session, dir_path, snapshot_id):
                 dirs.append(cpath)
                 stack.append(cpath)
             else:
-                files.append((cpath, ctype == _FS_TYPE_SYMLINK))
+                files.append((cpath, ctype == _FS_TYPE_SYMLINK, child.get("size")))
     return files, dirs
 
 
@@ -4201,14 +4276,14 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
                 client, session, path, snap_id)
             dir_targets.add(path)
             dir_targets.update(sub_dirs)
-            for fp, is_sl in sub_files:
-                file_targets[fp] = is_sl
+            for fp, is_sl, sz in sub_files:
+                file_targets[fp] = (is_sl, sz)
         else:
             if restore_dirs and _under_matched(path):
                 continue  # restored as part of its matched ancestor directory
-            file_targets[path] = (etype == _FS_TYPE_SYMLINK)
+            file_targets[path] = (etype == _FS_TYPE_SYMLINK, e.get("size"))
 
-    targets = sorted(file_targets.items())  # [(path, is_symlink), ...]
+    targets = sorted(file_targets.items())  # [(path, (is_symlink, size)), ...]
     stats["planned"] = len(targets)
     stats["planned_dirs"] = len(dir_targets)
 
@@ -4263,30 +4338,44 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
             log_stderr("WARN" if args.continue_on_error else "ERROR",
                        f"Failed to recreate directory {d}")
 
-    async def _run(path, is_symlink, idx):
+    restore_progress = None
+    if args.progress and targets:
+        total_bytes = sum(int(sz or 0) for _, (is_sl, sz) in targets if not is_sl)
+        restore_progress = CopyProgress(len(targets), total_bytes, label="RESTORE")
+
+    async def _run(path, is_symlink, size, idx):
         async with sem:
             parent = _mv_parent_of(path)
             if not await _ensure_restore_parent(client, session, parent, args, created):
                 return path, ("failed", f"could not recreate parent {parent}")
-            p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path), "target": path}
+            p = {"source": path, "dest_parent": parent, "new_name": _mv_basename(path),
+                 "target": path, "src_size": size}
             if is_symlink:
                 return path, await _copy_one_symlink(client, session, p, args)
-            return path, await _copy_one_file(client, session, p, args, idx)
+            return path, await _copy_one_file(client, session, p, args, idx, progress=restore_progress)
 
-    tasks = [asyncio.create_task(_run(path, sl, i)) for i, (path, sl) in enumerate(targets)]
+    tasks = [asyncio.create_task(_run(path, sl, sz, i))
+             for i, (path, (sl, sz)) in enumerate(targets)]
     for fut in asyncio.as_completed(tasks):
         path, (status, msg) = await fut
+        if restore_progress is not None:
+            restore_progress.file_done()
         if status == "copied":
             stats["restored"] += 1
             if args.verbose:
-                log_stderr("RESTORED", f"{path}" + (f" ({msg})" if msg else ""))
+                log_stderr("RESTORED", f"{path}" + (f" ({msg})" if msg else ""),
+                           newline_before=args.progress)
         elif status == "skipped_exists":
             stats["skipped_exists"] += 1
-            log_stderr("SKIP", f"{path} exists live (use --clobber or --rename-on-conflict)")
+            log_stderr("SKIP", f"{path} exists live (use --clobber or --rename-on-conflict)",
+                       newline_before=args.progress)
         else:
             stats["failed"] += 1
             _mv_record_error(stats, path, msg or "restore failed")
-            log_stderr("WARN" if args.continue_on_error else "ERROR", f"Failed to restore {path}: {msg}")
+            log_stderr("WARN" if args.continue_on_error else "ERROR",
+                       f"Failed to restore {path}: {msg}", newline_before=args.progress)
+    if restore_progress is not None:
+        restore_progress.finish()
     return stats
 
 
@@ -6303,6 +6392,7 @@ async def main_async(args):
                 ("skipped_noop", "Source and target identical"),
                 ("skipped_into_self", "Cannot copy a directory into itself"),
                 ("skipped_target_collision", "Multiple sources to one target"),
+                ("skipped_unchanged", "Unchanged (size + mtime match)"),
                 ("skipped_exists", "Target exists (use --clobber)"),
             ]
             for key, label in copy_skip_lines:
@@ -10055,6 +10145,16 @@ Examples:
              "For --copy-to this applies to files; an existing target directory is skipped.",
     )
     move_rename.add_argument(
+        "--skip-unchanged",
+        action="store_true",
+        help="With --copy-to, incremental sync: skip a destination file whose size and "
+             "modification_time already match the source, and copy only missing or changed "
+             "files (overwriting changed ones). The match check happens BEFORE any data is "
+             "copied, so re-runs are near-instant. Implies --preserve-all (so timestamps are "
+             "preserved and the comparison is meaningful on re-runs). Applies to files; not "
+             "yet supported with --include-directories.",
+    )
+    move_rename.add_argument(
         "--include-directories",
         action="store_true",
         help="Also move/copy matched directories (the whole subtree). "
@@ -10531,6 +10631,24 @@ Examples:
     if args.clobber and args.rename_on_conflict:
         print("Error: --clobber and --rename-on-conflict cannot be combined", file=sys.stderr)
         sys.exit(1)
+    if args.skip_unchanged:
+        if not args.copy_to:
+            print("Error: --skip-unchanged requires --copy-to", file=sys.stderr)
+            sys.exit(1)
+        if args.rename_on_conflict:
+            print("Error: --skip-unchanged and --rename-on-conflict cannot be combined",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.include_directories:
+            print("Error: --skip-unchanged is not yet supported with --include-directories "
+                  "(it applies to file matches)", file=sys.stderr)
+            sys.exit(1)
+        # The size+mtime comparison is only meaningful if the destination keeps the
+        # source's mtime, so a sync implies full attribute preservation.
+        if not args.preserve_all:
+            args.preserve_all = True
+            log_stderr("INFO", "--skip-unchanged implies --preserve-all (preserving timestamps "
+                               "so unchanged files can be detected on re-runs)")
 
     # Validate owner/group flags (only work with --source-acl, not --source-acl-file)
     if (args.copy_owner or args.copy_group) and not args.source_acl:

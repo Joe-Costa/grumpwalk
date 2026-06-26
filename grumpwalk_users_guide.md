@@ -792,6 +792,49 @@ permissions/owner) before anything is changed.
 > directory's owner and permissions are left unchanged - the copy/move still
 > proceeds into it.
 
+### How do I re-run a copy - to resume it, or to keep a destination in sync?
+
+These are two different needs, and they use different tools.
+
+**Resuming an interrupted copy: just re-run it - no special flag.** Re-running a
+`--copy-to` is cheap by default: grumpwalk checks each destination *before*
+copying, so files already there are skipped without moving any data. Because the
+copy is server-side, that saves real cluster I/O - re-running a half-finished
+200 GB copy skips the done files in seconds and transfers only what is missing.
+The same applies to restoring out of a snapshot (`--snapshot … --copy-to`) and to
+`--restore-in-place`: run the command again and only the not-yet-restored files
+are written. **A snapshot can never change, so there is nothing to "re-sync" - the
+plain re-run is all an interrupted restore needs.**
+
+**Keeping a destination in sync with a changing source: `--skip-unchanged`.** The
+default skips by *existence* - a destination file that already exists is left
+alone even if the *source* has since changed. That is exactly right for an
+unchanging source (like a snapshot). But when the source is **live and evolving**
+and you want the destination to track it, add `--skip-unchanged`:
+```bash
+# Re-runnable sync: copy only new/changed files from an evolving source
+./grumpwalk.py --host cluster --path /home/joe/active --type file \
+  --copy-to /home/joe/published --skip-unchanged --yes
+```
+It skips a file only when its size **and** modification time match the
+destination, re-copies files that changed, and copies missing ones - an
+incremental, rsync-style sync. It implies `--preserve-all` (the source's mtime
+must be stamped on the destination for "unchanged" to be detectable next run), so
+use it from the **first** copy; pointed at a destination made by an earlier
+non-preserving copy, the first run re-copies everything once and later runs are
+clean.
+
+| Goal | Use |
+|------|-----|
+| Resume an interrupted copy or snapshot restore (source unchanged) | just re-run (no flag) |
+| Keep a destination matching a changing live source | `--skip-unchanged` |
+| Force every matched file to be overwritten | `--clobber` |
+
+`--skip-unchanged` is a `--copy-to` option; an interrupted `--restore-in-place` is
+resumed by simply re-running it. The check trusts size + mtime, not a content hash
+(like rsync's default) - a file edited back to the exact same size *and* timestamp
+would read as unchanged, which is rare in practice but worth knowing.
+
 ---
 
 ## Recovering Data from Snapshots
@@ -931,6 +974,12 @@ confirmation - preview with `--dry-run` first:
 ```
 Without `--clobber`, files that still exist live are skipped (only deleted ones
 are recreated) - a safe way to undelete without rolling anything back.
+
+If a restore is interrupted, just run it again: already-restored files are skipped
+(checked before any data moves) and only the rest are written. A snapshot never
+changes, so there is nothing to re-sync - re-running is all you need, and
+`--skip-unchanged` is neither required nor applicable here (see
+[re-running a copy](#how-do-i-re-run-a-copy---to-resume-it-or-to-keep-a-destination-in-sync)).
 
 ### How do I restore an entire directory (not just its files)?
 
