@@ -921,6 +921,36 @@ When you give a snapshot-age limit on its own, `--all-snapshots` is implied - so
 ./grumpwalk.py --host cluster --path /Shared --name 'report.docx' --snapshots-newer-than 1h
 ```
 
+### How do I limit *which snapshots* are searched (by snapshot age)?
+
+`--snapshots-newer-than` and `--snapshots-older-than` bound the **set of snapshots** to
+look at, by each snapshot's own age. Keep them straight from `--older-than` /
+`--newer-than`, which filter the **files** inside a search by file timestamp: the
+`--snapshots-*` pair chooses *which snapshots*, not which files. Ages are computed in
+**UTC** and take days or hours - `5` or `5d` = 5 days, `12h` = 12 hours.
+
+```bash
+# Only snapshots from the last 7 days (the recent end)
+./grumpwalk.py --host cluster --path /Shared --name '*.docx' --snapshots-newer-than 7d
+
+# Only snapshots older than 30 days (the archive end)
+./grumpwalk.py --host cluster --path /Shared --name '*.docx' --snapshots-older-than 30d
+
+# A window - snapshots taken between 7 and 30 days ago (combine both)
+./grumpwalk.py --host cluster --path /Shared --name '*.docx' \
+  --snapshots-older-than 7d --snapshots-newer-than 30d
+```
+On their own (without `--all-snapshots` or `--in-the-last-snapshots`), a snapshot-age
+limit **implies `--all-snapshots`**. They also bound `--list-snapshots` - handy to see
+the set before you search it - and compose with `--in-the-last-snapshots`:
+```bash
+# See exactly which snapshots a search would cover
+./grumpwalk.py --host cluster --list-snapshots --path /Shared --snapshots-newer-than 14d
+```
+For a window, give `--snapshots-older-than X --snapshots-newer-than Y` with **Y greater
+than X** - it keeps snapshots aged between X and Y (older than X, younger than Y). An
+inverted pair (X ≥ Y) simply matches no snapshots.
+
 ### How do I get just the latest version of each match (no duplicates)?
 
 A file that hasn't changed appears in every snapshot, so `--all-snapshots` repeats
@@ -968,6 +998,24 @@ Requirements and limits:
   a file that was otherwise unchanged; every other attribute is exact. (Tested at scale:
   a 5-snapshot search of a 1.1-million-file directory matched a full crawl on every
   attribute but that one, in about a third of the time.)
+
+### `--delta` and `--incremental`: two different snapshot-diff speedups
+
+Both ride on the cluster's snapshot **diff**, but for opposite jobs - it's easy to mix
+them up, so here's the split (they can't be combined - each belongs to a different mode):
+
+| | `--incremental` | `--delta` |
+|---|---|---|
+| Speeds up | a multi-snapshot **search** | a **restore** / **revert** |
+| What it does | crawls only the oldest snapshot, then diffs consecutive snapshots to update results | rewrites only the changed **byte ranges** of a modified file, not the whole file |
+| Snapshots | many (`--all-snapshots` / `--in-the-last-snapshots` / age window) | one (`--snapshot N`) |
+| Touches the filesystem? | no - read-only search | yes - writes data back |
+| Which diff | tree diff (*which files* changed) | per-file byte-range diff (*which bytes* changed) |
+
+Rule of thumb: reach for **`--incremental`** when *finding* things across many snapshots
+is slow, and **`--delta`** when *putting back* a large file (or a directory of them) is
+slow. `--delta` is covered with `--restore-in-place` and `--revert` in the restore
+questions below.
 
 ### How do I see the size, age, and other attributes of matches (not just paths)?
 

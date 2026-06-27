@@ -26,4 +26,5 @@ auto-tuning-plan.md
 tuning-profile
 .claude/
 systemd-network*
-
+scrp*
+creds
