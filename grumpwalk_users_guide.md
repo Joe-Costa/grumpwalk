@@ -1181,6 +1181,14 @@ Notes:
   were delta-patched.
 - An interrupted `--delta` restore is safe to re-run: the next run diffs against a
   fresh temporary snapshot and patches whatever is still out of date.
+- `--delta` is **size-gated** so it stays optimal on a mixed tree: only files at least
+  `--delta-threshold` (default **1 MiB**) use the byte-range diff; smaller files are
+  copied whole in place (the per-file diff isn't worth it when there's little data to
+  save, and copying in place still preserves the file's mode). So on a big directory
+  where a few large files changed in small spots, `--revert --delta` finds just the
+  changed files, moves only the changed bytes of the large ones, and skips the diff
+  overhead on the many small ones. Use `--delta-threshold 0` to byte-range every
+  modified file regardless of size.
 
 ### How do I restore a whole directory to how it was at a snapshot ("undo all changes")?
 

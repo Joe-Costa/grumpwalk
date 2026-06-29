@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.3.1"
+__version__ = "3.4.0"
 
 import argparse
 import asyncio
@@ -4361,7 +4361,8 @@ async def _collect_snapshot_subtree(client, session, dir_path, snapshot_id):
     return files, dirs
 
 
-async def _delta_restore_file(client, session, path, good_snap, now_snap, progress=None):
+async def _delta_restore_file(client, session, path, good_snap, now_snap, progress=None,
+                              threshold=0):
     """Patch a live file in place to its good_snap version, copying ONLY the byte
     ranges that differ (the diff of now_snap vs good_snap).
 
@@ -4376,6 +4377,12 @@ async def _delta_restore_file(client, session, path, good_snap, now_snap, progre
     and -- because the diff only covers the overlapping range -- a file that shrank
     live (good is larger) has its truncated tail [live_size, good_size) copied
     explicitly, since the diff never reports it.
+
+    `threshold` (bytes) gates the byte-range diff: a file smaller than `threshold`
+    is restored by copying its whole content in place (still mode-preserving, but
+    skipping the per-file diff call, which buys nothing when the file is tiny). At
+    or above the threshold the byte-range diff is used so only changed regions move.
+    threshold=0 always uses the byte-range diff.
     """
     good_attr = await client.get_file_attr(session, path, snapshot_id=good_snap)
     if good_attr is None:
@@ -4387,6 +4394,22 @@ async def _delta_restore_file(client, session, path, good_snap, now_snap, progre
     good_size = int(good_attr.get("size") or 0)
     live_size = int(live_attr.get("size") or 0)
     file_id = good_attr.get("id")
+
+    # Small file: copy the whole content in place (no byte-range diff). The diff
+    # round-trip is not worth it when there is little data to save, and copying in
+    # place still preserves the file's mode (unlike a temp-file + rename restore).
+    if 0 < threshold and good_size < threshold:
+        if good_size != live_size:
+            ok, err = await client.set_file_size(session, path, good_size)
+            if not ok:
+                return ("failed", f"set-size failed: {err}")
+        if good_size > 0:
+            ok, err = await client.copy_file_range(session, path, path, good_snap, 0, good_size)
+            if not ok:
+                return ("failed", f"whole copy failed: {err}")
+        if progress is not None:
+            progress.advance_bytes(good_size, moved=True)
+        return ("copied", f"whole-in-place {good_size:,} bytes")
 
     regions, err = await client.get_file_byte_diff(session, now_snap, good_snap, file_id)
     if regions is None:
@@ -4598,7 +4621,8 @@ async def restore_in_place(client, session, args, file_filter) -> dict:
                     return path, await _copy_one_symlink(client, session, p, args), False
                 if now_snap is not None and not is_symlink:
                     status, msg = await _delta_restore_file(
-                        client, session, path, snap_id, now_snap, progress=restore_progress)
+                        client, session, path, snap_id, now_snap, progress=restore_progress,
+                        threshold=args.delta_threshold)
                     if status != "recreate":
                         return path, (status, msg), True
                     # File no longer exists live -> nothing to diff; whole-file restore.
@@ -4717,26 +4741,12 @@ async def _revert_recreate_standalone_file(client, session, path, snap_id, args,
         args, created, stats)
 
 
-async def _revert_recreate_dir_subtree(client, session, dir_path, snap_id, args, created, stats):
-    """Recreate a deleted directory and ALL its snapshot contents. The tree diff
-    reports only the directory node, so the subtree is walked in the snapshot and
-    every descendant directory and file is recreated."""
-    sub_files, sub_dirs = await _collect_snapshot_subtree(client, session, dir_path, snap_id)
-    for d in sorted([dir_path] + sub_dirs, key=lambda x: (x.count("/"), x)):
-        if await _ensure_restore_parent(client, session, d, args, created):
-            stats["recreated_dirs"] += 1
-        else:
-            stats["failed"] += 1
-            _mv_record_error(stats, d, "could not recreate directory")
-    for fpath, is_sl, sz in sub_files:
-        await _revert_recreate_file(client, session, fpath, is_sl, sz, args, created, stats)
-
-
 async def _revert_restore_modified(client, session, path, snap_id, now_snap, args, stats):
     """Restore a modified file to its snapshot version: delta-patch (--delta) or
     whole-file overwrite."""
     if args.delta:
-        status, msg = await _delta_restore_file(client, session, path, snap_id, now_snap)
+        status, msg = await _delta_restore_file(client, session, path, snap_id, now_snap,
+                                                threshold=args.delta_threshold)
         if status == "recreate":
             # The file disappeared between the diff and now; recreate it whole-file.
             await _revert_recreate_standalone_file(client, session, path, snap_id, args, set(), stats)
@@ -4886,29 +4896,68 @@ async def revert_to_snapshot(client, session, args) -> dict:
         args.clobber = True
         args.rename_on_conflict = False
         created_set = set()
+        sem = asyncio.Semaphore(max(1, args.copy_concurrency))
 
+        # Phase 1 (sequential): recreate the directory structure of each deleted dir
+        # subtree, shallow-first so parents exist before children, and collect the
+        # files to restore. Directory creation is cheap relative to the file copies.
+        subtree_files = []
         for root in del_dir_roots:
-            await _revert_recreate_dir_subtree(client, session, root.rstrip("/"),
-                                               snap_id, args, created_set, stats)
-        for f in standalone_del_files:
-            await _revert_recreate_standalone_file(client, session, f, snap_id, args,
-                                                   created_set, stats)
-        for f in modified_files:
-            await _revert_restore_modified(client, session, f, snap_id, now_snap, args, stats)
+            sub_files, sub_dirs = await _collect_snapshot_subtree(
+                client, session, root.rstrip("/"), snap_id)
+            for d in sorted([root.rstrip("/")] + sub_dirs, key=lambda x: (x.count("/"), x)):
+                if await _ensure_restore_parent(client, session, d, args, created_set):
+                    stats["recreated_dirs"] += 1
+                else:
+                    stats["failed"] += 1
+                    _mv_record_error(stats, d, "could not recreate directory")
+            subtree_files.extend(sub_files)
+
+        # Phase 2 (concurrent): restore every file - recreated (deleted) and modified -
+        # through a bounded-concurrency pool. Stat counters/error list are mutated
+        # without an intervening await, so increments are atomic under asyncio.
+        async def _recreate_file(path, is_sl, size):
+            async with sem:
+                await _revert_recreate_file(client, session, path, is_sl, size,
+                                            args, created_set, stats)
+
+        async def _recreate_standalone(path):
+            async with sem:
+                await _revert_recreate_standalone_file(client, session, path, snap_id,
+                                                       args, created_set, stats)
+
+        async def _restore_modified(path):
+            async with sem:
+                await _revert_restore_modified(client, session, path, snap_id, now_snap,
+                                               args, stats)
+
+        await asyncio.gather(
+            *[_recreate_file(p, sl, sz) for (p, sl, sz) in subtree_files],
+            *[_recreate_standalone(p) for p in standalone_del_files],
+            *[_restore_modified(p) for p in modified_files],
+        )
+
+        # Phase 3 (concurrent): delete objects created since the snapshot (--delete-new).
         if delete_new:
-            for f in standalone_cre_files:
-                ok, err2 = await client.delete_entry(session, f.rstrip("/"))
-                if ok:
-                    stats["deleted_files"] += 1
-                else:
-                    stats["failed"] += 1
-                    _mv_record_error(stats, f, f"delete failed: {err2}")
-            for root in cre_dir_roots:
-                _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
-                if ok:
-                    stats["deleted_dirs"] += 1
-                else:
-                    stats["failed"] += 1
+            async def _del_file(f):
+                async with sem:
+                    ok, err2 = await client.delete_entry(session, f.rstrip("/"))
+                    if ok:
+                        stats["deleted_files"] += 1
+                    else:
+                        stats["failed"] += 1
+                        _mv_record_error(stats, f, f"delete failed: {err2}")
+
+            async def _del_tree(root):
+                async with sem:
+                    _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
+                    if ok:
+                        stats["deleted_dirs"] += 1
+                    else:
+                        stats["failed"] += 1
+
+            await asyncio.gather(*[_del_file(f) for f in standalone_cre_files],
+                                 *[_del_tree(r) for r in cre_dir_roots])
         else:
             stats["kept_new"] = new_count
     finally:
@@ -10842,6 +10891,16 @@ Examples:
              "compute the diff and deletes it when done (needs snapshot-write privilege); "
              "files deleted since the snapshot still restore whole-file. Patches existing "
              "files in place (no temp-file + rename), so it overwrites live data: needs --yes.",
+    )
+    snapshots.add_argument(
+        "--delta-threshold",
+        type=parse_size_to_bytes,
+        default=1 << 20,
+        metavar="SIZE",
+        help="With --delta, only files at least SIZE are restored by byte-range diff; "
+             "smaller files are copied whole in place (the per-file diff buys nothing when "
+             "there is little data to save). Default 1MiB. Set 0 to byte-range-diff every "
+             "modified file regardless of size. Accepts 100KB, 4MiB, etc.",
     )
     snapshots.add_argument(
         "--revert",
