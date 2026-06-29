@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.3.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.4.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -50,6 +50,8 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
 - **ACL and owner/group management** - Copy ACLs, owner, and group between objects
 - **ACE manipulation** - Surgically add, remove, or modify individual ACEs within ACLs
+- **Move, copy, and rename** - Server-side move (`--move-to`), copy (`--copy-to`), and bulk rename (`--rename-to`) of matched objects, with optional attribute preservation and incremental sync
+- **Snapshot search and restore** - Search across snapshots, copy or restore snapshot versions (Qumulo has no native restore), `--restore-in-place` undelete, whole-directory `--revert`, byte-range `--delta` restore for large files, and `--incremental` diff-driven multi-snapshot search
 - **Object tagging** - Add, find, and remove custom key/value tags on matching objects
 - **Extended attribute management** - Find and set DOS attributes (read_only, hidden, system, archive)
 - **Similarity detection** - Find similar files using adaptive sampling
@@ -447,16 +449,22 @@ Search, copy, and restore data from Qumulo snapshots (Qumulo has no native resto
 - `--all-snapshots` - Search across all snapshots (used instead of `--path`); with `--path`, only snapshots whose source covers it. Each match is annotated with its snapshot. Search-only.
 - `--snapshots-newer-than DURATION` / `--snapshots-older-than DURATION` - Limit the snapshot set by snapshot age (UTC). Accepts days or hours: `5`/`5d` = 5 days, `12h` = 12 hours. On their own they imply `--all-snapshots` (search across the snapshots in that window); also work with `--list-snapshots`/`--in-the-last-snapshots`. Distinct from `--older-than`/`--newer-than`, which filter files.
 - `--in-the-last-snapshots N` - Search the N most recent snapshots and show only the newest result per path (dedupes the same file across snapshots). Composes with the filters and snapshot-age limits. Search-only.
+- `--incremental` - Speed up a multi-snapshot search: crawl only the oldest covered snapshot in full, then use the snapshot tree diff between consecutive snapshots to update the match set for each later one (re-checking only the files that changed). Identical results to crawling each snapshot, far fewer API calls when snapshots are mostly alike. Requires `--path`; not supported with `--max-depth` or access-time filters.
 - `--snapshot ID --copy-to DEST` - Copy the snapshot version of matched files (incl. deleted) to a live DEST. Reuses the full copy feature (`--rename-to`, `--preserve-*`, `--include-directories`, `--create-destination-directory`).
 - `--snapshot ID --restore-in-place` - Restore matched files to their original live paths (undelete / roll back): recreate files/dirs deleted since the snapshot, and with `--clobber` overwrite the current live version. Destructive - needs `--yes`/confirmation; preview with `--dry-run`. With `--include-directories` (or `--type directory`) a matched directory is restored as a full subtree - the directory and every descendant, including empty subdirectories; restoring into a directory that still exists live merges, with per-file conflict handling. Without those flags, directories are skipped and only files are restored.
+- `--snapshot ID --revert` - Restore the whole directory at `--path` to its state in the snapshot, using the tree diff to act only on what changed: recreate files/dirs deleted since and restore modified files. Files created since the snapshot are **kept by default**; add `--delete-new` to also remove them for an exact byte-identical rollback. Whole-directory operation (ignores name/type/owner filters); overwrites modified files - needs `--yes`, preview with `--dry-run`.
+- `--delta` - With `--restore-in-place` or `--revert`, patch modified files in place by copying only the byte ranges that differ from the snapshot, instead of rewriting the whole file - far faster for large files with localized edits, and it preserves file mode (no temp-file + rename). `--delta-threshold SIZE` (default 1 MiB) copies files below SIZE whole in place and byte-range-diffs only larger ones (keeps `--delta` optimal on mixed trees); `0` byte-range-diffs every file.
 - `--rename-on-conflict` - On a name conflict (during copy/restore), write the item under a `_restored_<date>_<time>` suffix instead of skipping (default) or overwriting (`--clobber`). Mutually exclusive with `--clobber`; customize with `--conflict-suffix`.
 
 ```bash
-# Find report.docx in any snapshot from the last week
-./grumpwalk.py --host HOST --all-snapshots --snapshots-newer-than 7 --name 'report.docx'
+# Find report.docx in any snapshot from the last week (fast diff-driven scan)
+./grumpwalk.py --host HOST --all-snapshots --snapshots-newer-than 7 --name 'report.docx' --incremental
 
 # Restore everything matching, from a chosen snapshot, back to where it was
 ./grumpwalk.py --host HOST --snapshot 5 --path /Shared --name '*.docx' --restore-in-place --clobber --yes
+
+# Revert a whole directory to a snapshot, patching only changed bytes of large files
+./grumpwalk.py --host HOST --snapshot 5 --path /Shared/project --revert --delta --yes
 
 # Restore an entire deleted directory (subtree, including empty subdirs)
 ./grumpwalk.py --host HOST --snapshot 5 --path /Shared --max-depth 1 --name 'project-x' \
