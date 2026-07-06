@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 
 import argparse
 import asyncio
@@ -5032,7 +5032,9 @@ async def recurse_ace_modifications_to_tree(
         'objects_failed': 0,
         'objects_skipped': 0,
         'total_objects_processed': 0,
-        'errors': []
+        'errors': [],
+        # In dry-run, a bounded sample of paths that would change (for preview).
+        'changed_paths': [],
     }
 
     start_time = time.time()
@@ -5185,6 +5187,10 @@ async def recurse_ace_modifications_to_tree(
                         if success:
                             if had_changes:
                                 stats['objects_changed'] += 1
+                                # Collect a bounded sample of would-change paths for
+                                # the dry-run preview (skipped in real runs to bound memory).
+                                if dry_run and len(stats['changed_paths']) < 50:
+                                    stats['changed_paths'].append(path)
                             else:
                                 stats['objects_unchanged'] += 1
                         else:
@@ -7987,9 +7993,17 @@ async def main_async(args):
             new_aces = mod_inner.get('aces', [])
             print(f"  Resulting ACE count:  {len(new_aces)}", file=sys.stderr)
 
-            # Dry run: show what would happen and exit
+            # Dry run: preview the change to the root object. When --propagate-changes
+            # is set, do NOT stop here -- fall through to the tree walk below, which
+            # runs in dry-run mode and previews each child object individually
+            # (each child's own ACL is evaluated; the root ACL is never stamped down).
             if args.dry_run:
-                log_stderr("DRY RUN", "Would apply the following ACL:", newline_before=True)
+                if args.propagate_changes:
+                    header = (f"Would apply this ACL to {args.path} "
+                              f"(this object only; children previewed individually below):")
+                else:
+                    header = f"Would apply the following ACL to {args.path}:"
+                log_stderr("DRY RUN", header, newline_before=True)
                 print("-" * 60, file=sys.stderr)
 
                 # Show each ACE in readable format
@@ -8002,13 +8016,16 @@ async def main_async(args):
                     print(f"  {i+1}. {ace_str}{marker}", file=sys.stderr)
 
                 print("-" * 60, file=sys.stderr)
-                log_stderr("DRY RUN", "No changes were made.")
-                # Save identity cache before exiting (trustees were resolved)
-                save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
-                return
 
-            # Step 3: Save backup if requested
-            if args.ace_backup:
+                # Without propagation there is nothing more to preview.
+                if not args.propagate_changes:
+                    log_stderr("DRY RUN", "No changes were made.")
+                    # Save identity cache before exiting (trustees were resolved)
+                    save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+                    return
+
+            # Step 3: Save backup if requested (skipped in dry-run: writes a file)
+            if args.ace_backup and not args.dry_run:
                 import json
                 backup_data = {
                     'path': args.path,
@@ -8070,27 +8087,31 @@ async def main_async(args):
                         log_stderr("ERROR", f"Could not resolve trustee: {raw_trustee}")
                         sys.exit(1)
 
-            # Step 5: Apply modified ACL to target path
-            log_stderr("INFO", f"Applying modified ACL to: {args.path}", newline_before=True)
-            # Normalize ACL for PUT request (convert trustee objects to auth_id strings)
-            normalized_acl = normalize_acl_for_put(modified_acl)
-            success, error = await client.set_file_acl(session, args.path, normalized_acl, mark_inherited=False)
+            # Step 5: Apply modified ACL to target path (skipped in dry-run)
+            if not args.dry_run:
+                log_stderr("INFO", f"Applying modified ACL to: {args.path}", newline_before=True)
+                # Normalize ACL for PUT request (convert trustee objects to auth_id strings)
+                normalized_acl = normalize_acl_for_put(modified_acl)
+                success, error = await client.set_file_acl(session, args.path, normalized_acl, mark_inherited=False)
 
-            if not success:
-                log_stderr("ERROR", f"Failed to apply ACL: {error}")
-                sys.exit(1)
+                if not success:
+                    log_stderr("ERROR", f"Failed to apply ACL: {error}")
+                    sys.exit(1)
 
-            log_stderr("INFO", "ACL applied successfully")
+                log_stderr("INFO", "ACL applied successfully")
 
             # Step 6: Recurse modifications to children if requested
             # Uses per-file modification: GET each child's ACL, apply the same
             # modifications, PUT back. This preserves each child's existing ACL
             # and prevents non-inherited permissions from being incorrectly propagated.
             if args.propagate_changes:
-                log_stderr("INFO", f"Applying modifications to children of: {args.path}", newline_before=True)
+                if args.dry_run:
+                    log_stderr("DRY RUN", f"Evaluating each object under {args.path} individually (no changes will be made)...", newline_before=True)
+                else:
+                    log_stderr("INFO", f"Applying modifications to children of: {args.path}", newline_before=True)
                 await display_scope_aggregates(
                     client, session, args.path,
-                    label="Modifying children of",
+                    label="Would evaluate under" if args.dry_run else "Modifying children of",
                     verbose=args.verbose,
                     max_depth=args.max_depth,
                     omit_subdirs=args.omit_subdirs,
@@ -8134,15 +8155,34 @@ async def main_async(args):
                     verbose=args.verbose
                 )
 
-                log_stderr("INFO", "Recursion complete:", newline_before=True)
-                print(f"  Objects changed:    {propagate_stats['objects_changed']:,}", file=sys.stderr)
-                print(f"  Objects unchanged:  {propagate_stats['objects_unchanged']:,}", file=sys.stderr)
-                print(f"  Objects failed:     {propagate_stats['objects_failed']:,}", file=sys.stderr)
-                if file_filter:
-                    print(f"  Objects skipped:    {propagate_stats['objects_skipped']:,}", file=sys.stderr)
+                if args.dry_run:
+                    log_stderr("INFO", "Dry-run preview complete:", newline_before=True)
+                    print(f"  Objects that would change: {propagate_stats['objects_changed']:,}", file=sys.stderr)
+                    print(f"  Objects unchanged:         {propagate_stats['objects_unchanged']:,}", file=sys.stderr)
+                    print(f"  Objects failed (read):     {propagate_stats['objects_failed']:,}", file=sys.stderr)
+                    if file_filter:
+                        print(f"  Objects skipped:           {propagate_stats['objects_skipped']:,}", file=sys.stderr)
+                    changed_paths = propagate_stats.get('changed_paths', [])
+                    if changed_paths:
+                        print(f"  Objects that would be modified:", file=sys.stderr)
+                        for cp in changed_paths:
+                            print(f"    {cp}", file=sys.stderr)
+                        remaining = propagate_stats['objects_changed'] - len(changed_paths)
+                        if remaining > 0:
+                            print(f"    ... and {remaining:,} more", file=sys.stderr)
+                else:
+                    log_stderr("INFO", "Recursion complete:", newline_before=True)
+                    print(f"  Objects changed:    {propagate_stats['objects_changed']:,}", file=sys.stderr)
+                    print(f"  Objects unchanged:  {propagate_stats['objects_unchanged']:,}", file=sys.stderr)
+                    print(f"  Objects failed:     {propagate_stats['objects_failed']:,}", file=sys.stderr)
+                    if file_filter:
+                        print(f"  Objects skipped:    {propagate_stats['objects_skipped']:,}", file=sys.stderr)
 
                 if propagate_stats['objects_failed'] > 0:
                     sys.exit(1)
+
+            if args.dry_run:
+                log_stderr("DRY RUN", "No changes were made.", newline_before=True)
 
         log_stderr("INFO", "ACE manipulation complete", newline_before=True)
         # Save identity cache before exiting

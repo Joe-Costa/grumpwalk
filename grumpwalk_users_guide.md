@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.3.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.4.1** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -2889,6 +2889,8 @@ The `--propagate-changes` flag applies modifications recursively to all children
 |--------------|----------------------------------|
 | With flag | Target path and all descendants are modified |
 
+For ACE operations, propagation checks each object's **own** permissions and changes only the entry you targeted, leaving every other permission in place. It does **not** copy the target folder's ACL down onto its children, and it does **not** stop when it reaches a folder that lacks the entry. Every object in the tree is searched, so an entry that appears only on a deeply nested subfolder is still found and fixed.
+
 Works with:
 - ACE operations (`--add-ace`, `--remove-ace`, `--replace-ace`, etc.)
 - Inheritance control (`--disable-inheritance`, `--disable-inheritance --remove-inherited`)
@@ -2896,6 +2898,8 @@ Works with:
 - Trustee migration (`--migrate-trustees`)
 - ACE cloning (`--clone-ace-source/--clone-ace-target`)
 - ACL restore (`--ace-restore`)
+
+**Preview first with `--dry-run`.** Added to any of these operations, `--dry-run` searches the whole tree without changing anything and reports how many objects would change, how many would be left untouched, and which objects would be modified. The preview matches exactly what a real run does, so use it to confirm the scope before applying.
 
 ### ACL Backup and Restore
 

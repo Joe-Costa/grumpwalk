@@ -5,6 +5,12 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-07-06
+
+### Fixed
+
+- **`--dry-run` now previews the whole tree for ACE changes, not just the top folder.** When previewing an ACE change with `--propagate-changes` (`--remove-ace`, `--add-ace`, `--replace-ace`, `--add-rights`, `--remove-rights`, `--clone-ace-*`, `--migrate-trustees`), `--dry-run` used to show only the change to the `--path` folder and then stop - which made it look as though that one folder's ACL would be copied down onto everything beneath it. A real run never behaved that way: it checks each object's own permissions and removes only the targeted ACE, leaving all other entries untouched, and it does not stop at a folder that happens to lack the entry. The preview simply did not show any of that. Now `--dry-run` searches the entire tree without changing anything and reports how many objects would change, how many would be left untouched, and which objects would be modified, so the preview matches exactly what a real run will do.
+
 ## [3.4.0] - 2026-06-29
 
 ### Added

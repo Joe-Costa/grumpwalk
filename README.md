@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.4.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.4.1** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -577,9 +577,9 @@ Supported trustee formats in CSV (same as command-line):
 | `--clone-ace-map` | `mappings.csv` | Bulk clone ACEs from CSV file |
 
 **Supporting Flags:**
-- `--propagate-changes` - Apply changes to all children recursively (`--propagate-acls` also accepted)
+- `--propagate-changes` - Apply the change to every object in the tree, checking each object's own ACL individually so only the matching ACE is touched and every other permission is left intact. It does not copy the parent's ACL onto its children, and it does not stop at a folder that lacks the ACE - the whole tree is searched. Without this flag, only the `--path` object is changed. (`--propagate-acls` also accepted.)
 - `--sync-cloned-aces` - When cloning, update existing target ACEs to match source rights
-- `--dry-run` - Preview changes without applying them
+- `--dry-run` - Preview what would change without applying anything. With `--propagate-changes`, it searches the whole tree and reports how many objects would change versus stay untouched, and lists the objects that would be modified - so you can confirm the exact scope before running for real.
 - `--ace-backup FILE` - Save original ACLs to JSON before modification (includes file_id for safety)
 - `--ace-restore FILE` - Restore ACLs from a backup file (verifies file_id matches)
 - `--force-restore` - Force restore even if file_id doesn't match (use with caution)
