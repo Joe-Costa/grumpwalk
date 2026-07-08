@@ -194,7 +194,7 @@ A practical guide with recipes for common storage administration tasks using gru
   --owner alice --owner bob --owner charlie
 ```
 
-### How do I find specific file types?
+### How do I find specific object types?
 
 **Find only directories:**
 ```bash
