@@ -10,6 +10,7 @@ import base64
 import copy
 import fnmatch
 import json
+import random
 import ssl
 import sys
 import time
@@ -39,6 +40,12 @@ from .output import ProgressTracker
 # parameter on read endpoints (entries/, data, streams data).
 SKIP_ATIME_MIN_VERSION = (7, 9, 0)
 
+# HTTP statuses that indicate a transient, retryable condition: 429 (rate limit /
+# Too Many Requests) plus the transient 5xx family. A retryable status is retried
+# with backoff instead of raising, so a rate-limited directory read is not turned
+# into a silently dropped subtree.
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 class AsyncQumuloClient:
     """Async Qumulo API client using aiohttp with optimized connection pooling."""
 
@@ -52,6 +59,7 @@ class AsyncQumuloClient:
         identity_cache: Optional[Dict] = None,
         verbose: bool = False,
         update_atime: bool = False,
+        max_retries: int = 5,
     ):
         self.host = host
         self.port = port
@@ -59,6 +67,18 @@ class AsyncQumuloClient:
         self.bearer_token = bearer_token
         self.max_concurrent = max_concurrent
         self.verbose = verbose
+
+        # Retry/backoff for transient read failures (rate-limit 429, transient 5xx,
+        # connection/timeout errors). max_retries is the number of RETRIES after the
+        # first attempt, so total attempts = max_retries + 1. retry_count tracks how
+        # many retries were performed across the run (surfaced in the crawl summary).
+        self.max_retries = max_retries
+        self.retry_count = 0
+        # Directories that could not be read even after retries. Populated by the
+        # tree walker so a partial crawl is reported loudly instead of exiting 0.
+        # Reset at the start of each walk_tree_async call.
+        self.walk_error_count = 0
+        self.walk_errors: List[dict] = []
 
         # atime handling. By default grumpwalk suppresses access-time updates on
         # reads (entries/data) when the cluster supports it. update_atime=True
@@ -305,6 +325,49 @@ class AsyncQumuloClient:
         except aiohttp.ClientError as e:
             return (False, str(e))
 
+    def _retry_delay(self, response, attempt: int) -> float:
+        """Seconds to wait before the next retry.
+
+        Honors a numeric Retry-After header when present (capped at 60s); otherwise
+        uses exponential backoff with jitter (~0.5, 1, 2, 4 ... seconds, capped at
+        30s, plus up to 50% random jitter to avoid a synchronized retry storm)."""
+        if response is not None:
+            ra = response.headers.get("Retry-After")
+            if ra:
+                try:
+                    return min(60.0, float(int(ra)))
+                except (ValueError, TypeError):
+                    pass  # HTTP-date form is uncommon here; fall back to backoff
+        base = min(30.0, 0.5 * (2 ** attempt))
+        return base * (0.5 + random.random())
+
+    async def _get_json_with_retry(self, session, url, params=None):
+        """GET url and return parsed JSON, retrying transient failures with backoff.
+
+        Retries on a rate-limit / transient status (RETRYABLE_STATUSES, incl. 429)
+        and on transient connection/timeout exceptions, up to self.max_retries times,
+        honoring Retry-After. Non-retryable statuses (e.g. 401/404) raise immediately
+        via raise_for_status(). If every attempt fails the final exception propagates,
+        so the caller still sees a hard error rather than a silently dropped subtree.
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with session.get(url, params=params, ssl=self.ssl_context) as response:
+                    if response.status in RETRYABLE_STATUSES and attempt < self.max_retries:
+                        delay = self._retry_delay(response, attempt)
+                        self.retry_count += 1
+                        await asyncio.sleep(delay)
+                        continue
+                    response.raise_for_status()
+                    return await response.json()
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+                    asyncio.TimeoutError):
+                if attempt < self.max_retries:
+                    self.retry_count += 1
+                    await asyncio.sleep(self._retry_delay(None, attempt))
+                    continue
+                raise
+
     async def get_directory_page(
         self,
         session: aiohttp.ClientSession,
@@ -338,11 +401,10 @@ class AsyncQumuloClient:
             params.update(self._atime_query_params())
             params.update(self._snapshot_query_params(snapshot_id))
 
-            async with session.get(
-                url, params=params, ssl=self.ssl_context
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
+            # Retry transient failures (429 rate-limit, transient 5xx, connection
+            # resets/timeouts) with backoff instead of raising. Without this a single
+            # rate-limited page turned into a silently dropped subtree.
+            return await self._get_json_with_retry(session, url, params)
 
     async def enumerate_directory(
         self,
@@ -459,12 +521,14 @@ class AsyncQumuloClient:
             url = f"{self.base_url}/v1/files/{encoded_path}/aggregates/"
 
             try:
-                async with session.get(
-                    url, params=self._snapshot_query_params(snapshot_id), ssl=self.ssl_context
-                ) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            except aiohttp.ClientError as e:
+                # Retry transient failures; aggregates only drive smart-skipping, so
+                # if they still fail after retries we fall back gracefully (a missing
+                # aggregate just disables pre-flight skipping for this directory - it
+                # never drops the directory itself).
+                return await self._get_json_with_retry(
+                    session, url, self._snapshot_query_params(snapshot_id)
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 # Fall back gracefully if aggregates unavailable
                 return {"total_files": "0", "total_directories": "0", "error": str(e)}
 
@@ -1672,6 +1736,10 @@ class AsyncQumuloClient:
         if omit_paths:
             normalized_omit_paths = set(p.rstrip("/") for p in omit_paths)
 
+        # Reset per-walk error accounting (directories unreadable after retries).
+        self.walk_error_count = 0
+        self.walk_errors = []
+
         # Shared state for collect_results mode
         collected_results = [] if collect_results else None
         results_lock = asyncio.Lock()
@@ -1924,6 +1992,13 @@ class AsyncQumuloClient:
                 try:
                     await _process_directory(dir_path, depth)
                 except Exception as e:
+                    # A directory could not be read even after retries, so its subtree
+                    # is missing from the results. Record it (always, not just under
+                    # --verbose) so the crawl can report an INCOMPLETE result loudly
+                    # and exit non-zero instead of silently succeeding.
+                    self.walk_error_count += 1
+                    if len(self.walk_errors) < 100:
+                        self.walk_errors.append({"path": dir_path, "error": str(e)})
                     if verbose:
                         log_stderr("WARN", f"Error processing {dir_path}: {e}")
                 finally:

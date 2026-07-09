@@ -6412,6 +6412,7 @@ async def main_async(args):
         identity_cache=identity_cache,
         verbose=args.verbose,
         update_atime=args.update_atime,
+        max_retries=getattr(args, "max_retries", 5),
     )
 
     # Test basic TCP connectivity to cluster before proceeding
@@ -9167,6 +9168,25 @@ async def main_async(args):
     if progress:
         progress.final_report()
 
+    # Report directories that could not be read even after retries. A partial crawl
+    # must be loud (always, not only under --verbose) and exit non-zero, so a
+    # rate-limited or error-interrupted run is never mistaken for a complete one.
+    walk_err = getattr(client, "walk_error_count", 0)
+    if walk_err > 0:
+        log_stderr("WARN",
+                   f"INCOMPLETE CRAWL: {walk_err:,} director{'y' if walk_err == 1 else 'ies'} "
+                   f"could not be read after {client.max_retries} retries and were skipped "
+                   f"along with their subtrees. Results are INCOMPLETE.", newline_before=True)
+        shown = client.walk_errors[:10]
+        for e in shown:
+            log_stderr("WARN", f"  unreadable: {e.get('path')}  ({e.get('error')})")
+        if walk_err > len(shown):
+            log_stderr("WARN", f"  ... and {walk_err - len(shown):,} more")
+        log_stderr("HINT",
+                   "Re-run to pick up the missing subtrees, and/or lower --max-concurrent "
+                   "to reduce rate-limiting. Exit code will be non-zero.")
+        args._incomplete_crawl = True
+
     # Add diagnostic timing
     if args.progress or args.verbose:
         if streaming_file_handler:
@@ -11274,6 +11294,15 @@ Examples:
         help=f"Maximum HTTP connections in pool (default: {default_connector_limit})",
     )
     performance.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Retries for a transient read failure (rate-limit 429, transient 5xx, "
+             "connection/timeout) before the directory is reported as failed. "
+             "Uses exponential backoff and honors Retry-After. 0 disables retries "
+             "(default: 5).",
+    )
+    performance.add_argument(
         "--retune",
         action="store_true",
         help="Regenerate tuning profile based on current system",
@@ -11921,6 +11950,11 @@ Examples:
         sys.exit(1)
     finally:
         close_log_file()
+
+    # A crawl that skipped directories after exhausting retries is incomplete;
+    # exit non-zero so scripts and schedulers do not treat it as a clean success.
+    if getattr(args, "_incomplete_crawl", False):
+        sys.exit(2)
 
 
 if __name__ == "__main__":
