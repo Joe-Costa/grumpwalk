@@ -352,14 +352,23 @@ class AsyncQumuloClient:
         """
         for attempt in range(self.max_retries + 1):
             try:
+                delay = None
                 async with session.get(url, params=params, ssl=self.ssl_context) as response:
                     if response.status in RETRYABLE_STATUSES and attempt < self.max_retries:
+                        # Drain the (small) error body so the connection can be
+                        # reused, and compute the delay while headers are available.
+                        # The sleep itself happens OUTSIDE this block so the pooled
+                        # connection is released during backoff - otherwise every
+                        # throttled request would pin a connector slot while asleep.
+                        await response.read()
                         delay = self._retry_delay(response, attempt)
-                        self.retry_count += 1
-                        await asyncio.sleep(delay)
-                        continue
-                    response.raise_for_status()
-                    return await response.json()
+                    else:
+                        response.raise_for_status()
+                        return await response.json()
+                if delay is not None:
+                    self.retry_count += 1
+                    await asyncio.sleep(delay)
+                    continue
             except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
                     asyncio.TimeoutError):
                 if attempt < self.max_retries:
