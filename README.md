@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.4.1** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.5.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -691,11 +691,27 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 ### Performance Options
 - `--max-concurrent N` - Concurrent operations (default: auto-tuned)
 - `--connector-limit N` - HTTP connection pool size (default: auto-tuned)
+- `--max-retries N` - Retries for a transient read failure before a directory is reported as failed (default: 5, `0` disables)
 - `--profile` - Performance profiling for user lookup operations
 - `--retune` - Regenerate auto-tuning profile
 - `--show-tuning` - Display current tuning profile
 - `--tuning-profile {conservative,balanced,aggressive}` - Select tuning profile
 - `--benchmark` - Test optimal concurrency for your cluster
+
+### Rate Limiting and Transient Errors
+
+Clusters, proxies, and busy networks can occasionally refuse a request - a rate
+limit (HTTP 429), a brief server error, or a dropped connection. grumpwalk
+retries these automatically with increasing wait times (honoring the server's
+`Retry-After` when given), so a momentary refusal does not cost you any
+results. `--max-retries` controls how persistent it is.
+
+If a directory still cannot be read after all retries, grumpwalk does not
+pretend the run succeeded: it prints an `INCOMPLETE CRAWL` warning listing the
+affected directories and **exits with code 2**, so scheduled jobs and scripts
+can detect a partial result. This applies to every operation that walks the
+tree - exports, reports, ACL/ACE changes, tagging, move/copy, and snapshot
+search. If you see repeated rate limiting, lower `--max-concurrent` and re-run.
 
 ## Pattern Matching
 
@@ -813,6 +829,7 @@ Suggested settings:
 4. **Combine filters** - More filters = fewer results to process
 5. **Use --limit** for testing before full runs
 6. **Smart skipping** automatically avoids directories that can't match your filters
+7. **If you see rate limiting** (429 warnings or an INCOMPLETE CRAWL report), lower **--max-concurrent** and re-run
 
 ## Architecture
 

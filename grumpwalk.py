@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.4.1"
+__version__ = "3.5.0"
 
 import argparse
 import asyncio
@@ -6324,7 +6324,49 @@ def validate_attribute_args(args):
         sys.exit(1)
 
 
+def report_incomplete_walk(client, args) -> None:
+    """Report directories that no tree walk this run could read even after retries.
+
+    A partial walk must be loud (always, not only under --verbose) and exit
+    non-zero, so a rate-limited or error-interrupted run - in ANY mode that walks
+    the tree (crawl/export, owner report, ACL report/propagation, ACE recursion,
+    tagging, move/copy discovery, snapshot search) - is never mistaken for a
+    complete one. Counters are cumulative across every walk the client performed.
+    """
+    walk_err = getattr(client, "walk_error_count", 0)
+    if walk_err <= 0:
+        return
+    log_stderr("WARN",
+               f"INCOMPLETE CRAWL: {walk_err:,} director{'y' if walk_err == 1 else 'ies'} "
+               f"could not be read after {client.max_retries} retries and were skipped "
+               f"along with their subtrees. Results are INCOMPLETE.", newline_before=True)
+    shown = client.walk_errors[:10]
+    for e in shown:
+        log_stderr("WARN", f"  unreadable: {e.get('path')}  ({e.get('error')})")
+    if walk_err > len(shown):
+        log_stderr("WARN", f"  ... and {walk_err - len(shown):,} more")
+    log_stderr("HINT",
+               "Re-run to pick up the missing subtrees, and/or lower --max-concurrent "
+               "to reduce rate-limiting. Exit code will be non-zero.")
+    args._incomplete_crawl = True
+
+
 async def main_async(args):
+    """Run the selected mode, then report any incomplete tree walk.
+
+    The finally clause runs no matter which mode executed or how it returned
+    (normal return, sys.exit inside the mode, or an exception), so every
+    walk-driven operation gets the incomplete-crawl report and non-zero exit.
+    """
+    try:
+        await _main_async(args)
+    finally:
+        client = getattr(args, "_walk_client", None)
+        if client is not None:
+            report_incomplete_walk(client, args)
+
+
+async def _main_async(args):
     """Main async function."""
     # Backward compatibility: consolidate old propagation flags into unified flag
     if getattr(args, 'propagate_ace_changes', False) or getattr(args, 'propagate_owner_changes', False):
@@ -6414,6 +6456,9 @@ async def main_async(args):
         update_atime=args.update_atime,
         max_retries=getattr(args, "max_retries", 5),
     )
+    # Expose the client to main_async's finally clause so an incomplete walk in
+    # any mode is reported and exits non-zero.
+    args._walk_client = client
 
     # Test basic TCP connectivity to cluster before proceeding
     print("Verifying cluster connection...", file=sys.stderr, end=" ", flush=True)
@@ -9167,25 +9212,6 @@ async def main_async(args):
     # Final progress report
     if progress:
         progress.final_report()
-
-    # Report directories that could not be read even after retries. A partial crawl
-    # must be loud (always, not only under --verbose) and exit non-zero, so a
-    # rate-limited or error-interrupted run is never mistaken for a complete one.
-    walk_err = getattr(client, "walk_error_count", 0)
-    if walk_err > 0:
-        log_stderr("WARN",
-                   f"INCOMPLETE CRAWL: {walk_err:,} director{'y' if walk_err == 1 else 'ies'} "
-                   f"could not be read after {client.max_retries} retries and were skipped "
-                   f"along with their subtrees. Results are INCOMPLETE.", newline_before=True)
-        shown = client.walk_errors[:10]
-        for e in shown:
-            log_stderr("WARN", f"  unreadable: {e.get('path')}  ({e.get('error')})")
-        if walk_err > len(shown):
-            log_stderr("WARN", f"  ... and {walk_err - len(shown):,} more")
-        log_stderr("HINT",
-                   "Re-run to pick up the missing subtrees, and/or lower --max-concurrent "
-                   "to reduce rate-limiting. Exit code will be non-zero.")
-        args._incomplete_crawl = True
 
     # Add diagnostic timing
     if args.progress or args.verbose:

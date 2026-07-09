@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.4.1** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.5.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -2656,6 +2656,36 @@ RAM (GB) ~ (subdirectories / 50000) + (max_concurrent * 0.05) + 0.5
   --progress
 ```
 
+### What happens if the cluster or a proxy rate-limits my crawl?
+
+Nothing is lost. When a request is refused - a rate limit (HTTP 429), a brief
+server error, or a dropped connection - grumpwalk retries it automatically with
+increasing wait times, honoring the server's `Retry-After` when one is given.
+A crawl under rate limiting runs slower but still returns complete results.
+
+`--max-retries` controls how persistent each request is (default: 5 retries;
+`0` disables retrying):
+
+```bash
+# Be extra patient with a heavily loaded cluster or a strict proxy
+./grumpwalk.py --host cluster --path /data --max-retries 8 --progress
+```
+
+If a directory still cannot be read after every retry, grumpwalk tells you
+instead of quietly returning partial results: it prints an `INCOMPLETE CRAWL`
+warning naming the directories it had to skip, and exits with **code 2** so
+scripts and schedulers can catch it. This safety net covers every operation
+that walks the tree - exports, owner and ACL reports, permission changes,
+tagging, move/copy, and snapshot search.
+
+If rate limiting keeps happening, you are sending more requests than the
+cluster (or something between you and it) will accept - lower
+`--max-concurrent` and re-run:
+
+```bash
+./grumpwalk.py --host cluster --path /data --max-concurrent 50 --progress
+```
+
 ---
 
 ## Scripting and Automation
@@ -2674,6 +2704,13 @@ OUTPUT_DIR="/reports"
 ./grumpwalk.py --host $CLUSTER --path /data \
   --progress \
   > "${OUTPUT_DIR}/inventory_${DATE}.ndjson" 2> "${OUTPUT_DIR}/inventory_${DATE}.log"
+
+# Exit code 2 means the crawl was incomplete (some directories could not be
+# read even after retries) - treat the output as partial, don't overwrite a
+# known-good inventory with it
+if [ $? -eq 2 ]; then
+  echo "WARNING: inventory incomplete, see ${OUTPUT_DIR}/inventory_${DATE}.log" >&2
+fi
 
 # Compress older inventories
 find ${OUTPUT_DIR} -name "inventory_*.ndjson" -mtime +7 -exec gzip {} \;

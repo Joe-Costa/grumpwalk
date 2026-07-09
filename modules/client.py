@@ -76,7 +76,9 @@ class AsyncQumuloClient:
         self.retry_count = 0
         # Directories that could not be read even after retries. Populated by the
         # tree walker so a partial crawl is reported loudly instead of exiting 0.
-        # Reset at the start of each walk_tree_async call.
+        # Cumulative across every walk this client performs during the run (modes
+        # like incremental snapshot search walk more than once); reported once at
+        # the end of the run.
         self.walk_error_count = 0
         self.walk_errors: List[dict] = []
 
@@ -1744,10 +1746,6 @@ class AsyncQumuloClient:
         normalized_omit_paths = None
         if omit_paths:
             normalized_omit_paths = set(p.rstrip("/") for p in omit_paths)
-
-        # Reset per-walk error accounting (directories unreadable after retries).
-        self.walk_error_count = 0
-        self.walk_errors = []
 
         # Shared state for collect_results mode
         collected_results = [] if collect_results else None

@@ -5,6 +5,17 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-09
+
+### Fixed
+
+- **Rate limiting no longer silently drops parts of the tree.** When a cluster, proxy, or network refused a directory read - a rate limit (HTTP 429), a brief server error, or a dropped connection - grumpwalk skipped that directory and everything beneath it, mentioned it only under `--verbose`, and still exited 0 reporting success. On a heavily throttled run this could silently lose most of the tree while producing a normal-looking output file. Now grumpwalk retries refused requests automatically with increasing wait times (honoring the server's `Retry-After`), so a rate-limited crawl runs slower but returns complete results. Verified against a billion-file cluster: a crawl that lost 96% of its directories under forced rate limiting now returns 100% with identical output.
+- **A crawl that could not read everything now reports it.** If a directory still cannot be read after every retry, grumpwalk prints an `INCOMPLETE CRAWL` warning naming the skipped directories (always, not just under `--verbose`) and exits with **code 2**, so scheduled jobs and scripts can detect a partial result instead of trusting it. This covers every operation that walks the tree: exports, owner and ACL reports, ACL/ACE changes, tagging, move/copy, and snapshot search.
+
+### Added
+
+- **`--max-retries N`** - How many times a refused read is retried before the directory is reported as failed (default: 5; `0` disables retrying). Increase it for heavily loaded clusters or strict proxies; if rate limiting is frequent, lowering `--max-concurrent` addresses the cause.
+
 ## [3.4.1] - 2026-07-06
 
 ### Fixed
