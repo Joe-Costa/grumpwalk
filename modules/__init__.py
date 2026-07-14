@@ -50,6 +50,7 @@ from .credentials import (
 # Import statistics classes
 from .stats import (
     OwnerStats,
+    DirectoryMatchStats,
 )
 
 # Import async Qumulo API client
@@ -110,6 +111,7 @@ __all__ = [
     "save_identity_cache",
     # Stats
     "OwnerStats",
+    "DirectoryMatchStats",
     # Client
     "AsyncQumuloClient",
     # Filters

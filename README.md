@@ -48,6 +48,7 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Progress tracking** - Real-time statistics with smart skip counters
 - **Multiple output formats** - Plain text, JSON, or CSV
 - **Directory statistics** - Quick aggregate counts without a tree walk (`--stats`)
+- **Per-directory match report** - Count and capacity of files matching your filters, broken down by directory (`--per-directory-matches`)
 - **Directory scope preview** - Shows total subdirs/files before every operation
 - **Owner reports** - Generate storage capacity breakdowns by owner
 - **Permissions reports** - Retrieve permissions ACLs of objects in tree
@@ -244,6 +245,12 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 
 # Directory statistics with one level of subdirectory breakdown
 ./grumpwalk.py --host cluster.example.com --path /data --stats --max-depth 1
+
+# How much data was modified in the last 30 days, per directory (largest first)
+./grumpwalk.py --host cluster.example.com --path /data --modified --newer-than 30 --type file --per-directory-matches --sort size
+
+# Same, but list stale data: files not modified in 180+ days, per directory
+./grumpwalk.py --host cluster.example.com --path /archive --modified --older-than 180 --type file --per-directory-matches --sort size
 ```
 
 ## Output Formats
@@ -368,9 +375,11 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--omit-subdirs PATTERN` - Skip directories (supports glob and paths, repeatable)
 - `--omit-path PATH` - Skip specific absolute path (must start with `/`, repeatable)
 - `--max-entries-per-dir N` - Skip directories exceeding N entries
-- `--stats` - Show directory aggregate statistics (files, subdirectories, total size) and exit. Supports `--max-depth`, `--omit-subdirs`, `--omit-path`, and all output options (`--json`, `--json-out`, `--csv-out`)
-- `--sort {size,count,name}` - Sort `--stats` table output by total size, file count, or path name
+- `--stats` - Show directory aggregate statistics (files, subdirectories, total size) and exit. Reports the whole subtree and ignores per-file filters (time, size, name, type, owner); use `--per-directory-matches` when you need a filtered breakdown. Supports `--max-depth`, `--omit-subdirs`, `--omit-path`, and all output options (`--json`, `--json-out`, `--csv-out`)
+- `--sort {size,count,name}` - Sort `--stats` or `--per-directory-matches` table output by total size, file count, or path name
 - `--show-dir-stats` - Show directory statistics (file/dir counts, sizes)
+- `--per-directory-matches` - Report, per directory, the number of matching files and how much disk capacity they use. Applies all your filters (time, size, name, type, owner) and `--max-depth`. By default it lists the immediate subdirectories of `--path`, each total covering everything beneath it, plus a grand total. Works with `--sort` and with `--csv-out` / `--json-out` / `--json`
+- `--subdir-report` - With `--per-directory-matches`, break the report down to every subdirectory that contains matches, not just the top level. Respects `--max-depth`
 
 ### Symlink Options
 - `--resolve-links` - Show symlink targets as absolute paths

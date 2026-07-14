@@ -378,6 +378,65 @@ Use `--sort` to order the table by size, file count, or name:
 ./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --sort name
 ```
 
+### How do I get counts and capacity for only the files that match my filters?
+
+`--stats` is fast because it reads the cluster's aggregate totals for the whole
+subtree -- but that means it ignores your filters. `--stats --modified-newer-than 30`
+returns the same numbers as a plain `--stats`.
+
+When you want a per-directory breakdown of a **filtered** set of files -- "how much
+data was modified in the last 30 days," "how many stale files are in each project" --
+use `--per-directory-matches`. It walks the tree, applies all your filters (time,
+size, name, type, owner), and reports the number of matching files and the disk
+capacity they use, one row per directory. The capacity column is actual space used
+on disk, so sparse files and small-file overhead are counted correctly.
+
+```bash
+# How much data was modified in the last 30 days, per directory, largest first
+./grumpwalk.py --host cluster --path /data \
+  --modified --newer-than 30 --type file \
+  --per-directory-matches --sort size
+```
+
+**Sample output:**
+```
+======================================================================
+Per-directory match report (immediate children of --path)
+======================================================================
+Path             Files   Capacity
+---------------  -----  ---------
+/data/active       842     4.66 GB
+/data/incoming     311   954.30 MB
+/data/scratch       57    12.40 MB
+---------------  -----  ---------
+TOTAL            1,210     5.61 GB
+```
+
+Each directory total covers everything beneath it, and the `TOTAL` line is the
+whole matching set. By default you get one row per immediate subdirectory of
+`--path`. To break it all the way down to every subdirectory that contains
+matches, add `--subdir-report` (it honors `--max-depth` if you want to cap how
+deep it goes):
+
+```bash
+# Full breakdown, every subdirectory with matches, capped at 3 levels deep
+./grumpwalk.py --host cluster --path /data \
+  --modified --newer-than 30 --type file \
+  --per-directory-matches --subdir-report --max-depth 3
+```
+
+Export works the same as everything else -- `--csv-out`, `--json-out`, or `--json`:
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --modified --newer-than 30 --type file \
+  --per-directory-matches --csv-out modified_30d.csv
+```
+
+The CSV and JSON include a `depth` column and a `depth=0` row for the grand total.
+Because a directory's numbers include its subdirectories, filter on the `depth`
+column rather than summing every row.
+
 ---
 
 ## Storage Capacity Planning
@@ -420,13 +479,11 @@ TOTAL                                               268,789    4,467     2.67 TB
   --json-out cold_data_90days.json
 ```
 
-**Summarize cold data by directory:**
+**Summarize cold data by directory (which directories hold the most cold data):**
 ```bash
 ./grumpwalk.py --host cluster --path /projects \
-  --accessed --older-than 180 \
-  --json --all-attributes \
-  --type file | \
-  jq -r '.path | split("/")[1:4] | join("/")' | sort | uniq -c | sort -rn | head -20
+  --accessed --older-than 180 --type file \
+  --per-directory-matches --sort size
 ```
 
 **Find large cold files (candidates for archival):**
@@ -458,9 +515,18 @@ TOTAL                                               268,789    4,467     2.67 TB
 
 ### How do I find directories consuming the most space?
 
+For total space (all files), use directory statistics:
 ```bash
 ./grumpwalk.py --host cluster --path /data \
   --show-dir-stats --max-depth 2 --progress
+```
+
+For space used only by files matching a filter (e.g. large old files), use the
+per-directory match report:
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --larger-than 1GB --modified --older-than 365 --type file \
+  --per-directory-matches --sort size
 ```
 
 ---

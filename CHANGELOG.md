@@ -5,6 +5,17 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.0] - 2026-07-13
+
+### Added
+
+- **`--per-directory-matches` (per-directory match report)** - Reports, one row per directory, the number of files matching your filters and the disk capacity they use. Unlike `--stats` - which reads the cluster's whole-subtree aggregate totals and therefore ignores per-file filters - this walks the tree and applies every universal filter (time, size, name, type, owner) and `--max-depth`, so it answers questions like "how much data was modified in the last 30 days, per directory" or "which directories hold the most stale data." Each directory total is a rollup of everything beneath it; the default output lists the immediate subdirectories of `--path` plus a grand total. The capacity column is actual space used on disk (allocated blocks), so sparse files and small-file overhead are counted correctly. Sort with `--sort size|count|name`, and export with `--csv-out` / `--json-out` / `--json` (which add a `depth` column and a `depth=0` grand-total row).
+- **`--subdir-report`** - With `--per-directory-matches`, expands the report from the immediate children of `--path` to every subdirectory that contains matches. Respects `--max-depth`.
+
+### Fixed
+
+- **Per-file filters combined with `--stats` no longer look like they worked.** `--stats` reads whole-subtree aggregate counts from the cluster and cannot apply per-file filters, so a command like `--stats --modified-newer-than 30` returned the totals for every file, not the filtered subset - and `--modified-older-than` and `--modified-newer-than` returned identical results. For a filtered per-directory breakdown, use the new `--per-directory-matches`.
+
 ## [3.5.0] - 2026-07-09
 
 ### Fixed

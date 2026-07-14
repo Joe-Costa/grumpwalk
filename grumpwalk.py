@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 
 import argparse
 import asyncio
@@ -59,6 +59,7 @@ from modules import (
     load_identity_cache,
     save_identity_cache,
     OwnerStats,
+    DirectoryMatchStats,
     AsyncQumuloClient,
     resolve_owner_filters,
     glob_to_regex,
@@ -6181,6 +6182,102 @@ async def generate_owner_report(
     print("=" * 80, file=sys.stderr)
 
 
+def render_directory_match_report(dir_stats, args, elapsed):
+    """Render the --per-directory-matches report.
+
+    Prints an aligned table to stderr (with a grand-total footer) and, when
+    requested, writes machine-readable output via --json (stdout),
+    --json-out, or --csv-out. Machine output includes a depth=0 row for the
+    grand total; directory rows are recursive rollups (a parent's totals
+    include its descendants), so do not sum capacity across depths -- filter
+    by the depth column instead.
+
+    Args:
+        dir_stats: A populated DirectoryMatchStats instance.
+        args: Parsed CLI arguments.
+        elapsed: Wall-clock seconds spent walking, for the summary line.
+    """
+    rows = dir_stats.rows(subdir_report=args.subdir_report)
+
+    # Sort: --sort size/count for admins hunting the biggest offenders,
+    # otherwise (name or unset) alphabetical by path for a stable du-like view.
+    if args.sort == "size":
+        rows.sort(key=lambda r: r["capacity"], reverse=True)
+    elif args.sort == "count":
+        rows.sort(key=lambda r: r["files"], reverse=True)
+    else:
+        rows.sort(key=lambda r: r["path"])
+
+    scope = (
+        "all subdirectories with matches"
+        if args.subdir_report
+        else "immediate children of --path"
+    )
+    print("=" * 70, file=sys.stderr)
+    print(f"Per-directory match report ({scope})", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+
+    if dir_stats.total_files == 0:
+        print("No matching objects found", file=sys.stderr)
+    else:
+        display = [
+            (r["path"], f"{r['files']:,}", format_bytes(r["capacity"]))
+            for r in rows
+        ]
+        headers = ("Path", "Files", "Capacity")
+        col_widths = [len(h) for h in headers]
+        for row in display:
+            for i, val in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(val))
+
+        fmt = f"{{:<{col_widths[0]}}}  {{:>{col_widths[1]}}}  {{:>{col_widths[2]}}}"
+        print(fmt.format(*headers), file=sys.stderr)
+        print(fmt.format(
+            "-" * col_widths[0], "-" * col_widths[1], "-" * col_widths[2],
+        ), file=sys.stderr)
+        for row in display:
+            print(fmt.format(*row), file=sys.stderr)
+        print(fmt.format(
+            "-" * col_widths[0], "-" * col_widths[1], "-" * col_widths[2],
+        ), file=sys.stderr)
+        print(fmt.format(
+            "TOTAL",
+            f"{dir_stats.total_files:,}",
+            format_bytes(dir_stats.total_capacity),
+        ), file=sys.stderr)
+
+    rate = dir_stats.total_files / elapsed if elapsed > 0 else 0
+    print(f"\nProcessing time: {elapsed:.2f}s ({rate:,.0f} obj/sec)", file=sys.stderr)
+
+    # Machine-readable output: display rows plus a depth=0 grand-total row.
+    machine_rows = [dict(r) for r in rows]
+    machine_rows.append({
+        "path": dir_stats.root,
+        "files": dir_stats.total_files,
+        "capacity": dir_stats.total_capacity,
+        "depth": 0,
+    })
+
+    if args.json:
+        json_parser.dump(machine_rows, sys.stdout, indent=2)
+        print()
+
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json_parser.dump(machine_rows, f, indent=2)
+        log_stderr("INFO", f"Wrote {len(machine_rows)} rows to {args.json_out}")
+
+    if args.csv_out:
+        import csv
+        with open(args.csv_out, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["path", "files", "capacity", "depth"]
+            )
+            writer.writeheader()
+            writer.writerows(machine_rows)
+        log_stderr("INFO", f"Wrote {len(machine_rows)} rows to {args.csv_out}")
+
+
 def validate_attribute_args(args):
     """
     Validate --find-attribute-* and --set-attribute-* arguments.
@@ -9011,6 +9108,44 @@ async def _main_async(args):
         else None
     )
 
+    # Per-directory match report mode: walk with the filters, aggregate matches
+    # per directory (recursive rollup, on-disk capacity), and report. Terminal
+    # mode -- returns without the standard streaming output.
+    if args.per_directory_matches:
+        dir_stats = DirectoryMatchStats(args.path)
+
+        async def per_directory_callback(entry):
+            dir_stats.add(entry)
+            if progress:
+                await progress.increment_output()
+
+        pdm_start = time.time()
+        async with client.create_session() as session:
+            await client.walk_tree_async(
+                session,
+                args.path,
+                args.max_depth,
+                progress=progress,
+                file_filter=file_filter,
+                omit_subdirs=args.omit_subdirs,
+                omit_paths=args.omit_path,
+                collect_results=False,
+                verbose=args.verbose,
+                max_entries_per_dir=args.max_entries_per_dir,
+                time_filter_info=time_filter_info,
+                size_filter_info=size_filter_info,
+                owner_filter_info=owner_filter_info,
+                output_callback=per_directory_callback,
+            )
+        pdm_elapsed = time.time() - pdm_start
+
+        if progress:
+            progress.final_report()
+
+        render_directory_match_report(dir_stats, args, pdm_elapsed)
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return
+
     # Create owner stats tracker if owner-report enabled
     # Use capacity-based calculation (actual disk usage) by default to handle sparse files correctly
     owner_stats = (
@@ -11263,6 +11398,25 @@ Examples:
         action="store_true",
         help="Show directory statistics only (no file enumeration)",
     )
+    exploration.add_argument(
+        "--per-directory-matches",
+        action="store_true",
+        help="Walk the tree with the given filters and report, per directory, "
+             "the count and on-disk capacity of MATCHING objects (unlike --stats, "
+             "which reports raw whole-subtree aggregates and ignores filters). "
+             "Each directory total is a recursive rollup of its subtree (du -d1 "
+             "style: immediate children of --path). Honors all universal filters "
+             "(time, size, name, type, owner) and --max-depth. Works with "
+             "--csv-out / --json-out / --json; sort with --sort.",
+    )
+    exploration.add_argument(
+        "--subdir-report",
+        action="store_true",
+        help="With --per-directory-matches, expand the report to every "
+             "subdirectory that contains matches at every depth reached by the "
+             "walk (du style), not just the immediate children of --path. "
+             "Respects --max-depth.",
+    )
 
     # ============================================================================
     # FEATURE: SYMLINK RESOLUTION
@@ -11776,9 +11930,60 @@ Examples:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if not args.stats:
+        if not args.stats and not args.per_directory_matches:
             print(
-                "Error: --sort requires --stats",
+                "Error: --sort requires --stats or --per-directory-matches",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # --subdir-report only applies to --per-directory-matches
+    if args.subdir_report and not args.per_directory_matches:
+        print(
+            "Error: --subdir-report requires --per-directory-matches",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Check --per-directory-matches conflicts with other operational modes.
+    # Like --stats it is a terminal report mode: it walks with the filters and
+    # emits an aggregate, so it cannot share the run with a mutating operation
+    # or another report mode.
+    if args.per_directory_matches:
+        conflicting = []
+        if args.stats:
+            conflicting.append("--stats")
+        if args.show_dir_stats:
+            conflicting.append("--show-dir-stats")
+        if args.owner_report:
+            conflicting.append("--owner-report")
+        if args.acl_report:
+            conflicting.append("--acl-report")
+        if args.source_acl or args.source_acl_file or args.acl_target:
+            conflicting.append("--source-acl/--acl-target")
+        if args.add_tag or args.find_tag or args.remove_tag:
+            conflicting.append("--add-tag/--find-tag/--remove-tag")
+        if getattr(args, 'ace_restore', None):
+            conflicting.append("--ace-restore")
+        if args.change_owner or args.change_group or args.change_owners_file or args.change_groups_file:
+            conflicting.append("--change-owner/--change-group")
+        if getattr(args, 'set_attribute_true', None) or getattr(args, 'set_attribute_false', None):
+            conflicting.append("--set-attribute-true/--set-attribute-false")
+        if getattr(args, 'find_similar', None):
+            conflicting.append("--find-similar")
+        if getattr(args, 'benchmark', None):
+            conflicting.append("--benchmark")
+        if getattr(args, 'remove_aces', None) or getattr(args, 'add_aces', None) or getattr(args, 'replace_aces', None):
+            conflicting.append("--add-ace/--remove-ace/--replace-ace")
+        if args.move_to or args.rename_to or args.copy_to:
+            conflicting.append("--move-to/--copy-to/--rename-to")
+        if getattr(args, 'restore_in_place', None) or getattr(args, 'revert', None):
+            conflicting.append("--restore-in-place/--revert")
+        if args.show_details or args.fields:
+            conflicting.append("--show-details/--fields")
+        if conflicting:
+            print(
+                f"Error: --per-directory-matches cannot be combined with {', '.join(conflicting)}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -11798,6 +12003,8 @@ Examples:
             conflicting.append("--set-attribute-true/--set-attribute-false")
         if args.show_dir_stats:
             conflicting.append("--show-dir-stats")
+        if args.per_directory_matches:
+            conflicting.append("--per-directory-matches")
         if args.owner_report:
             conflicting.append("--owner-report")
         if args.acl_report:
