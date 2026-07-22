@@ -8,7 +8,6 @@ the Qumulo REST API using async/await patterns.
 import asyncio
 import base64
 import copy
-import fnmatch
 import json
 import random
 import ssl
@@ -35,6 +34,7 @@ from .utils import (
 )
 from .stats import OwnerStats
 from .output import ProgressTracker
+from .filters import omit_matches
 
 # Minimum Qumulo Core version that supports the skip-atime-update query
 # parameter on read endpoints (entries/, data, streams data).
@@ -1747,6 +1747,28 @@ class AsyncQumuloClient:
         if omit_paths:
             normalized_omit_paths = set(p.rstrip("/") for p in omit_paths)
 
+        # An omitted directory must not be reported either, not just skipped. Fold
+        # that into the entry filter so it holds however entries leave the walk --
+        # streamed out one at a time, or collected and returned. The subdirectory
+        # pruning further down controls DESCENT; this controls OUTPUT, and both have
+        # to agree. Only directory entries can be omitted, so files never pay for it.
+        if omit_subdirs or normalized_omit_paths:
+            inner_filter = file_filter
+
+            def omit_aware_filter(entry: dict) -> bool:
+                if entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
+                    entry_path = entry.get("path", "")
+                    stripped = entry_path.rstrip("/")
+                    if normalized_omit_paths and stripped in normalized_omit_paths:
+                        return False
+                    if omit_subdirs:
+                        name = stripped.split("/")[-1] if "/" in stripped else stripped
+                        if omit_matches(omit_subdirs, entry_path, name):
+                            return False
+                return inner_filter(entry) if inner_filter else True
+
+            file_filter = omit_aware_filter
+
         # Shared state for collect_results mode
         collected_results = [] if collect_results else None
         results_lock = asyncio.Lock()
@@ -1900,13 +1922,7 @@ class AsyncQumuloClient:
                         subdir_path.rstrip("/").split("/")[-1]
                         if "/" in subdir_path else subdir_path
                     )
-                    should_omit = False
-                    for pattern in omit_subdirs:
-                        normalized_pattern = pattern.rstrip("/")
-                        if (fnmatch.fnmatch(subdir_path.rstrip("/"), normalized_pattern) or
-                                fnmatch.fnmatch(subdir_name, normalized_pattern)):
-                            should_omit = True
-                            break
+                    should_omit = omit_matches(omit_subdirs, subdir_path, subdir_name)
                     if should_omit:
                         omitted_dirs_count += 1
                     else:
@@ -1916,30 +1932,6 @@ class AsyncQumuloClient:
 
                 if progress and omitted_dirs_count > 0:
                     await progress.increment_skipped(0, omitted_dirs_count)
-
-                # Filter matching_entries for omitted directories
-                if collect_results:
-                    filtered_entries = []
-                    for entry in matching_entries:
-                        entry_path = entry.get('path', '')
-                        entry_type = entry.get('type', '')
-                        if entry_type == 'FS_FILE_TYPE_DIRECTORY':
-                            entry_name = (
-                                entry_path.rstrip("/").split("/")[-1]
-                                if "/" in entry_path else entry_path
-                            )
-                            should_omit = False
-                            for pattern in omit_subdirs:
-                                normalized_pattern = pattern.rstrip("/")
-                                if (fnmatch.fnmatch(entry_path.rstrip("/"), normalized_pattern) or
-                                        fnmatch.fnmatch(entry_name, normalized_pattern)):
-                                    should_omit = True
-                                    break
-                            if not should_omit:
-                                filtered_entries.append(entry)
-                        else:
-                            filtered_entries.append(entry)
-                    matching_entries = filtered_entries
 
             # Filter based on exact absolute paths (--omit-path)
             if normalized_omit_paths:
@@ -1956,12 +1948,6 @@ class AsyncQumuloClient:
 
                 if progress and omitted_paths_count > 0:
                     await progress.increment_skipped(0, omitted_paths_count)
-
-                if collect_results:
-                    matching_entries = [
-                        e for e in matching_entries
-                        if e.get('path', '').rstrip("/") not in normalized_omit_paths
-                    ]
 
             # Update progress for batch mode
             try:
@@ -2274,6 +2260,8 @@ class AsyncQumuloClient:
         path: str,
         max_depth: int = 1,
         current_depth: int = 0,
+        omit_subdirs: Optional[List[str]] = None,
+        omit_paths: Optional[List[str]] = None,
     ) -> None:
         """
         Display directory statistics without enumerating entries.
@@ -2284,6 +2272,8 @@ class AsyncQumuloClient:
             path: Directory path
             max_depth: Maximum depth to display (default: 1)
             current_depth: Current recursion depth
+            omit_subdirs: Optional patterns for subdirectory names/paths to skip
+            omit_paths: Optional exact absolute paths to skip (no wildcards)
         """
         # Get aggregates
         aggregates = await self.get_directory_aggregates(session, path)
@@ -2341,11 +2331,21 @@ class AsyncQumuloClient:
             # This avoids loading millions of file entries into memory just to
             # filter them down to a handful of directories.
             subdirs = []
+            normalized_omit_paths = (
+                {p.rstrip("/") for p in omit_paths} if omit_paths else set()
+            )
 
             async def extract_subdirs(page):
                 for entry in page:
-                    if entry.get("type") == "FS_FILE_TYPE_DIRECTORY":
-                        subdirs.append(entry["path"])
+                    if entry.get("type") != "FS_FILE_TYPE_DIRECTORY":
+                        continue
+                    subdir_path = entry["path"]
+                    subdir_name = subdir_path.rstrip("/").split("/")[-1]
+                    if subdir_path.rstrip("/") in normalized_omit_paths:
+                        continue
+                    if omit_matches(omit_subdirs, subdir_path, subdir_name):
+                        continue
+                    subdirs.append(subdir_path)
 
             try:
                 await self.enumerate_directory_streaming(
@@ -2361,7 +2361,8 @@ class AsyncQumuloClient:
 
             for subdir_path in subdirs:
                 await self.show_directory_stats(
-                    session, subdir_path, max_depth, current_depth + 1
+                    session, subdir_path, max_depth, current_depth + 1,
+                    omit_subdirs=omit_subdirs, omit_paths=omit_paths,
                 )
 
     async def expand_identity(

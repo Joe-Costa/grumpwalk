@@ -197,7 +197,26 @@ async def resolve_owner_filters(
     return all_auth_ids
 
 
-def glob_to_regex(pattern: str) -> str:
+# Characters that mean something different in a regex than in a shell glob.
+# Used both to auto-detect regex intent and to spot ambiguous patterns.
+REGEX_SPECIFIC_CHARS = {'^', '$', '.', '+', '(', ')', '|', '{', '}', '\\'}
+
+# Pattern interpretation modes, selected globally by --regex / --glob.
+PATTERN_MODE_AUTO = "auto"
+PATTERN_MODE_REGEX = "regex"
+PATTERN_MODE_GLOB = "glob"
+
+
+def resolve_pattern_mode(args) -> str:
+    """Return the pattern interpretation mode selected by --regex / --glob."""
+    if getattr(args, "force_regex", False):
+        return PATTERN_MODE_REGEX
+    if getattr(args, "force_glob", False):
+        return PATTERN_MODE_GLOB
+    return PATTERN_MODE_AUTO
+
+
+def glob_to_regex(pattern: str, mode: str = PATTERN_MODE_AUTO) -> str:
     """
     Convert a glob pattern to a regex pattern.
     Supports common glob wildcards: *, ?, [seq], [!seq]
@@ -210,13 +229,18 @@ def glob_to_regex(pattern: str) -> str:
 
     Args:
         pattern: Glob or regex pattern
+        mode: PATTERN_MODE_AUTO detects which one was meant (the default, and
+            grumpwalk's historical behavior); PATTERN_MODE_REGEX and
+            PATTERN_MODE_GLOB skip detection and read every pattern the one way,
+            as selected by --regex / --glob.
 
     Returns:
         Regex pattern string
     """
-    # Check if this looks like a regex pattern (contains regex-specific chars)
-    # that aren't also glob chars. If so, assume it's already regex.
-    regex_specific_chars = {'^', '$', '.', '+', '(', ')', '|', '{', '}', '\\'}
+    if mode == PATTERN_MODE_REGEX:
+        return pattern
+    if mode == PATTERN_MODE_GLOB:
+        return r"\A" + fnmatch.translate(pattern)
 
     # If pattern starts with common regex anchors or contains regex-specific syntax,
     # treat it as regex
@@ -224,7 +248,7 @@ def glob_to_regex(pattern: str) -> str:
         return pattern
 
     # Check for regex-specific characters (excluding those used in globs)
-    has_regex_chars = any(char in pattern for char in regex_specific_chars)
+    has_regex_chars = any(char in pattern for char in REGEX_SPECIFIC_CHARS)
 
     # If it has regex chars, try to compile it as regex first
     if has_regex_chars:
@@ -243,6 +267,96 @@ def glob_to_regex(pattern: str) -> str:
     # standard shell-glob semantics. User-written regexes (returned above,
     # unanchored) keep their re.search behavior.
     return r"\A" + fnmatch.translate(pattern)
+
+
+def pattern_is_ambiguous(pattern: str) -> bool:
+    """
+    Return True if auto-detection reads this pattern as a regex when a shell
+    glob would have been a reasonable reading too, and the two disagree.
+
+    Only these patterns can surprise a user: they carry no explicit ^/$ anchor,
+    so nothing signals regex intent, yet they compile as one. '.*' is the
+    canonical case - as a regex it matches every name, as a glob it means "starts
+    with a period". Patterns that cannot compile as a regex ('*.log') or that are
+    explicitly anchored ('^[0-9]') have exactly one sensible reading, so they are
+    never ambiguous.
+    """
+    if pattern.startswith('^') or pattern.endswith('$'):
+        return False
+    if not any(char in pattern for char in REGEX_SPECIFIC_CHARS):
+        return False
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
+def warn_if_ambiguous(patterns: Optional[List[str]], mode: str, flag: str) -> None:
+    """Warn once per ambiguous pattern that auto-detection had to guess.
+
+    Silent when --regex or --glob was given: the user already said which they
+    meant, so there is nothing to guess and nothing to warn about.
+    """
+    if not patterns or mode != PATTERN_MODE_AUTO:
+        return
+    for pattern in patterns:
+        if pattern_is_ambiguous(pattern):
+            log_stderr(
+                "WARN",
+                f"{flag} pattern '{pattern}' is ambiguous: it was read as a REGEX "
+                "(unanchored, so '.' matches any character and the pattern may match "
+                "part of a name). As a shell glob it would mean something different "
+                "('.' would be a literal period and the match would cover the whole "
+                "name). Pass --regex or --glob to say which you meant and silence "
+                "this warning.",
+            )
+
+
+class OmitPatterns(list):
+    """--omit-subdirs patterns plus the mode they should be matched with.
+
+    A list subclass so every existing call site can keep passing it around as the
+    plain list of strings it used to be. Directory omission has always been glob
+    matching, and stays glob under auto-detection - reading '--omit-subdirs .*'
+    as a regex would silently prune the entire tree. Only an explicit --regex
+    switches it.
+    """
+
+    def __init__(self, patterns: Optional[List[str]] = None,
+                 mode: str = PATTERN_MODE_AUTO):
+        super().__init__(patterns or [])
+        self.mode = mode
+        self._regexes: Optional[List["re.Pattern"]] = None
+        if mode == PATTERN_MODE_REGEX:
+            self._regexes = []
+            for pattern in self:
+                try:
+                    self._regexes.append(re.compile(pattern.rstrip("/")))
+                except re.error as e:
+                    log_stderr("ERROR", f"Invalid --omit-subdirs regex '{pattern}': {e}")
+                    sys.exit(1)
+
+    def matches(self, path: str, name: str) -> bool:
+        """True if this directory should be omitted, by full path or by name."""
+        if self._regexes is not None:
+            stripped = path.rstrip("/")
+            return any(r.search(stripped) or r.search(name) for r in self._regexes)
+        for pattern in self:
+            normalized = pattern.rstrip("/")
+            if (fnmatch.fnmatch(path.rstrip("/"), normalized)
+                    or fnmatch.fnmatch(name, normalized)):
+                return True
+        return False
+
+
+def omit_matches(patterns, path: str, name: str) -> bool:
+    """Match against --omit-subdirs patterns, accepting a plain list of globs."""
+    if patterns is None:
+        return False
+    if isinstance(patterns, OmitPatterns):
+        return patterns.matches(path, name)
+    return OmitPatterns(patterns).matches(path, name)
 
 
 def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
@@ -332,31 +446,32 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
     # Determine time field
     time_field = args.time_field
 
-    # Compile name patterns (OR logic)
-    name_patterns_or = []
-    if args.name_patterns:
-        regex_flags = 0 if args.name_case_sensitive else re.IGNORECASE
-        for pattern in args.name_patterns:
-            try:
-                # Convert glob to regex if needed
-                regex_pattern = glob_to_regex(pattern)
-                name_patterns_or.append(re.compile(regex_pattern, regex_flags))
-            except re.error as e:
-                log_stderr("ERROR", f"Invalid pattern '{pattern}': {e}")
-                sys.exit(1)
+    # Compile name patterns. --regex / --glob decide how every pattern is read;
+    # by default each one is auto-detected as a glob or a regex.
+    pattern_mode = resolve_pattern_mode(args)
+    regex_flags = 0 if args.name_case_sensitive else re.IGNORECASE
 
-    # Compile name patterns (AND logic)
-    name_patterns_and = []
-    if args.name_patterns_and:
-        regex_flags = 0 if args.name_case_sensitive else re.IGNORECASE
-        for pattern in args.name_patterns_and:
+    def compile_name_patterns(patterns, flag: str) -> List["re.Pattern"]:
+        warn_if_ambiguous(patterns, pattern_mode, flag)
+        compiled = []
+        for pattern in patterns or []:
             try:
-                # Convert glob to regex if needed
-                regex_pattern = glob_to_regex(pattern)
-                name_patterns_and.append(re.compile(regex_pattern, regex_flags))
+                compiled.append(
+                    re.compile(glob_to_regex(pattern, pattern_mode), regex_flags)
+                )
             except re.error as e:
                 log_stderr("ERROR", f"Invalid pattern '{pattern}': {e}")
                 sys.exit(1)
+        return compiled
+
+    # OR logic - any pattern can match
+    name_patterns_or = compile_name_patterns(args.name_patterns, "--name")
+    # AND logic - all patterns must match
+    name_patterns_and = compile_name_patterns(args.name_patterns_and, "--name-and")
+    # Exclusion - matching any pattern rejects the entry
+    name_patterns_not = compile_name_patterns(
+        getattr(args, "name_patterns_not", None), "--not-name"
+    )
 
     # Extended attribute filters
     find_attr_true = getattr(args, 'find_attribute_true_parsed', None)
@@ -384,24 +499,28 @@ def create_file_filter(args, owner_auth_ids: Optional[Set[str]] = None):
         if target_type and entry.get("type") != target_type:
             return False
 
-        # Name pattern filters (OR logic - any pattern can match)
-        if name_patterns_or:
-            # Extract basename from path
+        # Name pattern filters. All three match against the basename, never the
+        # full path, so --not-name excludes an object by its own name and does
+        # not exclude the contents of a directory it matched (use
+        # --omit-subdirs for that).
+        if name_patterns_or or name_patterns_and or name_patterns_not:
             path = entry.get("path", "")
             name = path.rstrip('/').split('/')[-1] if '/' in path else path
 
-            # Check if any pattern matches
-            if not any(pattern.search(name) for pattern in name_patterns_or):
+            # Exclusion first: matching any --not-name pattern rejects the entry
+            if any(pattern.search(name) for pattern in name_patterns_not):
                 return False
 
-        # Name pattern filters (AND logic - all patterns must match)
-        if name_patterns_and:
-            # Extract basename from path
-            path = entry.get("path", "")
-            name = path.rstrip('/').split('/')[-1] if '/' in path else path
+            # OR logic - any pattern can match
+            if name_patterns_or and not any(
+                pattern.search(name) for pattern in name_patterns_or
+            ):
+                return False
 
-            # Check if all patterns match
-            if not all(pattern.search(name) for pattern in name_patterns_and):
+            # AND logic - all patterns must match
+            if name_patterns_and and not all(
+                pattern.search(name) for pattern in name_patterns_and
+            ):
                 return False
 
         # File-only filter (deprecated - use --type file instead)

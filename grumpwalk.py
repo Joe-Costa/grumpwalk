@@ -8,12 +8,11 @@ Usage:
 
 """
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 import argparse
 import asyncio
 import copy
-import fnmatch
 import json
 import os
 import re
@@ -63,6 +62,9 @@ from modules import (
     AsyncQumuloClient,
     resolve_owner_filters,
     glob_to_regex,
+    resolve_pattern_mode,
+    OmitPatterns,
+    omit_matches,
     create_file_filter,
     FINDABLE_ATTRIBUTES,
     SETTABLE_ATTRIBUTES,
@@ -1902,10 +1904,7 @@ async def collect_stats(
 
                 if subdir_path.rstrip("/") in normalized_omit_paths:
                     continue
-                if omit_subdirs and any(
-                    fnmatch.fnmatch(subdir_name, pat.rstrip("/"))
-                    for pat in omit_subdirs
-                ):
+                if omit_matches(omit_subdirs, subdir_path, subdir_name):
                     continue
                 subdirs.append(subdir_path)
 
@@ -9038,7 +9037,10 @@ async def _main_async(args):
         depth = args.max_depth if args.max_depth else 1
 
         async with client.create_session() as session:
-            await client.show_directory_stats(session, args.path, max_depth=depth)
+            await client.show_directory_stats(
+                session, args.path, max_depth=depth,
+                omit_subdirs=args.omit_subdirs, omit_paths=args.omit_path,
+            )
 
         elapsed = time.time() - start_time
         print(f"\n{'=' * 70}", file=sys.stderr)
@@ -10281,7 +10283,7 @@ Examples:
   ./grumpwalk.py --host cluster.example.com --path /backups --name-and '*backup*' --name-and '*2024*'
 
   # Find all Python test files (glob pattern)
-  ./grumpwalk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+  ./grumpwalk.py --host cluster.example.com --path /code --glob --name 'test_*.py' --type file
 
   # Find all directories starting with "temp" (regex pattern)
   ./grumpwalk.py --host cluster.example.com --path /data --name '^temp.*' --type directory
@@ -10465,9 +10467,36 @@ Examples:
              "Example: --name-and '*backup*' --name-and '*2024*'",
     )
     name_filters.add_argument(
+        "--not-name",
+        action="append",
+        dest="name_patterns_not",
+        help="Exclude objects whose name matches this pattern (supports glob wildcards "
+             "and regex, repeatable to exclude several). Matches the object's own name, "
+             "not its path, so it does not prune a directory's contents - use "
+             "--omit-subdirs for that. Example: --glob --not-name '.*' skips dotfiles",
+    )
+    name_filters.add_argument(
         "--name-case-sensitive",
         action="store_true",
         help="Make name pattern matching case-sensitive (default: case-insensitive)",
+    )
+
+    pattern_mode = name_filters.add_mutually_exclusive_group()
+    pattern_mode.add_argument(
+        "--regex",
+        action="store_true",
+        dest="force_regex",
+        help="Read every pattern argument (--name, --name-and, --not-name, "
+             "--omit-subdirs) as a regular expression instead of auto-detecting. "
+             "Regexes are unanchored: anchor with ^/$ yourself",
+    )
+    pattern_mode.add_argument(
+        "--glob",
+        action="store_true",
+        dest="force_glob",
+        help="Read every pattern argument as a shell glob instead of auto-detecting, "
+             "so '.' and '+' are literal characters and the match covers the whole "
+             "name. Example: --glob --not-name '.*' skips dotfiles",
     )
     name_filters.add_argument(
         "--type",
@@ -11510,6 +11539,12 @@ Examples:
 
     args = parser.parse_args()
 
+    # Bind --omit-subdirs to the pattern mode chosen by --regex / --glob. Wrapped
+    # in place so the many call sites that pass args.omit_subdirs around keep
+    # working: OmitPatterns is a list of the same strings, carrying its own
+    # matcher. Directory omission stays glob under auto-detection.
+    args.omit_subdirs = OmitPatterns(args.omit_subdirs, resolve_pattern_mode(args))
+
     # Validate arguments
     # Check that either --path OR (--source-acl/--source-acl-file + --acl-target) are provided.
     # Snapshot modes supply their own root: --list-snapshots needs no path,
@@ -11774,6 +11809,18 @@ Examples:
     copy_mode = bool(args.copy_to)
     # --rename-to alone (no --copy-to) is handled by the move/rename driver.
     move_rename_mode = bool(args.move_to or args.rename_to) and not copy_mode
+
+    # A '*'/'?' --rename-to template fills its wildcards from the --name GLOBS it
+    # matched, so it has nothing to read under --regex. The brace form carries its
+    # own match side and works in either mode.
+    if (args.rename_to and getattr(args, "force_regex", False)
+            and not args.rename_to.startswith("{")
+            and any(c in args.rename_to for c in "*?")):
+        print("Error: a --rename-to template using '*'/'?' takes those wildcards from "
+              "the --name glob it matched, which --regex turns off. Use the "
+              "{old|new} substitution form instead, or drop --regex.",
+              file=sys.stderr)
+        sys.exit(1)
 
     def _transfer_conflicts(label):
         conflicts = []
