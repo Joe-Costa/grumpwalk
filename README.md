@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.6.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.7.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -196,7 +196,10 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 ./grumpwalk.py --host cluster.example.com --path /var --name '*.log' --larger-than 100MB --progress
 
 # Search for Python test files
-./grumpwalk.py --host cluster.example.com --path /code --name 'test_*.py' --type file
+./grumpwalk.py --host cluster.example.com --path /code --glob --name 'test_*.py' --type file
+
+# Find files older than 90 days, skipping hidden files
+./grumpwalk.py --host cluster.example.com --path /data --older-than 90 --glob --not-name '.*'
 
 # Find symlinks and show their targets
 ./grumpwalk.py --host cluster.example.com --path /home --type symlink --resolve-links
@@ -334,9 +337,19 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 ### Name/Type Filters
 - `--name PATTERN` - Match by name (glob/regex, OR logic, repeatable)
 - `--name-and PATTERN` - Match by name (AND logic, repeatable)
+- `--not-name PATTERN` - Exclude by name (repeatable; excluded if it matches any pattern). Tests each object's own name, not its path, and applies to directories as well as files: `--not-name '.*'` drops the `.git` directory itself, but the ordinary-named files inside it are still reported - add `--omit-subdirs` to skip its contents too. Skip hidden files with `--glob --not-name '.*'`
 - `--name-case-sensitive` - Case-sensitive name matching
+- `--glob` - Read every name pattern as a shell glob (`.` and `+` are literal, the match covers the whole name)
+- `--regex` - Read every name pattern as a regular expression (unanchored - anchor with `^`/`$` yourself)
 - `--type {file,directory,symlink}` - Filter by object type
 - `--file-only` - Search files only (deprecated, use `--type file`)
+
+Name patterns accept globs or regular expressions and grumpwalk works out which
+you meant. A few are valid as both and mean different things - `.*` is a regular
+expression matching everything, but a glob meaning "starts with a period" - so
+grumpwalk warns when it has to choose. Use `--glob` or `--regex` to decide
+yourself. Both also apply to `--omit-subdirs`, which stays a glob unless you pass
+`--regex`.
 
 ### Time Filters
 - `--older-than N` - Files older than N days
@@ -470,7 +483,7 @@ Search, copy, and restore data from Qumulo snapshots (Qumulo has no native resto
 
 ```bash
 # Find report.docx in any snapshot from the last week (fast diff-driven scan)
-./grumpwalk.py --host HOST --all-snapshots --snapshots-newer-than 7 --name 'report.docx' --incremental
+./grumpwalk.py --host HOST --all-snapshots --snapshots-newer-than 7 --glob --name 'report.docx' --incremental
 
 # Restore everything matching, from a chosen snapshot, back to where it was
 ./grumpwalk.py --host HOST --snapshot 5 --path /Shared --name '*.docx' --restore-in-place --clobber --yes
@@ -726,11 +739,12 @@ search. If you see repeated rate limiting, lower `--max-concurrent` and re-run.
 
 ### Glob Patterns (shell-style)
 ```bash
---name '*.log'           # Names ending in .log
---name 'test_*'          # Names starting with test_ (NOT "mytest_1")
---name 'file?.txt'       # file1.txt, fileA.txt, etc.
---name 'report'          # Exactly "report" (no wildcards = exact name)
---name '*report*'        # Any name containing "report"
+--name '*.log'                  # Names ending in .log
+--name 'test_*'                 # Names starting with test_ (NOT "mytest_1")
+--glob --name 'file?.txt'       # file1.txt, fileA.txt, etc.
+--glob --name 'test_*.py'       # test_foo.py, test_bar.py
+--name 'report'                 # Exactly "report" (no wildcards = exact name)
+--name '*report*'               # Any name containing "report"
 ```
 
 Globs match the **whole name** (like the shell), so `test_*` matches names that
@@ -738,6 +752,14 @@ Globs match the **whole name** (like the shell), so `test_*` matches names that
 wildcards matches the exact name. Always **quote** patterns (`--name 'file_*'`)
 so your shell does not expand the `*` against your local working directory
 before grumpwalk sees it.
+
+Note the `--glob` on two of those examples. A glob that also happens to be a
+valid regular expression is read as a regular expression, and `file?.txt` and
+`test_*.py` both are - as regexes they mean something quite different, so
+`--name 'test_*.py'` on its own does **not** find `test_foo.py`. grumpwalk warns
+when a pattern is ambiguous like this; `--glob` settles it. Patterns whose
+wildcard comes first (`*.log`, `*report*`) cannot be regexes, so they need
+nothing extra.
 
 ### Regex Patterns
 ```bash
@@ -747,6 +769,10 @@ before grumpwalk sees it.
 ```
 
 **Auto-detection:** Patterns with `/`, `^`, `$`, or regex chars are treated as regex. Others as glob. Unlike globs, regex patterns are matched unanchored (substring); anchor them yourself with `^` and `$`.
+
+**Overriding it:** `--glob` reads every pattern as a shell glob, `--regex` reads every one as a regular expression. Use them whenever a pattern could be read either way - grumpwalk warns when that happens. Both also apply to `--omit-subdirs`, which is read as a glob unless you pass `--regex`.
+
+**Non-ASCII names:** patterns and names are matched as Unicode text, so wildcards work per character (`?` matches one accented or CJK character, not one byte) and case-insensitive matching works across scripts. Matching does **not** normalize, so a name stored in one Unicode form is not matched by a pattern typed in another - relevant when macOS clients write names like `café` in decomposed form. If an accented name will not match, copy the name straight from grumpwalk output rather than retyping it.
 
 ### Combining Patterns (--name vs --name-and)
 ```bash

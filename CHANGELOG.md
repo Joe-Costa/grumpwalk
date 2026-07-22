@@ -5,6 +5,25 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0] - 2026-07-22
+
+### Added
+
+- **`--not-name` (exclude by name)** - The inverse of `--name`: drops anything whose name matches. Repeatable, and an object is excluded if it matches any of the patterns. This is how you answer "everything except X" - for example "skip files starting with '.'": `--older-than 90 --glob --not-name '.*'`. Works with every other filter and in every mode. Like `--name`, it tests each object's own name rather than its full path, and it applies to directories as well as files unless you add `--type`. So `--not-name '.*'` drops the `.git` directory itself from the results, but the ordinary-named files stored inside it are still reported - add `--omit-subdirs` to skip a directory's contents too.
+- **`--regex` and `--glob`** - Name patterns can be written as shell globs or as regular expressions, and grumpwalk works out which you meant. A few patterns are valid as both and mean different things, so these flags let you say which you want: `--glob --not-name '.*'` excludes hidden files, `--regex --not-name '^\.'` does the same thing the other way. Both apply to `--name`, `--name-and`, `--not-name` and `--omit-subdirs`, and `--regex` lets `--omit-subdirs` take regular expressions for the first time. Existing commands are unaffected.
+- **Warning on ambiguous patterns** - When a pattern could be read either way and the two readings disagree, grumpwalk now says which one it used and points at `--regex` / `--glob`. This catches patterns that quietly did the opposite of what they looked like: `--not-name '.*'` matches every name as a regular expression, though it looks like "starts with a period", and `--name 'report.txt'` also matches `myreport.txt.bak`. Passing `--regex` or `--glob` silences it.
+
+### Fixed
+
+- **`--show-dir-stats` now honors `--omit-subdirs` and `--omit-path`.** Both were accepted and then ignored, so the report always covered every subdirectory. They now skip directories at every depth, matching `--stats` and a normal crawl.
+- **An omitted directory is no longer listed in the results.** `--omit-subdirs` and `--omit-path` correctly skipped a directory's contents, but the directory itself still appeared in the normal streamed output - while `--show-details` left it out. The same command therefore gave a slightly different answer depending on the output format. Omitted directories are now absent from every output mode.
+- **Corrected documented examples that did not do what they said.** Some example patterns are valid as both a glob and a regular expression, and were being read as regular expressions - `--name 'test_*.py'` did not match `test_foo.py` at all, and `--name 'file?.txt'` matched nothing. The examples now pass `--glob`, and the new warning flags this class of pattern when you hit it yourself.
+
+### Notes
+
+- `--omit-subdirs` is still read as a glob unless you pass `--regex`, so `--omit-subdirs '.snapshot'` and `--omit-subdirs '.*'` keep working as they always have.
+- `--rename-to` templates using `*`/`?` fill those wildcards from the `--name` glob they matched, so they cannot be combined with `--regex`. That combination now reports an error pointing at the `{old|new}` form, which works either way.
+
 ## [3.6.0] - 2026-07-13
 
 ### Added

@@ -111,7 +111,9 @@ A practical guide with recipes for common storage administration tasks using gru
 > use `--name '*report*'` for "contains". Always quote patterns so your shell does not
 > expand `*` against your local directory before grumpwalk runs. (Regex patterns - those
 > containing characters like `^`, `$`, `.`, `+` - are matched unanchored; anchor them
-> with `^`/`$` yourself.)
+> with `^`/`$` yourself. A wildcard-free name that contains a dot, like `report.txt`, is
+> read as a regex and so also matches `myreport.txt.bak`; add `--glob` to match it
+> literally. See "Should I use a glob or a regex?" below.)
 
 **Find using regex:**
 ```bash
@@ -119,7 +121,168 @@ A practical guide with recipes for common storage administration tasks using gru
 ./grumpwalk.py --host cluster --path /data --name '^[0-9].*'
 
 # Find files with version numbers (v1, v2, etc.)
-./grumpwalk.py --host cluster --path /releases --name '.*_v[0-9]+\.'
+./grumpwalk.py --host cluster --path /releases --regex --name '_v[0-9]+\.'
+```
+
+### How do I exclude files by name?
+
+`--not-name` is the opposite of `--name`: it drops anything whose name matches. It is
+repeatable, and an object is excluded if it matches any of the patterns.
+
+**Skip hidden files:**
+```bash
+./grumpwalk.py --host cluster --path /data --older-than 90 --glob --not-name '.*'
+```
+
+**Exclude several patterns:**
+```bash
+./grumpwalk.py --host cluster --path /data --not-name '*.tmp' --not-name '*.bak'
+```
+
+**Combine with `--name` - logs, but not the rotated ones:**
+```bash
+./grumpwalk.py --host cluster --path /var --name '*.log' --not-name '*.[0-9].log'
+```
+
+> **`--not-name` tests each object's own name, not its full path**, and it applies to
+> directories as well as files unless you add `--type`. `--glob --not-name '.*'`
+> therefore drops the `.git` directory itself from the results - but the files inside
+> it have ordinary names, so they are still reported. To skip a directory's contents as well,
+> add `--omit-subdirs`, which is also faster because grumpwalk never looks inside the
+> directory at all:
+> ```bash
+> ./grumpwalk.py --host cluster --path / --glob --not-name '.*' --omit-subdirs '.*'
+> ```
+> Given a `.git` directory holding `config`, the first form reports `config` and hides
+> `.git`; adding `--omit-subdirs '.*'` hides both.
+
+### Should I use --glob or --regex?
+
+**Short answer: use globs.** They are the same wildcards you already type in the
+shell, they cover the large majority of real searches, and they are hard to get
+wrong. Reach for `--regex` only when you need something a glob cannot express.
+
+| If you want to... | Use |
+|---|---|
+| Match an extension, a prefix, or "contains" | glob - `*.log`, `backup_*`, `*2024*` |
+| Match a single character position | glob - `server?.conf` |
+| Match a name that itself contains `.` `+` `(` `)` `{` `}` `\|` `$` | glob (those are ordinary characters to a glob) |
+| Match several alternatives in one pattern | regex - `\.(jpg\|png)$` |
+| Say "exactly four digits" or "one or more" | regex - `[0-9]{4}`, `[0-9]+` |
+| Match a range of characters | regex - `[0-9]`, `[a-f]` |
+| Match somewhere in the middle of a name | regex (globs always match the whole name) |
+
+#### Globs - the everyday patterns
+
+A glob matches the **whole name**, like the shell. `*` stands for any run of
+characters, `?` for exactly one.
+
+```bash
+--name '*.log'              # app.log, error.log        (not app.log.1)
+--name 'backup_*'           # backup_2024.tar.gz        (not my_backup.tar.gz)
+--name '*2024*'             # backup_2024.tar.gz, invoice_2024_01.pdf
+--glob --name 'server?.conf'  # server1.conf, server2.conf   (not server10.conf)
+--glob --not-name '.*'      # everything except hidden files
+```
+
+Because a glob covers the whole name, `--name 'report'` matches only a file called
+exactly `report`. Use `--name '*report*'` for "contains".
+
+#### Regular expressions - when globs run out
+
+A regex matches **any part** of the name unless you anchor it with `^` (start) or
+`$` (end). That is the main difference to keep in mind.
+
+```bash
+# Several extensions in one pattern, instead of repeating --name
+--regex --name '\.(jpg|jpeg|png|gif)$'   # any .jpg/.jpeg/.png/.gif, either case
+
+# Exactly four digits - a glob cannot count
+--regex --name '^IMG_[0-9]{4}\.'         # IMG_0001.JPG   (not IMG_12345.jpg)
+
+# Rotated logs: .log followed by a number
+--regex --name '\.log\.[0-9]+$'          # app.log.1, app.log.12   (not app.log)
+
+# A range of years
+--regex --name '^backup_202[34]'         # backup_2023..., backup_2024...
+
+# Anywhere in the name - no anchors needed
+--regex --name 'report'                  # report.docx, report_final.docx
+```
+
+Note the backslashes: in a regex a bare `.` means "any character", so you write
+`\.` when you mean a literal dot. That is the single most common regex mistake.
+
+#### Two habits that avoid surprises
+
+**1. If the name itself contains regex punctuation, pass `--glob`.** To a glob,
+characters like `.` `+` `(` `)` `{` `}` `|` `$` are just ordinary characters:
+
+```bash
+./grumpwalk.py --host cluster --path /data --glob --name 'C++ notes.txt'
+./grumpwalk.py --host cluster --path /data --glob --name 'report(final).docx'
+```
+
+**2. If your pattern has a wildcard anywhere but the front *and* contains a dot,
+pass `--glob`.** Those patterns are valid regular expressions too, so grumpwalk has
+to guess - and the regex reading is usually not what you meant:
+
+```bash
+--name 'test_*.py'          # as a regex this does NOT match test_foo.py
+--glob --name 'test_*.py'   # correct: test_foo.py, test_bar.py
+
+--name 'server?.conf'       # as a regex this matches nothing at all
+--glob --name 'server?.conf'  # correct: server1.conf, server2.conf
+```
+
+Patterns whose wildcard comes first, like `*.log` or `*report*`, cannot be regular
+expressions, so they never need `--glob`.
+
+#### Letting grumpwalk decide
+
+By default grumpwalk works out which syntax you meant, and **warns on stderr**
+whenever a pattern could sensibly be read both ways. If you see that warning, add
+`--glob` or `--regex` to settle it - the warning then goes away.
+
+| Flag | Effect |
+|------|--------|
+| *(default)* | grumpwalk decides per pattern, and warns when the choice is not obvious |
+| `--glob` | Shell glob: `.` and `+` are ordinary characters, match covers the whole name |
+| `--regex` | Regular expression, matching any part of the name unless you anchor it |
+
+These two spellings are equivalent, so use whichever you find clearer:
+
+```bash
+./grumpwalk.py --host cluster --path /data --glob  --not-name '.*'
+./grumpwalk.py --host cluster --path /data --regex --not-name '^\.'
+```
+
+Both flags apply to `--name`, `--name-and`, `--not-name` and `--omit-subdirs`. Two
+things to know:
+
+- `--omit-subdirs` is read as a glob unless you pass `--regex`, so patterns like
+  `--omit-subdirs '.snapshot'` keep working exactly as before.
+- `--rename-to` templates using `*`/`?` fill those wildcards from the `--name` glob
+  they matched, so they cannot be combined with `--regex`. Use the `{old|new}` form
+  instead, which works either way.
+
+### What about accented and non-English file names?
+
+Patterns are matched as Unicode text, so this all works as you would expect:
+wildcards count characters rather than bytes (`?` matches one accented or CJK
+character), and case-insensitive matching applies to non-Latin alphabets too, so a
+pattern in Cyrillic capitals finds the lowercase name.
+
+The one thing to know is that grumpwalk does **not** normalize Unicode. The same
+accented name can be stored in two different ways - `café` as five characters, or as
+six with the accent held separately - and they will not match each other. macOS
+clients commonly write names the second way, so a pattern you typed on a Linux
+terminal may silently find nothing. If an accented name refuses to match, copy the
+name from grumpwalk's own output instead of retyping it, or match the unaccented part
+with a wildcard:
+
+```bash
+./grumpwalk.py --host cluster --path /data --glob --name 'caf*'
 ```
 
 ### How do I find files by size?
@@ -597,7 +760,7 @@ warning and reads simply fall back to the cluster's default atime behavior.
 
 # Core dumps older than 30 days
 ./grumpwalk.py --host cluster --path /var \
-  --name 'core.*' --name '*.core' \
+  --glob --name 'core.*' --name '*.core' \
   --older-than 30 --type file \
   --csv-out cores_to_delete.csv
 ```
@@ -977,14 +1140,14 @@ flags to bound the set. Snapshot ages are in **UTC** and accept days or hours -
 `5`/`5d` = 5 days, `12h` = 12 hours:
 ```bash
 ./grumpwalk.py --host cluster --all-snapshots --path /Shared \
-  --name 'report.docx' --snapshots-newer-than 30d
+  --glob --name 'report.docx' --snapshots-newer-than 30d
 #   [snap 9] /Shared/docs/report.docx
 #   [snap 5] /Shared/docs/report.docx   <- the same file, duplicated per snapshot
 ```
 When you give a snapshot-age limit on its own, `--all-snapshots` is implied - so
 "search the snapshots from the last hour" is just:
 ```bash
-./grumpwalk.py --host cluster --path /Shared --name 'report.docx' --snapshots-newer-than 1h
+./grumpwalk.py --host cluster --path /Shared --glob --name 'report.docx' --snapshots-newer-than 1h
 ```
 
 ### How do I limit *which snapshots* are searched (by snapshot age)?
@@ -1024,7 +1187,7 @@ it. `--in-the-last-snapshots N` searches the **N most recent** snapshots and sho
 only the **newest** result for each path:
 ```bash
 # The latest recoverable version of each report, looking back over the 5 newest snapshots
-./grumpwalk.py --host cluster --in-the-last-snapshots 5 --path /Shared --name 'report.docx'
+./grumpwalk.py --host cluster --in-the-last-snapshots 5 --path /Shared --glob --name 'report.docx'
 #   [snap 9] /Shared/docs/report.docx        (one line per file, newest snapshot wins)
 ```
 It composes with the snapshot-age limits, e.g. `--in-the-last-snapshots 10 --snapshots-newer-than 12h`.
@@ -1181,7 +1344,7 @@ To restore several files at once, repeat `--name` - the patterns are OR'd, so th
 restores everything named `cat`, `dog`, or `pig` anywhere under `--path`:
 ```bash
 ./grumpwalk.py --host cluster --snapshot 5 --path /Shared \
-  --name cat --name dog --name pig --restore-in-place --yes
+  --name 'cat' --name 'dog' --name 'pig' --restore-in-place --yes
 ```
 Any other filters narrow the set further (AND), e.g. add `--type file --older-than 30`
 to restore only files, only those older than 30 days, among the names matched.

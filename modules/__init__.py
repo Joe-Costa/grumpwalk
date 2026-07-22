@@ -62,6 +62,11 @@ from .client import (
 from .filters import (
     resolve_owner_filters,
     glob_to_regex,
+    resolve_pattern_mode,
+    pattern_is_ambiguous,
+    warn_if_ambiguous,
+    OmitPatterns,
+    omit_matches,
     create_file_filter,
     FINDABLE_ATTRIBUTES,
     SETTABLE_ATTRIBUTES,
@@ -117,6 +122,11 @@ __all__ = [
     # Filters
     "resolve_owner_filters",
     "glob_to_regex",
+    "resolve_pattern_mode",
+    "pattern_is_ambiguous",
+    "warn_if_ambiguous",
+    "OmitPatterns",
+    "omit_matches",
     "create_file_filter",
     "FINDABLE_ATTRIBUTES",
     "SETTABLE_ATTRIBUTES",
