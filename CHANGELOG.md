@@ -5,6 +5,22 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.0] - 2026-08-06
+
+### Added
+
+- **`--base10` (decimal display units)** - Every human-readable size grumpwalk prints is now binary by default (KiB/MiB/GiB/TiB), matching how Qumulo allocates space in 4 KiB blocks. Pass `--base10` to see decimal units instead (KB/MB/GB/TB, powers of 1000), which is what drive vendors and cloud billing use. The flag changes display only: `--csv-out`, `--json-out` and `--json` still emit raw byte integers, and size filters always follow the unit you type - `--larger-than 1TB` is 10^12 bytes and `--larger-than 1TiB` is 2^40 bytes in either mode.
+
+### Fixed
+
+- **Reports no longer label binary sizes as decimal.** `--owner-report`, `--show-dir-stats`, `--per-directory-matches` and the snapshot listings divided by 1024 but printed `KB`/`MB`/`GB`/`TB`, so a reported `1.00 TB` was really 1 TiB - about 10% larger than the label claimed. Worse, `parse_size_to_bytes` reads `TB` correctly as 10^12, so `--larger-than 1TB` would match a 1,050,000,000,000-byte file and the owner report would then render it as `977.89 GB` - under the threshold you just asked for. Sizes are now labeled with the units they are actually computed in, and match `--show-details`, which was already correct.
+
+### Notes
+
+- This changes the text of existing reports: sizes that read `GB`/`TB` now read `GiB`/`TiB`. The numbers are unchanged - only the labels were wrong. Anything scraping units out of report text needs updating; `--csv-out` / `--json-out` were always raw bytes and are unaffected.
+- The `--find-similar` scan summary moves the other way: its sizes were genuinely decimal and are now binary like everything else. Pass `--base10` to get its previous output.
+- System memory in auto-tuning / `--benchmark` output is still reported as `GB` and is unaffected by `--base10`; it describes the client machine's RAM, not cluster capacity.
+
 ## [3.7.0] - 2026-07-22
 
 ### Added

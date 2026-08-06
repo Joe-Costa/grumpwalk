@@ -8,7 +8,7 @@ parsing, and error handling.
 import sys
 import re
 from datetime import datetime, timezone
-from typing import Optional, Dict, IO
+from typing import List, Optional, Dict, IO, Tuple
 from urllib.parse import urlparse, parse_qs
 
 
@@ -235,13 +235,42 @@ def parse_size_to_bytes(size_str: str) -> int:
     return int(size_num * multipliers[size_unit])
 
 
+# Display units for human-readable byte counts. Binary is the default because
+# it matches how Qumulo allocates space (4 KiB blocks); --base10 switches every
+# human-readable size to decimal. This affects DISPLAY ONLY -- parse_size_to_bytes
+# always honors the unit the user typed, so --larger-than 1TB is 10^12 bytes in
+# either mode, and CSV/JSON output stays raw bytes.
+_BINARY_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+_DECIMAL_UNITS = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]
+_display_base10 = False
+
+
+def set_display_base10(enabled: bool) -> None:
+    """Select decimal (KB/MB/GB) or binary (KiB/MiB/GiB) display units.
+
+    Called once from main() after argument parsing; every size formatter reads
+    the mode from here rather than taking it as a parameter.
+    """
+    global _display_base10
+    _display_base10 = bool(enabled)
+
+
+def display_units() -> Tuple[float, List[str]]:
+    """Return (divisor, unit_labels) for the active display mode."""
+    if _display_base10:
+        return 1000.0, _DECIMAL_UNITS
+    return 1024.0, _BINARY_UNITS
+
+
 def format_bytes(bytes_value: int) -> str:
-    """Format bytes as human-readable string."""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if bytes_value < 1024.0:
-            return f"{bytes_value:.2f} {unit}"
-        bytes_value /= 1024.0
-    return f"{bytes_value:.2f} EB"
+    """Format bytes as a human-readable string in the active display units."""
+    divisor, units = display_units()
+    value = float(bytes_value)
+    for unit in units[:-1]:
+        if value < divisor:
+            return f"{value:.2f} {unit}"
+        value /= divisor
+    return f"{value:.2f} {units[-1]}"
 
 
 def format_time(seconds: float) -> str:
