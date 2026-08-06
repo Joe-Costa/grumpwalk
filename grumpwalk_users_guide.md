@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.7.0** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.8.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -568,11 +568,11 @@ Per-directory match report (immediate children of --path)
 ======================================================================
 Path             Files   Capacity
 ---------------  -----  ---------
-/data/active       842     4.66 GB
-/data/incoming     311   954.30 MB
-/data/scratch       57    12.40 MB
+/data/active       842    4.66 GiB
+/data/incoming     311  954.30 MiB
+/data/scratch       57   12.40 MiB
 ---------------  -----  ---------
-TOTAL            1,210     5.61 GB
+TOTAL            1,210    5.60 GiB
 ```
 
 Each directory total covers everything beneath it, and the `TOTAL` line is the
@@ -617,12 +617,56 @@ OWNER REPORT
 ================================================================================
 Owner                          Domain               Files       Dirs      Total Size
 ------------------------------------------------------------------------------------------
-alice@corp.com                 AD_USER              125,432    2,341     1.23 TB
-bob@corp.com                   AD_USER               98,234    1,892     987.45 GB
-UID 1001                       POSIX_USER            45,123      234     456.78 GB
+alice@corp.com                 AD_USER              125,432    2,341    1.23 TiB
+bob@corp.com                   AD_USER               98,234    1,892  987.45 GiB
+UID 1001                       POSIX_USER            45,123      234  456.78 GiB
 ------------------------------------------------------------------------------------------
-TOTAL                                               268,789    4,467     2.67 TB
+TOTAL                                               268,789    4,467    2.64 TiB
 ```
+
+Sizes are shown in binary units by default -- see
+[Are sizes in TB or TiB?](#are-sizes-in-tb-or-tib) if you would rather see
+`GB`/`TB`.
+
+### Are sizes in TB or TiB?
+
+TiB, by default. Every human-readable size grumpwalk prints -- owner reports,
+directory statistics, `--per-directory-matches`, `--show-details`, copy progress
+-- uses binary units: `KiB`, `MiB`, `GiB`, `TiB`, each step a factor of 1024.
+A reported `1.00 TiB` is 1,099,511,627,776 bytes.
+
+Binary is the default because it matches the way the cluster actually allocates
+space: Qumulo writes in 4 KiB blocks, and the API reports plain byte counts with
+no units attached, so the labels are grumpwalk's choice rather than something
+handed down by the cluster.
+
+If you would rather see decimal units -- the `GB`/`TB` that drive vendors and
+cloud bills use, each step a factor of 1000 -- add `--base10`:
+
+```bash
+# Default: binary units
+./grumpwalk.py --host cluster --path /home --owner-report
+#   alice@corp.com   AD_USER   125,432   2,341   1.23 TiB
+
+# Decimal units
+./grumpwalk.py --host cluster --path /home --owner-report --base10
+#   alice@corp.com   AD_USER   125,432   2,341   1.35 TB
+```
+
+Both commands crawled the same files and found the same number of bytes. Only
+the label changed, and `1.23 TiB` and `1.35 TB` are the same amount of storage.
+This is the usual reason a grumpwalk number looks about 10% off from a number
+somewhere else -- one of them is counting in 1024s and the other in 1000s.
+
+Two things `--base10` deliberately does **not** touch:
+
+- **The sizes you type.** A suffix always means exactly what it says, in either
+  mode. `--larger-than 1TB` is 1,000,000,000,000 bytes and `--larger-than 1TiB`
+  is 1,099,511,627,776 bytes, whether or not you passed `--base10`. If you want
+  the filter and the report to agree, use the matching suffix.
+- **Exported data.** `--csv-out`, `--json-out`, and `--json` always write raw
+  byte counts with no units, so your spreadsheet or database does its own math.
+  `--base10` changes what you read on screen, never what lands in a file.
 
 ### How do I find who is using the most storage?
 
@@ -1267,6 +1311,9 @@ table gains a leading `SNAPSHOT` column showing which snapshot each row came fro
 It also writes to files - `--csv-out FILE` or `--json-out FILE` (and `--json` to
 stdout); in those machine formats `size` stays raw bytes rather than human-readable.
 Note: `--all-attributes` does nothing for snapshot search - use `--fields all`.
+
+The `SIZE` column is in binary units (`MiB`, `GiB`, `TiB`); add `--base10` if you
+prefer `MB`/`GB`/`TB`. See [Are sizes in TB or TiB?](#are-sizes-in-tb-or-tib).
 
 When you search for **directories** (`--type directory --show-details`), the size
 column is replaced by the directory's recursive aggregate **`capacity`** - the
@@ -3049,6 +3096,10 @@ done
 
 ### Size Suffixes
 
+These are the suffixes you **type** on `--larger-than`, `--smaller-than`,
+`--delta-threshold` and friends. They always mean exactly what they say,
+regardless of `--base10`.
+
 | Suffix | Meaning |
 |--------|---------|
 | `KB` | Kilobytes (1000) |
@@ -3059,6 +3110,19 @@ done
 | `GiB` | Gibibytes |
 | `TB` | Terabytes |
 | `TiB` | Tebibytes |
+
+### Display Units
+
+These are the units grumpwalk **prints**. Exported files (`--csv-out`,
+`--json-out`, `--json`) always hold raw byte counts and ignore this setting.
+
+| Mode | Units shown | Step | Example |
+|------|-------------|------|---------|
+| Default | `KiB` `MiB` `GiB` `TiB` | 1024 | `1.23 TiB` |
+| `--base10` | `KB` `MB` `GB` `TB` | 1000 | `1.35 TB` |
+
+Both describe the same amount of storage. See
+[Are sizes in TB or TiB?](#are-sizes-in-tb-or-tib) for the full explanation.
 
 ### Time Field Shortcuts
 

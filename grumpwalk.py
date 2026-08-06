@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 
 import argparse
 import asyncio
@@ -42,6 +42,8 @@ from modules import (
     extract_pagination_token,
     parse_size_to_bytes,
     format_bytes,
+    set_display_base10,
+    display_units,
     format_time,
     format_raw_id,
     format_owner_name,
@@ -5932,24 +5934,15 @@ async def find_similar(
         else:
             coverage_pct = 0
 
-        # Format human-readable sizes
-        def format_bytes(b):
-            if b >= 1_000_000_000_000:
-                return f"{b / 1_000_000_000_000:.2f} TB"
-            elif b >= 1_000_000_000:
-                return f"{b / 1_000_000_000:.2f} GB"
-            elif b >= 1_000_000:
-                return f"{b / 1_000_000:.2f} MB"
-            elif b >= 1_000:
-                return f"{b / 1_000:.2f} KB"
-            else:
-                return f"{b} bytes"
-
-        # Human-readable chunk size
-        if sample_chunk_size >= 1048576:
-            chunk_str = f"{sample_chunk_size / 1048576:.1f}MB".rstrip('0').rstrip('.')
-        elif sample_chunk_size >= 1024:
-            chunk_str = f"{sample_chunk_size / 1024:.0f}KB"
+        # Human-readable chunk size, in the same units as every other size we print
+        chunk_divisor, chunk_units = display_units()
+        if sample_chunk_size >= chunk_divisor ** 2:
+            chunk_str = (
+                f"{sample_chunk_size / chunk_divisor ** 2:.1f}".rstrip('0').rstrip('.')
+                + chunk_units[2]
+            )
+        elif sample_chunk_size >= chunk_divisor:
+            chunk_str = f"{sample_chunk_size / chunk_divisor:.0f}{chunk_units[1]}"
         else:
             chunk_str = f"{sample_chunk_size}B"
 
@@ -10594,6 +10587,15 @@ Examples:
         help="Include all file attributes in JSON output",
     )
     output.add_argument(
+        "--base10",
+        action="store_true",
+        help="Display sizes in decimal units (KB/MB/GB/TB, powers of 1000) "
+             "instead of the default binary units (KiB/MiB/GiB/TiB, powers of "
+             "1024). Affects human-readable output only: CSV/JSON stay raw "
+             "bytes, and size filters such as --larger-than always follow the "
+             "unit you type (1TB = 10^12, 1TiB = 2^40).",
+    )
+    output.add_argument(
         "--show-details",
         action="store_true",
         help="Show attributes of matched results instead of just paths "
@@ -11538,6 +11540,10 @@ Examples:
         argcomplete.autocomplete(parser)
 
     args = parser.parse_args()
+
+    # Select display units before anything can format a size. Display only:
+    # parsing and machine-readable output are deliberately unaffected.
+    set_display_base10(args.base10)
 
     # Bind --omit-subdirs to the pattern mode chosen by --regex / --glob. Wrapped
     # in place so the many call sites that pass args.omit_subdirs around keep

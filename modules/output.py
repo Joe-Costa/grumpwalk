@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 # Import utility functions from the utils module
-from .utils import format_time, format_raw_id, format_owner_name
+from .utils import format_time, format_raw_id, format_owner_name, display_units
 
 # Try to use ujson for faster parsing
 try:
@@ -558,17 +558,18 @@ ALL_DETAIL_FIELDS = [
 
 
 def human_size(value):
-    """Render a byte count as a short binary-unit string: '16 B', '1.4 GiB'."""
+    """Render a byte count as a short string in the active display units:
+    '16 B', '1.4 GiB' -- or '1.5 GB' under --base10."""
     if value is None:
         return ""
     try:
         n = float(value)
     except (TypeError, ValueError):
         return str(value)
-    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"]
+    divisor, units = display_units()
     i = 0
-    while n >= 1024.0 and i < len(units) - 1:
-        n /= 1024.0
+    while n >= divisor and i < len(units) - 1:
+        n /= divisor
         i += 1
     if i == 0:
         return f"{int(n)} B"

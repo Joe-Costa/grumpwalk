@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.7.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.8.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -699,6 +699,7 @@ This copies the parent's ACL (with inherited flags set appropriately) to the chi
 - `--json-out FILE` - JSON output to file
 - `--csv-out FILE` - CSV output to file
 - `--all-attributes` - Include all file attributes in output
+- `--base10` - Display sizes in decimal units (KB/MB/GB/TB, powers of 1000) instead of the default binary units (KiB/MiB/GiB/TiB, powers of 1024). Display only: CSV/JSON output stays raw bytes, and size filters always follow the unit you type (`--larger-than 1TB` is 10^12 bytes, `1TiB` is 2^40, in either mode)
 - `--show-details` - Show attributes of matched results instead of just paths (snapshot search and the live walk). Defaults to `path`, human-readable `size`, and `change_time` (ctime); renders an aligned table, or honors `--csv-out`/`--json-out`/`--json` (size stays raw bytes there). Multi-snapshot search adds a `SNAPSHOT` column. With `--type directory` the size column becomes the recursive aggregate `capacity` (whole-subtree, from directory aggregates). `--limit` caps the rows shown
 - `--fields FIELD[,FIELD,...]` - Select specific output fields (aliases: `owner_id`, `group_id`, `attr.*`; dot notation supported). `--fields all` selects every attribute (implies `--show-details`). Use `--fields-list` to see all available fields
 - `--fields-list` - List all available field names and exit
