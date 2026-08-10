@@ -832,14 +832,14 @@ def nfsv4_flags_to_qacl(flags_str: str) -> List[str]:
 
 # Trustee formats that contain a colon, which is also the ACE pattern delimiter.
 # Numeric forms are validated so a typo cannot masquerade as a trustee.
+# Only formats that resolve on their own belong here: 'ad:name' and
+# 'local:name' are left out because the domain qualifier is dropped before
+# the identity lookup, which makes a bare name like 'Users' ambiguous.
 COLON_TRUSTEE_PREFIXES = {
     'uid:': 'numeric',
     'gid:': 'numeric',
     'auth_id:': 'numeric',
     'sid:': 'any',
-    'ad:': 'any',
-    'active_directory:': 'any',
-    'local:': 'any',
 }
 
 
@@ -5717,6 +5717,10 @@ def parse_trustee(trustee_input: str) -> Dict:
     # Explicit type prefixes
     if trustee.startswith("auth_id:"):
         return {"payload": {"auth_id": trustee[8:]}, "type": "auth_id"}
+
+    # 'sid:S-1-...' is how grumpwalk prints SID trustees, so accept it back
+    if trustee.lower().startswith("sid:"):
+        return {"payload": {"sid": trustee[4:]}, "type": "sid"}
 
     if trustee.startswith("uid:"):
         try:

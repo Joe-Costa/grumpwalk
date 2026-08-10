@@ -1924,24 +1924,41 @@ Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-
   --propagate-changes --progress
 ```
 
-### How do I grant access to a POSIX group by GID?
+### How do I grant access by UID or GID?
 
-Use the `gid:N` trustee form. It works in every ACE pattern even though the
-trustee itself contains a colon:
+Write the trustee as `uid:N` or `gid:N`:
 
 ```bash
+# Grant NFS group 14011 read/write, inherited by everything underneath
 ./grumpwalk.py --host cluster --path /prod/media \
   --add-ace "Allow:fd:gid:14011:rwxda" \
   --propagate-changes --progress
+
+# The same for a single user
+./grumpwalk.py --host cluster --path /prod/media \
+  --add-ace "Allow:fd:uid:1001:rwxda" \
+  --propagate-changes --progress
 ```
 
-The GID does not need to exist in Active Directory. Qumulo maps any numeric
-GID to a `POSIX_GROUP` identity, so the ACE is written against that group
-whether or not the GID is linked to an AD account. `uid:N`, `auth_id:N` and
-`sid:S-1-...` work the same way in these patterns.
+Both forms work anywhere a trustee is accepted, so you can take the ACE back
+out the same way:
 
-Do not pass a bare number as the trustee - `14011` on its own is read as a
-**UID**, not a GID, and would grant access to the wrong identity.
+```bash
+./grumpwalk.py --host cluster --path /prod/media \
+  --remove-ace "Allow:gid:14011" --propagate-changes
+```
+
+`--add-rights`, `--remove-rights`, `--replace-ace` and `--new-ace` accept them
+too, as do `auth_id:N` and a SID written either way (`S-1-5-21-...` or
+`sid:S-1-5-21-...`).
+
+The UID or GID does not have to exist in Active Directory. Qumulo recognizes
+any NFS UID or GID on its own, so these work on a cluster with no AD at all,
+and for numbers that were never linked to an AD account.
+
+**Always include the `uid:` or `gid:` prefix.** A bare number is read as a UID,
+so `Allow:fd:14011:rwxda` grants access to *user* 14011, not group 14011 -
+two different identities.
 
 ### How do I disable inheritance on a directory tree?
 
