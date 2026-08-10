@@ -1924,6 +1924,25 @@ Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-
   --propagate-changes --progress
 ```
 
+### How do I grant access to a POSIX group by GID?
+
+Use the `gid:N` trustee form. It works in every ACE pattern even though the
+trustee itself contains a colon:
+
+```bash
+./grumpwalk.py --host cluster --path /prod/media \
+  --add-ace "Allow:fd:gid:14011:rwxda" \
+  --propagate-changes --progress
+```
+
+The GID does not need to exist in Active Directory. Qumulo maps any numeric
+GID to a `POSIX_GROUP` identity, so the ACE is written against that group
+whether or not the GID is linked to an AD account. `uid:N`, `auth_id:N` and
+`sid:S-1-...` work the same way in these patterns.
+
+Do not pass a bare number as the trustee - `14011` on its own is read as a
+**UID**, not a GID, and would grant access to the wrong identity.
+
 ### How do I disable inheritance on a directory tree?
 
 Equivalent to Windows "Disable Inheritance" or `icacls /inheritance`:

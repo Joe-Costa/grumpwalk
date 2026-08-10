@@ -5,6 +5,18 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.1] - 2026-08-10
+
+### Fixed
+
+- **ACE patterns now accept trustees that contain a colon, such as `gid:14011`.** The trustee formats documented for ACE manipulation include `uid:N`, `gid:N`, `auth_id:N` and `sid:S-1-...`, but the pattern parser split on `:` and required an exact field count, so any of them was rejected: `--add-ace 'Allow:fd:gid:14011:rwxda'` failed with `Invalid add pattern: expected Type:Flags:Trustee:Rights` and exited before contacting the cluster. Because type, flags and rights can never contain a colon, the trustee field now absorbs the extra ones. This applies to `--add-ace`, `--remove-ace`, `--replace-ace`, `--new-ace`, `--add-rights` and `--remove-rights`. Malformed patterns are still rejected with the same message - surplus fields are only accepted when they form a recognized trustee, so `'Allow:fd:Group:Modify:oops'` and a non-numeric `'Allow:fd:gid:abc:rw'` still fail.
+- **`--dry-run` shows a new ACE's trustee as typed.** A not-yet-resolved trustee was printed with an `auth_id:` prefix, so previewing a new ACE for `gid:14011` read `Allow:fd:auth_id:gid:14011:rwaxd`, and one for a named group read `auth_id:Group111`. Non-numeric trustees are now shown as entered.
+
+### Notes
+
+- A GID does not have to exist in Active Directory. Qumulo maps any numeric GID to a `POSIX_GROUP` identity (`/v1/identity/find` with `{"gid": N}`), so `gid:N` resolves whether or not it is linked to an AD account.
+- A bare number is still read as a **UID**, not a GID - `--add-ace 'Allow:fd:14011:rwxda'` grants access to uid 14011. Always write `gid:N` for a group.
+
 ## [3.8.0] - 2026-08-06
 
 ### Added
