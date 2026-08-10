@@ -5,6 +5,20 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.1] - 2026-08-10
+
+### Fixed
+
+- **ACE commands now accept `uid:N`, `gid:N`, `auth_id:N` and SID trustees.** These were listed as valid trustee formats but none of them worked: `--add-ace 'Allow:fd:gid:14011:rwxda'` stopped with `Invalid add pattern: expected Type:Flags:Trustee:Rights` and never reached the cluster, because the colon inside `gid:14011` was read as a field separator. Granting a group or a user by number now works as documented, in `--add-ace`, `--remove-ace`, `--replace-ace`, `--new-ace`, `--add-rights` and `--remove-rights`. Mistyped patterns are still caught the same way as before, so `'Allow:fd:Group:Modify:oops'` and `'Allow:fd:gid:abc:rw'` are still rejected.
+- **A SID can be pasted back in the form grumpwalk prints it.** ACL reports show SID trustees as `sid:S-1-5-...`, but using that in a command looked it up as a user name and failed to resolve. Both `sid:S-1-5-...` and a bare `S-1-5-...` now work.
+- **`--dry-run` shows a new ACE's trustee the way you typed it.** Previewing a new ACE for `gid:14011` used to read `Allow:fd:auth_id:gid:14011:rwaxd`, and one for a named group read `auth_id:Group111`.
+
+### Notes
+
+- A UID or GID does not have to exist in Active Directory. Qumulo recognizes any NFS UID or GID on its own, so `uid:N` and `gid:N` work on a cluster with no AD, and for numbers never linked to an AD account.
+- A bare number is still read as a **UID**, so `--add-ace 'Allow:fd:14011:rwxda'` grants access to user 14011, not group 14011. Always write the `uid:` or `gid:` prefix.
+- `ad:name` and `local:name` are not accepted as ACE trustees. Use the plain name, `DOMAIN\name`, or the user's UID/GID/SID instead.
+
 ## [3.8.0] - 2026-08-06
 
 ### Added

@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.8.0"
+__version__ = "3.8.1"
 
 import argparse
 import asyncio
@@ -227,8 +227,10 @@ def qacl_trustee_to_nfsv4(trustee: Dict, trustee_details: Optional[Dict] = None)
         elif id_type == 'LOCAL_GROUP':
             return f'group:{id_value}'
 
-    # Fallback: use auth_id
-    return f'auth_id:{trustee}'
+    # Fallback: a bare auth_id, or a not-yet-resolved trustee as the user typed
+    # it (e.g. 'gid:14011' in a --dry-run preview of a new ACE)
+    principal = str(trustee)
+    return f'auth_id:{principal}' if principal.isdigit() else principal
 
 
 def extract_auth_ids_from_acl(qacl_data: Dict) -> set:
@@ -828,6 +830,76 @@ def nfsv4_flags_to_qacl(flags_str: str) -> List[str]:
     return flags
 
 
+# Trustee formats that contain a colon, which is also the ACE pattern delimiter.
+# Numeric forms are validated so a typo cannot masquerade as a trustee.
+# Only formats that resolve on their own belong here: 'ad:name' and
+# 'local:name' are left out because the domain qualifier is dropped before
+# the identity lookup, which makes a bare name like 'Users' ambiguous.
+COLON_TRUSTEE_PREFIXES = {
+    'uid:': 'numeric',
+    'gid:': 'numeric',
+    'auth_id:': 'numeric',
+    'sid:': 'any',
+}
+
+
+def is_colon_trustee(candidate: str) -> bool:
+    """
+    Check whether a string is a trustee whose own syntax contains a colon.
+
+    Used to tell a real trustee like 'gid:14011' apart from a malformed
+    pattern with a stray colon.
+
+    Args:
+        candidate: The candidate trustee string
+
+    Returns:
+        True if candidate is a recognized colon-bearing trustee format
+    """
+    lowered = candidate.lower()
+    for prefix, value_kind in COLON_TRUSTEE_PREFIXES.items():
+        if lowered.startswith(prefix):
+            value = candidate[len(prefix):]
+            if not value:
+                return False
+            return value.isdigit() if value_kind == 'numeric' else True
+    return False
+
+
+def split_ace_fields(pattern: str, field_count: int, trustee_index: int) -> Optional[List[str]]:
+    """
+    Split an ACE pattern into fixed fields, tolerating colons in the trustee.
+
+    Type, flags, and rights fields never contain a colon, so any surplus
+    fields belong to the trustee (e.g. 'Allow:fd:gid:14011:rwx' splits into
+    5 parts but is a 4-field pattern whose trustee is 'gid:14011').
+
+    Args:
+        pattern: The raw pattern string
+        field_count: Number of fields the pattern type expects
+        trustee_index: Index of the trustee field
+
+    Returns:
+        List of exactly field_count fields, or None if the pattern does not fit
+    """
+    parts = pattern.split(':')
+
+    if len(parts) == field_count:
+        return parts
+    if len(parts) < field_count:
+        return None
+
+    # Surplus fields are only valid if they form a colon-bearing trustee
+    trailing_count = field_count - trustee_index - 1
+    trustee_end = len(parts) - trailing_count
+    trustee = ':'.join(parts[trustee_index:trustee_end])
+
+    if not is_colon_trustee(trustee):
+        return None
+
+    return parts[:trustee_index] + [trustee] + parts[trustee_end:]
+
+
 def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
     """
     Parse ACE pattern strings into structured dict.
@@ -836,6 +908,8 @@ def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
     - 'Type:Trustee' for removal (e.g., 'Allow:Everyone')
     - 'Type:Trustee:Rights' for rights modification (e.g., 'Allow:Everyone:rx')
     - 'Type:Flags:Trustee:Rights' for adding (e.g., 'Allow:fd:jsmith:rwx')
+
+    The trustee may itself contain a colon (e.g. 'Allow:fd:gid:14011:rwx').
 
     Args:
         pattern: The pattern string to parse
@@ -871,27 +945,30 @@ def parse_ace_pattern(pattern: str, pattern_type: str = 'remove') -> dict:
 
     if pattern_type == 'remove':
         # Format: Type:Trustee
-        if len(parts) != 2:
+        fields = split_ace_fields(pattern, 2, trustee_index=1)
+        if fields is None:
             log_stderr("ERROR", f"Invalid remove pattern '{pattern}': expected Type:Trustee")
             return None
-        result['raw_trustee'] = parts[1]
+        result['raw_trustee'] = fields[1]
 
     elif pattern_type in ('add_rights', 'remove_rights'):
         # Format: Type:Trustee:Rights
-        if len(parts) != 3:
+        fields = split_ace_fields(pattern, 3, trustee_index=1)
+        if fields is None:
             log_stderr("ERROR", f"Invalid rights pattern '{pattern}': expected Type:Trustee:Rights")
             return None
-        result['raw_trustee'] = parts[1]
-        result['rights'] = nfsv4_rights_to_qacl(parts[2])
+        result['raw_trustee'] = fields[1]
+        result['rights'] = nfsv4_rights_to_qacl(fields[2])
 
     elif pattern_type == 'add':
         # Format: Type:Flags:Trustee:Rights
-        if len(parts) != 4:
+        fields = split_ace_fields(pattern, 4, trustee_index=2)
+        if fields is None:
             log_stderr("ERROR", f"Invalid add pattern '{pattern}': expected Type:Flags:Trustee:Rights")
             return None
-        result['flags'] = nfsv4_flags_to_qacl(parts[1])
-        result['raw_trustee'] = parts[2]
-        result['rights'] = nfsv4_rights_to_qacl(parts[3])
+        result['flags'] = nfsv4_flags_to_qacl(fields[1])
+        result['raw_trustee'] = fields[2]
+        result['rights'] = nfsv4_rights_to_qacl(fields[3])
 
     return result
 
@@ -5640,6 +5717,10 @@ def parse_trustee(trustee_input: str) -> Dict:
     # Explicit type prefixes
     if trustee.startswith("auth_id:"):
         return {"payload": {"auth_id": trustee[8:]}, "type": "auth_id"}
+
+    # 'sid:S-1-...' is how grumpwalk prints SID trustees, so accept it back
+    if trustee.lower().startswith("sid:"):
+        return {"payload": {"sid": trustee[4:]}, "type": "sid"}
 
     if trustee.startswith("uid:"):
         try:
@@ -11255,7 +11336,8 @@ Examples:
         metavar="PATTERN",
         help="Add ACE with 'Type:Flags:Trustee:Rights'. Merges rights if ACE exists. "
              "Flags: f=file-inherit, d=dir-inherit. Rights: Read, Write, Modify, FullControl or NFSv4 (rwx). "
-             "Example: --add-ace 'Allow:fd:Group111:Modify'"
+             "Trustee may be a name, DOMAIN\\\\group, uid:N, gid:N, auth_id:N or a SID. "
+             "Example: --add-ace 'Allow:fd:Group111:Modify' or --add-ace 'Allow:fd:gid:14011:rwxda'"
     )
 
     ace_manipulation.add_argument(
