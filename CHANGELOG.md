@@ -5,6 +5,20 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.2] - 2026-08-10
+
+### Fixed
+
+- **`uid:N` and `gid:N` now work on clusters that cannot look the number up.** Adding an ACE for a numeric UID or GID failed outright wherever the cluster's identity service does not map bare POSIX numbers. `--add-ace 'Allow:fd:gid:14052:rwxda' --propagate` printed a summary that read like success (`ACEs added: 1`), then stopped with `Could not resolve trustee` and exited without changing the target directory or any child - the ACE simply never appeared. grumpwalk now hands the number to the cluster as a POSIX user or group trustee and lets the cluster do the mapping, which is what naming a raw UID or GID asks for in the first place. Clusters where the lookup already worked behave exactly as before.
+- **Child objects no longer receive an unusable trustee during propagation.** Children reused the identity looked up for the parent; if that lookup had failed, every child was sent the literal text (`gid:14052`) where an ID was expected, which the cluster rejects. Children now get the same POSIX trustee as the parent.
+- **A trustee that genuinely cannot be resolved now says so plainly.** The error states that no changes were applied, instead of following a summary that looked like the change had gone through.
+- **`--set-mode --propagate` no longer marks every child permission as inherited.** Children were written with the "inherited" flag set on all of their entries while the directory you pointed at kept explicit ones, so the same object ended up with different permissions depending on whether you ran the command on it directly or on its parent. It also mislabeled entries that had nothing to do with the change. This mattered beyond cosmetics: Windows shows inherited entries greyed out and uneditable, and because a mode carries nothing inheritable for a child to have inherited from, any "disable inheritance and remove" operation - in Windows or via grumpwalk's own `--remove-inherited` - would strip every entry and leave those files with no permissions at all. Children are now written explicitly, exactly like the target directory, which is what chmod means. A later `--add-ace` no longer produces a mixed ACL where old entries are inherited and the new one is not.
+
+### Notes
+
+- A bare number is still read as a **UID**, so keep the `uid:` or `gid:` prefix.
+- To check whether your cluster maps a number: `qq --host CLUSTER auth_find_identity --gid 14052`. Either way the ACE now applies.
+
 ## [3.8.1] - 2026-08-10
 
 ### Fixed

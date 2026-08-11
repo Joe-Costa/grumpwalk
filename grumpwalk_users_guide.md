@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.8.1** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.8.2** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1952,9 +1952,10 @@ out the same way:
 too, as do `auth_id:N` and a SID written either way (`S-1-5-21-...` or
 `sid:S-1-5-21-...`).
 
-The UID or GID does not have to exist in Active Directory. Qumulo recognizes
-any NFS UID or GID on its own, so these work on a cluster with no AD at all,
-and for numbers that were never linked to an AD account.
+The UID or GID does not have to exist in Active Directory, and it does not
+have to be known to the cluster's identity service either. The number is
+handed to the cluster as a POSIX user or group, so these work on a cluster
+with no AD at all, and for numbers that were never linked to an account.
 
 **Always include the `uid:` or `gid:` prefix.** A bare number is read as a UID,
 so `Allow:fd:14011:rwxda` grants access to *user* 14011, not group 14011 -
