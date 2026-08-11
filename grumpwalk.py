@@ -1603,11 +1603,25 @@ def apply_ace_modifications(
         merged = False
         for ace in aces:
             if match_ace(ace, pattern):
-                # Merge rights into existing ACE
+                # Merge rights AND the requested flags into the existing ACE.
+                # Merging only rights silently dropped the inheritance the
+                # caller asked for: 'Allow:fd:gid:14052:rwxda' against a trustee
+                # that already had an ACE granted the rights but left the ACE
+                # non-inheritable.
+                #
+                # Flags already on the ACE are preserved, INHERITED included:
+                # --add-ace adds what was asked for and does not editorialise
+                # about the rest of the entry.
                 existing_rights = set(ace.get('rights', []))
-                new_rights = set(pattern.get('rights', []))
-                ace['rights'] = list(existing_rights | new_rights)
-                stats['modified'] += 1
+                existing_flags = set(ace.get('flags', []))
+
+                merged_rights = existing_rights | set(pattern.get('rights', []))
+                merged_flags = existing_flags | set(pattern.get('flags', []))
+
+                if merged_rights != existing_rights or merged_flags != existing_flags:
+                    ace['rights'] = list(merged_rights)
+                    ace['flags'] = list(merged_flags)
+                    stats['modified'] += 1
                 merged = True
                 break
 
