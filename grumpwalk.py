@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.8.1"
+__version__ = "3.8.2"
 
 import argparse
 import asyncio
@@ -1169,6 +1169,33 @@ async def resolve_pattern_trustees(
             log_stderr("WARN", f"Could not resolve trustee '{raw_trustee}' - matching may fail")
 
 
+def trustee_payload_from_string(trustee: str) -> dict:
+    """
+    Build a v2 API trustee object from a raw trustee string.
+
+    'uid:N' and 'gid:N' become POSIX trustees, which the cluster maps to an
+    auth_id itself. That matters on clusters where the identity API cannot
+    resolve a bare UID or GID: specifying the number is precisely how an admin
+    asks for the POSIX identity, so it must not depend on a lookup succeeding.
+
+    Args:
+        trustee: Raw trustee string, e.g. 'gid:14052', 'auth_id:500', '12884903889'
+
+    Returns:
+        Trustee dict suitable for a v2 ACL PUT
+    """
+    lowered = trustee.lower()
+
+    if lowered.startswith('uid:') and trustee[4:].isdigit():
+        return {'domain': 'POSIX_USER', 'uid': int(trustee[4:])}
+    if lowered.startswith('gid:') and trustee[4:].isdigit():
+        return {'domain': 'POSIX_GROUP', 'gid': int(trustee[4:])}
+    if lowered.startswith('auth_id:') and trustee[8:].isdigit():
+        return {'auth_id': trustee[8:]}
+
+    return {'auth_id': trustee}
+
+
 def normalize_acl_for_put(acl: dict) -> dict:
     """
     Normalize ACL for PUT request to Qumulo API v2.
@@ -1201,10 +1228,12 @@ def normalize_acl_for_put(acl: dict) -> dict:
         ace.pop('_needs_resolution', None)
         ace.pop('trustee_details', None)
 
-        # v2 API requires trustee as object, not string
+        # v2 API requires trustee as object, not string. An unresolved
+        # 'uid:N'/'gid:N' becomes a POSIX trustee rather than a bogus auth_id,
+        # which the API would reject outright.
         trustee = ace.get('trustee')
         if isinstance(trustee, str):
-            ace['trustee'] = {'auth_id': trustee}
+            ace['trustee'] = trustee_payload_from_string(trustee)
 
     # Remove 'generated' field if present (read-only field from GET response)
     result.pop('generated', None)
@@ -1574,11 +1603,25 @@ def apply_ace_modifications(
         merged = False
         for ace in aces:
             if match_ace(ace, pattern):
-                # Merge rights into existing ACE
+                # Merge rights AND the requested flags into the existing ACE.
+                # Merging only rights silently dropped the inheritance the
+                # caller asked for: 'Allow:fd:gid:14052:rwxda' against a trustee
+                # that already had an ACE granted the rights but left the ACE
+                # non-inheritable.
+                #
+                # Flags already on the ACE are preserved, INHERITED included:
+                # --add-ace adds what was asked for and does not editorialise
+                # about the rest of the entry.
                 existing_rights = set(ace.get('rights', []))
-                new_rights = set(pattern.get('rights', []))
-                ace['rights'] = list(existing_rights | new_rights)
-                stats['modified'] += 1
+                existing_flags = set(ace.get('flags', []))
+
+                merged_rights = existing_rights | set(pattern.get('rights', []))
+                merged_flags = existing_flags | set(pattern.get('flags', []))
+
+                if merged_rights != existing_rights or merged_flags != existing_flags:
+                    ace['rights'] = list(merged_rights)
+                    ace['flags'] = list(merged_flags)
+                    stats['modified'] += 1
                 merged = True
                 break
 
@@ -6850,8 +6893,13 @@ async def _main_async(args):
                             else:
                                 child_acl = acl_data
 
+                            # Children are set explicitly, exactly like the target
+                            # path. --set-mode is chmod: it gives each object its
+                            # own permissions rather than establishing inheritance,
+                            # and a mode ACL carries no inheritable flags for a
+                            # child to have inherited from in the first place.
                             ok, err = await client.set_file_acl(
-                                session, child_path, child_acl, mark_inherited=True
+                                session, child_path, child_acl, mark_inherited=False
                             )
                             if ok and (resolved_owner_auth_id or resolved_group_auth_id):
                                 ok, err = await client.set_file_owner_group(
@@ -8299,8 +8347,20 @@ async def _main_async(args):
                         del ace['_needs_resolution']
                         if args.verbose:
                             log_stderr("INFO", f"Resolved '{raw_trustee}' to auth_id {resolved['auth_id']}")
+                    elif id_type in ('uid', 'gid'):
+                        # The identity API could not map this number, but the
+                        # cluster resolves a POSIX trustee on its own. Asking for
+                        # a raw UID/GID is asking for the POSIX identity, so this
+                        # is the answer rather than a fallback.
+                        ace['trustee'] = trustee_payload_from_string(raw_trustee)
+                        del ace['_needs_resolution']
+                        log_stderr("INFO",
+                                   f"'{raw_trustee}' is not mapped in the identity API; "
+                                   f"applying it as a POSIX {'user' if id_type == 'uid' else 'group'} trustee")
                     else:
-                        log_stderr("ERROR", f"Could not resolve trustee: {raw_trustee}")
+                        log_stderr("ERROR",
+                                   f"Could not resolve trustee: {raw_trustee}. "
+                                   f"No changes were applied.")
                         sys.exit(1)
 
             # Step 5: Apply modified ACL to target path (skipped in dry-run)
