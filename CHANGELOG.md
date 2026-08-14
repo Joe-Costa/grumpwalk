@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--size-totals-only`** - Answers "how much space does this add up to?" without printing the files. It applies the same filters you would use for a listing and reports the number of matching objects and the capacity they occupy on disk:
 
   ```
-  ./grumpwalk.py --host cluster --path /data --created-newer-than 217 --type file --size-totals-only
+  ./grumpwalk.py --host cluster --path /data --created-newer-than 200 --type file --size-totals-only
 
   ======================================================================
   Total matching objects:  1,284,552
