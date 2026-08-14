@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.8.2"
+__version__ = "3.9.0"
 
 import argparse
 import asyncio
@@ -61,6 +61,7 @@ from modules import (
     save_identity_cache,
     OwnerStats,
     DirectoryMatchStats,
+    MatchTotals,
     AsyncQumuloClient,
     resolve_owner_filters,
     glob_to_regex,
@@ -88,8 +89,14 @@ from modules.tuning import (
     format_benchmark_results,
     suggest_from_benchmark,
     get_profile_path,
+    retire_outdated_profile,
+    format_retired_profile_notice,
+    current_rss_mb,
     BENCHMARK_CONCURRENCY_LEVELS,
     BENCHMARK_FILE_LIMIT,
+    BENCHMARK_SECONDS_PER_LEVEL,
+    BENCHMARK_WARMUP_SECONDS,
+    BENCHMARK_MEASURE_SECONDS,
 )
 
 try:
@@ -6298,6 +6305,55 @@ async def generate_owner_report(
     print("=" * 80, file=sys.stderr)
 
 
+def render_size_totals(totals, args, elapsed):
+    """Render the --size-totals-only report.
+
+    Prints how many objects matched and the space they occupy. Capacity is
+    allocated blocks, the same measure --per-directory-matches uses, so the two
+    agree on the same set of files.
+
+    Args:
+        totals: A populated MatchTotals instance.
+        args: Parsed CLI arguments.
+        elapsed: Wall-clock seconds spent walking, for the summary line.
+    """
+    print("=" * 70, file=sys.stderr)
+    print("Total matching objects:  " f"{totals.total_files:,}", file=sys.stderr)
+    print("Total capacity used:     " f"{format_bytes(totals.total_capacity)}",
+          file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+
+    rate = totals.total_files / elapsed if elapsed > 0 else 0
+    print(f"\nProcessing time: {elapsed:.2f}s ({rate:,.0f} obj/sec)", file=sys.stderr)
+
+    if not (args.json or args.json_out or args.csv_out):
+        return
+
+    # Machine-readable form: one row, capacity in raw bytes.
+    row = {
+        "path": args.path,
+        "files": totals.total_files,
+        "capacity": totals.total_capacity,
+    }
+
+    if args.json:
+        json_parser.dump([row], sys.stdout, indent=2)
+        print()
+
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json_parser.dump([row], f, indent=2)
+        log_stderr("INFO", f"Wrote totals to {args.json_out}")
+
+    if args.csv_out:
+        import csv
+        with open(args.csv_out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["path", "files", "capacity"])
+            writer.writeheader()
+            writer.writerow(row)
+        log_stderr("INFO", f"Wrote totals to {args.csv_out}")
+
+
 def render_directory_match_report(dir_stats, args, elapsed):
     """Render the --per-directory-matches report.
 
@@ -6313,14 +6369,17 @@ def render_directory_match_report(dir_stats, args, elapsed):
         args: Parsed CLI arguments.
         elapsed: Wall-clock seconds spent walking, for the summary line.
     """
-    rows = dir_stats.rows(subdir_report=args.subdir_report)
+    rows = dir_stats.rows()
 
     # Sort: --sort size/count for admins hunting the biggest offenders,
     # otherwise (name or unset) alphabetical by path for a stable du-like view.
+    # Path is the tie-breaker so two runs over the same tree print the same
+    # order; directories that tie on size or count are otherwise ordered by
+    # whenever the concurrent walk happened to reach them.
     if args.sort == "size":
-        rows.sort(key=lambda r: r["capacity"], reverse=True)
+        rows.sort(key=lambda r: (-r["capacity"], r["path"]))
     elif args.sort == "count":
-        rows.sort(key=lambda r: r["files"], reverse=True)
+        rows.sort(key=lambda r: (-r["files"], r["path"]))
     else:
         rows.sort(key=lambda r: r["path"])
 
@@ -6366,6 +6425,11 @@ def render_directory_match_report(dir_stats, args, elapsed):
     print(f"\nProcessing time: {elapsed:.2f}s ({rate:,.0f} obj/sec)", file=sys.stderr)
 
     # Machine-readable output: display rows plus a depth=0 grand-total row.
+    # Built only when something will consume it -- under --subdir-report this
+    # is a full second copy of every row.
+    if not (args.json or args.json_out or args.csv_out):
+        return
+
     machine_rows = [dict(r) for r in rows]
     machine_rows.append({
         "path": dir_stats.root,
@@ -9247,8 +9311,43 @@ async def _main_async(args):
     # Per-directory match report mode: walk with the filters, aggregate matches
     # per directory (recursive rollup, on-disk capacity), and report. Terminal
     # mode -- returns without the standard streaming output.
+    if args.size_totals_only:
+        totals = MatchTotals()
+
+        async def size_totals_callback(entry):
+            totals.add(entry)
+            if progress:
+                await progress.increment_output()
+
+        sto_start = time.time()
+        async with client.create_session() as session:
+            await client.walk_tree_async(
+                session,
+                args.path,
+                args.max_depth,
+                progress=progress,
+                file_filter=file_filter,
+                omit_subdirs=args.omit_subdirs,
+                omit_paths=args.omit_path,
+                collect_results=False,
+                verbose=args.verbose,
+                max_entries_per_dir=args.max_entries_per_dir,
+                time_filter_info=time_filter_info,
+                size_filter_info=size_filter_info,
+                owner_filter_info=owner_filter_info,
+                output_callback=size_totals_callback,
+            )
+        sto_elapsed = time.time() - sto_start
+
+        if progress:
+            progress.final_report()
+
+        render_size_totals(totals, args, sto_elapsed)
+        save_identity_cache(client.persistent_identity_cache, verbose=args.verbose)
+        return
+
     if args.per_directory_matches:
-        dir_stats = DirectoryMatchStats(args.path)
+        dir_stats = DirectoryMatchStats(args.path, subdir_report=args.subdir_report)
 
         async def per_directory_callback(entry):
             dir_stats.add(entry)
@@ -10353,6 +10452,10 @@ async def _main_async(args):
 
 def main():
     # Load or generate tuning profile for defaults
+    # An upgrade can retire a profile written under the old, much higher
+    # concurrency defaults. The old values are kept so the user can put them
+    # back, and the notice is printed once the new profile has been generated.
+    retired_profile = retire_outdated_profile()
     tuning_profile = load_tuning_profile()
     is_first_run = tuning_profile is None
 
@@ -11572,6 +11675,16 @@ Examples:
         help="Show directory statistics only (no file enumeration)",
     )
     exploration.add_argument(
+        "--size-totals-only",
+        action="store_true",
+        help="Report only the number of matching objects and the on-disk "
+             "capacity they use, instead of listing them. Honors all the usual "
+             "filters, and uses the same allocated-space measure as "
+             "--per-directory-matches. Works with --json / --json-out / "
+             "--csv-out.",
+    )
+
+    exploration.add_argument(
         "--per-directory-matches",
         action="store_true",
         help="Walk the tree with the given filters and report, per directory, "
@@ -12132,6 +12245,40 @@ Examples:
             )
             sys.exit(1)
 
+    # --size-totals-only replaces the listing with a single total, so it cannot
+    # be combined with anything that produces its own output.
+    if getattr(args, 'size_totals_only', False):
+        conflicting = []
+        if args.per_directory_matches:
+            conflicting.append("--per-directory-matches")
+        if args.stats:
+            conflicting.append("--stats")
+        if args.show_dir_stats:
+            conflicting.append("--show-dir-stats")
+        if args.owner_report:
+            conflicting.append("--owner-report")
+        if args.acl_report:
+            conflicting.append("--acl-report")
+        if args.show_details:
+            conflicting.append("--show-details")
+        if getattr(args, 'find_similar', None):
+            conflicting.append("--find-similar")
+        if args.source_acl or args.source_acl_file or args.acl_target:
+            conflicting.append("--source-acl/--acl-target")
+        if args.move_to or args.copy_to or args.rename_to:
+            conflicting.append("--move-to/--copy-to/--rename-to")
+        if args.add_tag or args.find_tag or args.remove_tag:
+            conflicting.append("--add-tag/--find-tag/--remove-tag")
+        if conflicting:
+            print(
+                f"Error: --size-totals-only cannot be combined with {', '.join(conflicting)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.path:
+            print("Error: --size-totals-only requires --path", file=sys.stderr)
+            sys.exit(1)
+
     # --subdir-report only applies to --per-directory-matches
     if args.subdir_report and not args.per_directory_matches:
         print(
@@ -12229,7 +12376,9 @@ Examples:
         print(f"Cluster: {args.host}", file=sys.stderr)
         print(f"Path:    {args.path}", file=sys.stderr)
         print(f"Testing: {BENCHMARK_CONCURRENCY_LEVELS}", file=sys.stderr)
-        print(f"Limit:   {BENCHMARK_FILE_LIMIT:,} files per test", file=sys.stderr)
+        print(f"Time:    {BENCHMARK_SECONDS_PER_LEVEL:.0f}s per test "
+              f"({BENCHMARK_WARMUP_SECONDS:.0f}s warm-up, {BENCHMARK_MEASURE_SECONDS:.0f}s measured)",
+              file=sys.stderr)
         print("=" * 70, file=sys.stderr)
 
         # Run benchmark asynchronously
@@ -12265,19 +12414,52 @@ Examples:
                 start = time.time()
 
                 async with client.create_session() as session:
-                    await client.walk_tree_async(
-                        session=session,
-                        path=args.path,
-                        file_filter=None,
-                        collect_results=False,
-                        progress=progress,
+                    walk = asyncio.create_task(
+                        client.walk_tree_async(
+                            session=session,
+                            path=args.path,
+                            file_filter=None,
+                            collect_results=False,
+                            progress=progress,
+                        )
                     )
 
-                elapsed = time.time() - start
-                count = progress.matches
+                    # Let the walk get up to speed before timing anything.
+                    done, _ = await asyncio.wait(
+                        {walk}, timeout=BENCHMARK_WARMUP_SECONDS
+                    )
+
+                    if walk in done:
+                        # Whole tree walked before the clock started: too small
+                        # to measure, which the reliability check will catch.
+                        elapsed = time.time() - start
+                        count = progress.total_objects
+                        rss_mb = current_rss_mb()
+                    else:
+                        settled = progress.total_objects
+                        mark = time.time()
+                        await asyncio.wait({walk}, timeout=BENCHMARK_MEASURE_SECONDS)
+                        elapsed = time.time() - mark
+                        count = progress.total_objects - settled
+                        # Sampled while this level's requests are still in
+                        # flight, so it reflects what the setting really costs.
+                        rss_mb = current_rss_mb()
+                        walk.cancel()
+
+                    try:
+                        await walk
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+
                 rate = count / elapsed if elapsed > 0 else 0
-                results.append({'concurrent': concurrent, 'rate': rate, 'time': elapsed})
-                log_stderr("BENCH", f"{count:,} files in {elapsed:.1f}s = {rate:,.0f} obj/sec")
+                results.append({
+                    'concurrent': concurrent, 'rate': rate,
+                    'time': elapsed, 'rss_mb': rss_mb,
+                })
+                mem_note = f", {rss_mb:,.0f} MB" if rss_mb else ""
+                log_stderr("BENCH", f"{count:,} files in {elapsed:.1f}s = {rate:,.0f} obj/sec{mem_note}")
 
             return results
 
@@ -12316,9 +12498,16 @@ Examples:
         tuning_profile = generate_tuning_profile(profile_name)
         save_tuning_profile(tuning_profile)
         print("=" * 70, file=sys.stderr)
-        print("GrumpWalk - First Run Setup", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print("Detected system configuration:", file=sys.stderr)
+        if retired_profile:
+            print("GrumpWalk - Tuning Settings Reset", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print(format_retired_profile_notice(retired_profile), file=sys.stderr)
+            print("", file=sys.stderr)
+            print("New settings:", file=sys.stderr)
+        else:
+            print("GrumpWalk - First Run Setup", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print("Detected system configuration:", file=sys.stderr)
         print(format_profile_summary(tuning_profile), file=sys.stderr)
         print("", file=sys.stderr)
         print(f"Profile saved to: {get_profile_path()}", file=sys.stderr)

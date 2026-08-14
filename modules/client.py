@@ -1564,11 +1564,25 @@ class AsyncQumuloClient:
         except (ValueError, TypeError):
             total_entries = 0
 
-        # Decide enumeration strategy
-        # Use streaming for large directories when either:
-        # 1. We're collecting results (to save memory)
-        # 2. We have an output callback (for immediate output)
-        use_streaming = total_entries >= 50000 and (collect_results or output_callback is not None)
+        # Decide enumeration strategy.
+        #
+        # Batch mode holds a whole directory listing in the worker's frame at
+        # roughly 2.6 KB per parsed entry, and every concurrent worker holds
+        # one at the same time, so peak memory is (workers x directory size)
+        # rather than anything to do with the size of the result set. When a
+        # callback consumes entries one at a time there is nothing to gain by
+        # buffering, so stream regardless of how big the directory is.
+        #
+        # The size threshold still applies when results are being collected:
+        # there the entries are retained either way, so batch mode's single
+        # large request is worth it for small directories.
+        #
+        # Note total_entries is the RECURSIVE count for the subtree, which can
+        # be far larger than this directory's own entry count -- it is a hint,
+        # not a measure of what batch mode would buffer here.
+        use_streaming = output_callback is not None or (
+            total_entries >= 50000 and collect_results
+        )
 
         if verbose and use_streaming:
             print(

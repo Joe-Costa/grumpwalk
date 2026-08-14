@@ -24,6 +24,7 @@ test_migration.csv
 ace_manipulation*
 auto-tuning-plan.md
 tuning-profile
+tuning-profile.previous
 .claude/
 systemd-network*
 scrp*

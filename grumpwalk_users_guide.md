@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.8.2** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.9.0** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -540,6 +540,34 @@ Use `--sort` to order the table by size, file count, or name:
 # Alphabetical by path
 ./grumpwalk.py --host cluster --path /data --stats --max-depth 1 --sort name
 ```
+
+### How much space do my matching files add up to?
+
+When you only want the number, add `--size-totals-only` to the search you would
+otherwise run. It applies the same filters and prints one answer instead of a
+listing:
+
+```bash
+./grumpwalk.py --host cluster --path /data \
+  --created-newer-than 217 --type file \
+  --size-totals-only
+```
+
+```
+======================================================================
+Total matching objects:  1,284,552
+Total capacity used:     4.21 TiB
+======================================================================
+```
+
+Capacity is the space the files actually occupy on disk, so sparse files count
+as what they really use. The total is the same one you would get at the bottom
+of `--per-directory-matches` for the same filters -- this simply skips the
+per-directory breakdown.
+
+Add `--json`, `--json-out` or `--csv-out` to get the same two numbers in a form
+a script can read (as raw bytes). It costs the same memory whether ten files
+match or a hundred million.
 
 ### How do I get counts and capacity for only the files that match my filters?
 
@@ -2853,21 +2881,26 @@ This avoids API calls to `/v1/identity/expand` for every unique owner/group, whi
 
 ### How do I reduce memory usage?
 
-Memory usage scales primarily with the number of subdirectories being traversed, not the number of files. The main memory consumers are:
+Memory depends on how many directories grumpwalk reads at the same time, not
+on how many files it finds. Each simultaneous read holds about 2 MB while it is
+in progress, so `--max-concurrent` is the setting that matters.
 
-| Component | Impact | Tunable |
-|-----------|--------|---------|
-| Subdirectory queue | O(num_dirs) - paths held for processing | Partial |
-| Concurrency buffers | O(max_concurrent) - async task overhead | Yes |
-| Identity cache | O(unique_owners) - auth_id mappings | No |
-| Connection pool | O(connector_limit) - HTTP connections | Yes |
+Measured while reading two million objects from a 71-million-file system:
 
-**Reduce concurrency for memory-constrained systems:**
+| --max-concurrent | Memory used |
+|------------------|-------------|
+| 25 (default)     | 170 MB      |
+| 50               | 275 MB      |
+| 100              | 480 MB      |
+| 200              | 600 MB      |
+| 400              | 820 MB      |
+
+Speed was the same at every one of those settings, which is why the default is
+25. On a small machine you can go lower still:
+
 ```bash
-# For systems with <8GB RAM
 ./grumpwalk.py --host cluster --path /data \
-  --max-concurrent 25 \
-  --connector-limit 25 \
+  --max-concurrent 10 \
   --progress
 ```
 
@@ -2911,25 +2944,24 @@ done
 
 ### Memory Planning Guide
 
-Use this formula to estimate RAM requirements:
+Allow about 100 MB, plus roughly 2 MB for each simultaneous directory read:
 
-```
-RAM (GB) ~ (subdirectories / 50000) + (max_concurrent * 0.05) + 0.5
-```
+| --max-concurrent | Expect about |
+|------------------|--------------|
+| 10               | 150 MB       |
+| 25 (default)     | 200 MB       |
+| 50               | 300 MB       |
+| 100              | 500 MB       |
 
-**Example calculations:**
-- 50k subdirs, default concurrency: `50000/50000 + 100*0.05 + 0.5 = 6.5 GB`
-- 500k subdirs, default concurrency: `500000/50000 + 100*0.05 + 0.5 = 15.5 GB`
-- 500k subdirs, reduced concurrency: `500000/50000 + 25*0.05 + 0.5 = 11.75 GB`
+The size of the filesystem does not change these numbers -- grumpwalk streams
+its way through a tree rather than holding it -- so the same settings work for
+a hundred thousand files or a hundred million.
 
-**Recommended configurations by available RAM:**
-
-| Available RAM | --max-concurrent | --connector-limit | Notes |
-|---------------|------------------|-------------------|-------|
-| 4 GB | 25 | 25 | Use --max-depth or segment paths |
-| 8 GB | 50 | 50 | OK for <100k directories |
-| 16 GB | 100 | 100 | Default, handles most cases |
-| 32+ GB | 200-500 | 200 | High performance mode |
+Two things add to it. `--subdir-report` keeps a running total for every
+directory it reports, so on a filesystem with millions of directories allow
+extra. Reports that have to sort or compare everything before printing
+(`--show-details`, `--acl-report`, `--find-similar`) hold their results until
+the end; use `--csv-out` or `--json-out`, which write as they go.
 
 **Low-memory configuration example:**
 ```bash

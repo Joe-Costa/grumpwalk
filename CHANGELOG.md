@@ -5,6 +5,37 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.0] - 2026-08-13
+
+### Added
+
+- **`--size-totals-only`** - Answers "how much space does this add up to?" without printing the files. It applies the same filters you would use for a listing and reports the number of matching objects and the capacity they occupy on disk:
+
+  ```
+  ./grumpwalk.py --host cluster --path /data --created-newer-than 217 --type file --size-totals-only
+
+  ======================================================================
+  Total matching objects:  1,284,552
+  Total capacity used:     4.21 TiB
+  ======================================================================
+  ```
+
+  Capacity is the space actually allocated, so sparse files count as what they really use, and the figure matches the total from `--per-directory-matches` for the same filters. Memory stays flat however many objects match. Add `--json`, `--json-out` or `--csv-out` for a single machine-readable row of raw bytes.
+
+### Fixed
+
+- **Large crawls use much less memory and finish faster.** grumpwalk read each directory into memory in full before doing anything with it, and every concurrent request held one at the same time, so memory grew with how many directories were being read at once rather than with anything you asked for - enough to run out of memory on a big filesystem. Directories are now handled as their contents arrive. Measured against a tree of 71 million files in 33 million directories, reaching two million objects went from about 2.2 GB down to about 0.5 GB, and took roughly half the time. This applies to every operation that walks a tree, not just reports.
+- **`--per-directory-matches` no longer keeps track of directories it will never report.** The report lists the immediate children of `--path`, but every directory below them was being tallied too. On a filesystem with millions of directories that is millions of running totals kept in order to print a handful of lines. `--subdir-report` still tracks every subdirectory, because that is what it reports.
+- **`--sort size` and `--sort count` now list tied directories in the same order every time.** Directories with matching sizes or counts came out in whatever order the walk happened to finish them, so the same report run twice could not be compared. Ties are now broken by path.
+
+### Changed
+
+- **Default settings now use far fewer simultaneous directory reads, and your existing settings have been reset.** grumpwalk used to work up to 200-500 at once. Testing across a 71-million-file system found that nothing above about 25 ran any faster - on a fast local link or a slow VPN alike - while each extra one added memory. The default is now 25, which uses roughly 200 MB instead of several gigabytes.
+
+  The first run after upgrading replaces your tuning profile. Your old settings are written to `tuning-profile.previous` and printed on screen, so nothing is lost: pass them on the command line if you want them back for a particular job.
+
+- **`--benchmark` now reports what each setting costs in memory, and only recommends a higher one when it is clearly worth it.** It previously reported speed alone and suggested whichever number came out fastest, even when the difference was noise. Repeating the same test on the same filesystem produced results three times apart for the same setting, because a walk speeds up and slows down depending on where it has reached. Each test now runs for a fixed time after a warm-up, shows memory alongside speed, and says plainly when a directory was too small to measure anything useful.
+
 ## [3.8.2] - 2026-08-10
 
 ### Fixed
