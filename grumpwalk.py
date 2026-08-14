@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.9.0"
+__version__ = "3.9.1"
 
 import argparse
 import asyncio
@@ -91,6 +91,8 @@ from modules.tuning import (
     get_profile_path,
     retire_outdated_profile,
     format_retired_profile_notice,
+    calculate_base_concurrency,
+    detect_available_memory,
     current_rss_mb,
     BENCHMARK_CONCURRENCY_LEVELS,
     BENCHMARK_FILE_LIMIT,
@@ -10492,15 +10494,29 @@ def main():
         print("=" * 70, file=sys.stderr)
         sys.exit(0)
 
-    # Get defaults from profile (or use hardcoded defaults if no profile)
+    # Generate the profile before the defaults are read from it, so the very
+    # first run uses the settings it just worked out for this machine. It used
+    # to be generated after the arguments were parsed, which left the first run
+    # -- and only the first run -- on hardcoded values.
+    if is_first_run:
+        first_run_profile_name = 'balanced'
+        for i, arg in enumerate(sys.argv):
+            if arg == '--tuning-profile' and i + 1 < len(sys.argv):
+                first_run_profile_name = sys.argv[i + 1]
+        tuning_profile = generate_tuning_profile(first_run_profile_name)
+        save_tuning_profile(tuning_profile)
+
+    # Get defaults from the profile, falling back to the same values the
+    # tuning module would recommend if one could not be generated.
     if tuning_profile:
         default_max_concurrent = tuning_profile['recommended']['max_concurrent']
         default_connector_limit = tuning_profile['recommended']['connector_limit']
         default_acl_concurrency = tuning_profile['recommended']['acl_concurrency']
     else:
-        default_max_concurrent = 100
-        default_connector_limit = 100
-        default_acl_concurrency = 100
+        fallback = calculate_base_concurrency(detect_available_memory())
+        default_max_concurrent = fallback['max_concurrent']
+        default_connector_limit = fallback['connector_limit']
+        default_acl_concurrency = fallback['acl_concurrency']
 
     parser = argparse.ArgumentParser(
         description="Qumulo File Filter and Directory Tree Walker Tool",
@@ -12494,9 +12510,8 @@ Examples:
 
     # Handle first-run tuning profile generation
     if is_first_run:
-        profile_name = args.tuning_profile if hasattr(args, 'tuning_profile') else 'balanced'
-        tuning_profile = generate_tuning_profile(profile_name)
-        save_tuning_profile(tuning_profile)
+        # The profile was generated before the arguments were parsed so this
+        # run could use it; here it is only reported.
         print("=" * 70, file=sys.stderr)
         if retired_profile:
             print("GrumpWalk - Tuning Settings Reset", file=sys.stderr)

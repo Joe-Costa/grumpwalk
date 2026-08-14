@@ -5,6 +5,12 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.1] - 2026-08-14
+
+### Fixed
+
+- **A new install used the wrong settings on its very first run.** grumpwalk works out the right settings for your machine the first time it runs, saves them, and prints them on screen -- but that first crawl went ahead with a built-in value of 100 simultaneous directory reads instead, four to five times what it had just chosen, and only used the saved settings from the second run onwards. The first run after upgrading behaved the same way. Runs now use the settings they display.
+
 ## [3.9.0] - 2026-08-13
 
 ### Added
