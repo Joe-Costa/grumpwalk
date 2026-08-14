@@ -53,6 +53,7 @@ from .credentials import (
 from .stats import (
     OwnerStats,
     DirectoryMatchStats,
+    MatchTotals,
 )
 
 # Import async Qumulo API client
@@ -121,6 +122,7 @@ __all__ = [
     # Stats
     "OwnerStats",
     "DirectoryMatchStats",
+    "MatchTotals",
     # Client
     "AsyncQumuloClient",
     # Filters

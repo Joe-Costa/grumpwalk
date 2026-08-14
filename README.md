@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.8.2** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.9.0** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -48,6 +48,7 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Progress tracking** - Real-time statistics with smart skip counters
 - **Multiple output formats** - Plain text, JSON, or CSV
 - **Directory statistics** - Quick aggregate counts without a tree walk (`--stats`)
+- **Match totals** - Just the number of matching files and the space they use, with no listing (`--size-totals-only`)
 - **Per-directory match report** - Count and capacity of files matching your filters, broken down by directory (`--per-directory-matches`)
 - **Directory scope preview** - Shows total subdirs/files before every operation
 - **Owner reports** - Generate storage capacity breakdowns by owner
@@ -389,6 +390,7 @@ yourself. Both also apply to `--omit-subdirs`, which stays a glob unless you pas
 - `--omit-path PATH` - Skip specific absolute path (must start with `/`, repeatable)
 - `--max-entries-per-dir N` - Skip directories exceeding N entries
 - `--stats` - Show directory aggregate statistics (files, subdirectories, total size) and exit. Reports the whole subtree and ignores per-file filters (time, size, name, type, owner); use `--per-directory-matches` when you need a filtered breakdown. Supports `--max-depth`, `--omit-subdirs`, `--omit-path`, and all output options (`--json`, `--json-out`, `--csv-out`)
+- `--size-totals-only` - Report only how many objects matched and the on-disk capacity they use, instead of listing them. Applies all the usual filters and uses the same allocated-space measure as `--per-directory-matches`. Works with `--json`, `--json-out` and `--csv-out`
 - `--sort {size,count,name}` - Sort `--stats` or `--per-directory-matches` table output by total size, file count, or path name
 - `--show-dir-stats` - Show directory statistics (file/dir counts, sizes)
 - `--per-directory-matches` - Report, per directory, the number of matching files and how much disk capacity they use. Applies all your filters (time, size, name, type, owner) and `--max-depth`. By default it lists the immediate subdirectories of `--path`, each total covering everything beneath it, plus a grand total. Works with `--sort` and with `--csv-out` / `--json-out` / `--json`
@@ -818,6 +820,8 @@ Grumpwalk automatically detects your system resources and generates optimal perf
 
 On first run, grumpwalk detects your platform (macOS, Linux, Windows, WSL), available RAM, and file descriptor limits to generate a tuning profile saved to `tuning-profile` in the grumpwalk directory.
 
+Settings are deliberately modest. Reading many directories at once is what uses memory, and testing on a 71-million-file system found no extra speed beyond about 25 simultaneous reads, so that is the default. Raising it costs memory without going faster.
+
 ### Tuning Commands
 
 ```bash
@@ -836,26 +840,31 @@ On first run, grumpwalk detects your platform (macOS, Linux, Windows, WSL), avai
 
 ### Benchmark Mode
 
-The `--benchmark` flag tests multiple concurrency levels against your cluster and suggests optimal settings:
+The `--benchmark` flag times several concurrency levels against your cluster and reports what each one costs in memory:
 
 ```
 ======================================================================
 Benchmark Results:
-  Concurrent | Rate (obj/sec) | Time
-  -----------|----------------|------
-         100 |         17,066 | 6.8s
-         150 |         17,628 | 6.6s
-         200 |         17,803 | 6.5s
-         250 |         16,288 | 7.1s
-         300 |         18,061 | 6.4s *
-         400 |         13,456 | 8.6s
+  Concurrent | Rate (obj/sec) | Time   | Memory
+  -----------|----------------|--------|-------
+          10 |          7,418 |  10.0s |   378 MB
+          25 |         20,615 |  10.0s |   612 MB <- recommended
+          50 |         19,452 |  10.0s |   832 MB
+         100 |         19,779 |  10.0s | 1,063 MB
+         200 |         12,492 |  10.0s | 1,140 MB
 
 Suggested settings:
-  max-concurrent:  300
-  connector-limit: 300
-  acl-concurrency: 240
+  max-concurrent:  25
+  connector-limit: 100
+  acl-concurrency: 100
 ======================================================================
 ```
+
+Rates move around between runs depending on which part of the filesystem each
+test happens to reach, so a higher setting is only recommended when it is far
+faster, not merely faster. Point `--benchmark` at a large directory: on a small
+one every test finishes instantly and measures nothing, and grumpwalk will say
+so rather than guess.
 
 ## Performance Tips
 
@@ -866,6 +875,7 @@ Suggested settings:
 5. **Use --limit** for testing before full runs
 6. **Smart skipping** automatically avoids directories that can't match your filters
 7. **If you see rate limiting** (429 warnings or an INCOMPLETE CRAWL report), lower **--max-concurrent** and re-run
+8. **Raise --max-concurrent only if a benchmark shows it helps** - it is the main thing that drives memory use, and on the systems tested nothing above 25 ran any faster
 
 ## Architecture
 

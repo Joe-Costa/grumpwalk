@@ -45,14 +45,68 @@ class OwnerStats:
         return self.owner_data.get(owner_auth_id, {"bytes": 0, "files": 0, "dirs": 0})
 
 
+BLOCK_SIZE = 4096
+
+
+def entry_capacity(entry: dict) -> int:
+    """
+    On-disk used capacity of one entry, in bytes.
+
+    Allocated blocks rather than logical size, so sparse files are reported as
+    the space they actually occupy. Falls back to logical size when a response
+    carries no block counts.
+
+    Shared by every report that totals capacity, so they cannot drift apart.
+
+    Args:
+        entry: File/directory entry dict from the walk
+
+    Returns:
+        Capacity in bytes
+    """
+    datablocks = entry.get("datablocks")
+    metablocks = entry.get("metablocks")
+    if datablocks is not None or metablocks is not None:
+        return (int(datablocks or 0) + int(metablocks or 0)) * BLOCK_SIZE
+    return int(entry.get("size", 0) or 0)
+
+
+class MatchTotals:
+    """Count and total capacity of matching objects, for --size-totals-only.
+
+    Fed one matched entry at a time from the tree walk and keeps two running
+    numbers, so the totals cost the same memory whether the walk matches ten
+    objects or a hundred million.
+    """
+
+    def __init__(self):
+        self.total_files = 0
+        self.total_capacity = 0
+
+    def add(self, entry: dict) -> None:
+        """Add one matched entry to the totals.
+
+        Runs inside the async walk's single-threaded event loop with no awaits,
+        so it is atomic with respect to other callbacks (no lock needed).
+        """
+        self.total_files += 1
+        self.total_capacity += entry_capacity(entry)
+
+
 class DirectoryMatchStats:
     """Aggregate filtered matches per directory for --per-directory-matches.
 
-    Fed one matched entry at a time from the tree walk. For each match, every
-    ancestor directory between the search root and the object's parent is
-    credited (recursive, du-style rollup), so a directory's totals include all
-    matches anywhere in its subtree. A grand total across the whole tree is
-    tracked separately.
+    Fed one matched entry at a time from the tree walk. Each match is credited
+    to its ancestor directories (recursive, du-style rollup), so a directory's
+    totals include all matches anywhere in its subtree. A grand total across
+    the whole tree is tracked separately and is always complete.
+
+    How many ancestors are credited depends on what will be reported. The
+    default report lists only the immediate children of the root, so only those
+    are tracked and one bucket is held per child. Under subdir_report every
+    directory containing a match is reported, so one bucket is held per such
+    directory -- unavoidable for that report, but it means memory grows with
+    the size of the tree.
 
     Capacity is actual on-disk usage -- (datablocks + metablocks) * 4096 --
     which reflects what admins care about (allocated space, correct for sparse
@@ -61,12 +115,19 @@ class DirectoryMatchStats:
 
     BLOCK_SIZE = 4096
 
-    def __init__(self, root_path: str):
+    def __init__(self, root_path: str, subdir_report: bool = False):
         """
         Args:
             root_path: The --path search root that all matches live under.
+            subdir_report: Whether every subdirectory will be reported. When
+                False only the immediate children of the root are ever
+                displayed, so only those are tracked and memory is bounded by
+                the root's fan-out instead of the size of the tree. When True
+                every directory containing a match is kept, because every one
+                of them is reported.
         """
         self.root = self._normalize(root_path)
+        self.subdir_report = subdir_report
         # dir_path -> {"files": int, "capacity": int, "depth": int}
         self.dirs: Dict[str, Dict] = {}
         self.total_files = 0
@@ -79,11 +140,7 @@ class DirectoryMatchStats:
 
     def _capacity(self, entry: dict) -> int:
         """On-disk used capacity of an entry, in bytes."""
-        datablocks = entry.get("datablocks")
-        metablocks = entry.get("metablocks")
-        if datablocks is not None or metablocks is not None:
-            return (int(datablocks or 0) + int(metablocks or 0)) * self.BLOCK_SIZE
-        return int(entry.get("size", 0) or 0)
+        return entry_capacity(entry)
 
     def add(self, entry: dict) -> None:
         """Credit one matched entry to the grand total and its ancestor dirs.
@@ -113,7 +170,14 @@ class DirectoryMatchStats:
         components = rel.split("/") if rel else []
         # Ancestor directories are the prefixes excluding the final component
         # (the matched object itself). depth == number of components below root.
-        for depth in range(1, len(components)):
+        #
+        # Only the depth-1 bucket is ever displayed unless every subdirectory
+        # was asked for. Crediting deeper ancestors costs one bucket for every
+        # directory in the tree that contains a match -- enough to exhaust
+        # memory on a filesystem with millions of directories, to produce rows
+        # that are then discarded. Stop at depth 1 unless they will be shown.
+        deepest = len(components) if self.subdir_report else min(2, len(components))
+        for depth in range(1, deepest):
             if self.root == "/":
                 dir_path = "/" + "/".join(components[:depth])
             else:
@@ -125,17 +189,22 @@ class DirectoryMatchStats:
                 bucket["files"] += 1
                 bucket["capacity"] += cap
 
-    def rows(self, subdir_report: bool = False) -> List[Dict]:
+    def rows(self) -> List[Dict]:
         """Return per-directory rows to display.
 
-        Without subdir_report: only the immediate children of the root
-        (depth 1), each a rollup of its whole subtree (du -d1 style).
-        With subdir_report: every directory that contains matches, at every
-        depth reached by the walk (du style).
+        In the default mode: only the immediate children of the root (depth 1),
+        each a rollup of its whole subtree (du -d1 style). Under subdir_report:
+        every directory that contains matches, at every depth reached by the
+        walk (du style).
+
+        The mode comes from the instance rather than the caller, because only
+        what the instance was told to track was ever recorded -- asking here
+        for a deeper report than was collected would silently print a partial
+        one under a heading promising the full tree.
         """
         rows = []
         for dir_path, bucket in self.dirs.items():
-            if not subdir_report and bucket["depth"] != 1:
+            if not self.subdir_report and bucket["depth"] != 1:
                 continue
             rows.append({
                 "path": dir_path,
