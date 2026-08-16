@@ -5,6 +5,12 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.2] - 2026-08-15
+
+### Fixed
+
+- **`--progress` counted most objects twice.** The running "objects processed" figure could climb well past the number of objects that exist in the path -- a search of a directory holding 10.6 million objects reported over 18 million -- and the objects/sec rate was inflated by the same amount. Anything a directory contained was counted once as it was read and again when the directory finished, for every directory below 50,000 entries. Results were never affected: totals, matches and output were always correct, and only the progress display was wrong. `--limit` was affected, though, and could stop at roughly half the number of results asked for.
+
 ## [3.9.1] - 2026-08-14
 
 ### Fixed

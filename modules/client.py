@@ -1706,6 +1706,18 @@ class AsyncQumuloClient:
                         break  # Stop processing entries
                     await output_callback(entry)
 
+        # Progress is updated here, in the one place that knows which way the
+        # directory was actually read. The caller used to re-derive that from
+        # the aggregates, which silently double counted every entry once the
+        # two copies of the rule drifted apart.
+        if progress:
+            if use_streaming:
+                # Entries were counted page by page as they arrived; this adds
+                # the directory itself.
+                await progress.update(0, 1, 0)
+            else:
+                await progress.update(total_processed, 1, match_count)
+
         return (matching_entries, subdirs, match_count, total_processed)
 
     async def walk_tree_async(
@@ -1963,17 +1975,8 @@ class AsyncQumuloClient:
                 if progress and omitted_paths_count > 0:
                     await progress.increment_skipped(0, omitted_paths_count)
 
-            # Update progress for batch mode
-            try:
-                tf = int(aggregates.get("total_files", 0))
-                td = int(aggregates.get("total_directories", 0))
-                te = tf + td
-                used_streaming = te >= 50000 and (collect_results or output_callback is not None)
-            except (ValueError, TypeError):
-                used_streaming = False
-
-            if progress and not used_streaming:
-                await progress.update(total_processed, 1, match_count)
+            # Progress for this directory was already recorded by
+            # enumerate_directory_adaptive, which knows how it was read.
 
             # Collect results if needed
             if collect_results and matching_entries:
