@@ -6795,10 +6795,33 @@ async def _main_async(args):
         async with client.create_session() as session:
             aggregates = await client.get_directory_aggregates(session, args.path)
             if "error" not in aggregates:
-                total_files = int(aggregates.get("total_files", 0))
-                total_dirs = int(aggregates.get("total_directories", 0))
+                def _count(field):
+                    try:
+                        return int(aggregates.get(field, 0) or 0)
+                    except (ValueError, TypeError):
+                        return 0
+
+                total_files = _count("total_files")
+                total_dirs = _count("total_directories")
+                total_symlinks = _count("total_symlinks")
+                total_other = _count("total_other_objects")
+
+                # Symlinks and any other object types are walked too, so the
+                # total is what the progress counter will climb towards --
+                # a scope line that left them out read as smaller than the
+                # work that followed it.
+                scope = [
+                    f"{total_dirs:,} directories",
+                    f"{total_files:,} files",
+                    f"{total_symlinks:,} symlinks",
+                ]
+                if total_other:
+                    scope.append(f"{total_other:,} other objects")
+
+                grand_total = total_dirs + total_files + total_symlinks + total_other
                 print(
-                    f"Searching {total_dirs:,} directories and {total_files:,} files",
+                    f"Searching {', '.join(scope[:-1])} and {scope[-1]} "
+                    f"({grand_total:,} objects total)",
                     file=sys.stderr,
                 )
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.9.2] - 2026-08-15
 
+### Changed
+
+- **The line printed before a search now counts symlinks, and gives an object total.** It previously listed only directories and files, which read as a smaller job than the one that followed, because symlinks are walked too. A search that reports `21,002 directories, 460,569 files and 35,896 symlinks (517,467 objects total)` now ends on exactly 517,467 objects processed, so the figure you see at the start is the one `--progress` counts towards. Other object types are included in the total and listed when there are any.
+
 ### Fixed
 
 - **`--progress` counted most objects twice.** The running "objects processed" figure could climb well past the number of objects that exist in the path -- a search of a directory holding 10.6 million objects reported over 18 million -- and the objects/sec rate was inflated by the same amount. Anything a directory contained was counted once as it was read and again when the directory finished, for every directory below 50,000 entries. Results were never affected: totals, matches and output were always correct, and only the progress display was wrong. `--limit` was affected, though, and could stop at roughly half the number of results asked for.
