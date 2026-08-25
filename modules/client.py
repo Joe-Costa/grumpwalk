@@ -46,6 +46,45 @@ SKIP_ATIME_MIN_VERSION = (7, 9, 0)
 # into a silently dropped subtree.
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
+def build_ssl_context(verify_tls: bool = True,
+                      ca_bundle: Optional[str] = None) -> ssl.SSLContext:
+    """Build the TLS context used for every request to the cluster.
+
+    Verification is the default. grumpwalk sends a bearer token on every
+    call, so an unverified connection hands that token to anything able to
+    intercept the route, and a crawl's metadata with it.
+
+    Qumulo clusters often present a certificate this machine has no reason to
+    trust - self-signed, or signed by an internal CA - which is why turning
+    verification off stays available. Point --ca-bundle at the signing CA to
+    keep verification and trust the cluster.
+
+    Args:
+        verify_tls: Check the certificate chain and hostname.
+        ca_bundle: PEM file of trusted CA certificates to verify against,
+            instead of the system trust store.
+
+    Returns:
+        A configured SSLContext.
+
+    Raises:
+        OSError: The CA bundle could not be read.
+        ssl.SSLError: The CA bundle is not valid PEM.
+    """
+    if ca_bundle:
+        context = ssl.create_default_context(cafile=ca_bundle)
+    else:
+        context = ssl.create_default_context()
+
+    if not verify_tls:
+        # Order matters: Python rejects verify_mode=CERT_NONE while
+        # check_hostname is still set.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    return context
+
+
 class AsyncQumuloClient:
     """Async Qumulo API client using aiohttp with optimized connection pooling."""
 
@@ -60,6 +99,8 @@ class AsyncQumuloClient:
         verbose: bool = False,
         update_atime: bool = False,
         max_retries: int = 5,
+        verify_tls: bool = True,
+        ca_bundle: Optional[str] = None,
     ):
         self.host = host
         self.port = port
@@ -91,10 +132,12 @@ class AsyncQumuloClient:
         self.cluster_version: Optional[str] = None
         self.api_version: Optional[tuple] = None
 
-        # Create SSL context that doesn't verify certificates (for self-signed certs)
-        self.ssl_context = ssl.create_default_context()
-        self.ssl_context.check_hostname = False
-        self.ssl_context.verify_mode = ssl.CERT_NONE
+        # TLS. Verification is on unless the caller turns it off; the bearer
+        # token is sent on every request, so an unverified connection puts it
+        # in reach of anything on the path.
+        self.verify_tls = verify_tls
+        self.ca_bundle = ca_bundle
+        self.ssl_context = build_ssl_context(verify_tls, ca_bundle)
 
         # Configure connection pooling
         self.connector_limit = connector_limit

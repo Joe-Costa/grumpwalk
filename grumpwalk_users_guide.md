@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.9.2** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.9.3** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -55,7 +55,33 @@ A practical guide with recipes for common storage administration tasks using gru
    Log in as a user with the RBAC rights for whatever grumpwalk will do, and treat
    these keys like any other credentials - secure them properly.
 
-2. **Dependencies**: Install required packages:
+2. **TLS certificates**: grumpwalk verifies the cluster's certificate. Your
+   bearer token goes out with every request, so an unverified connection puts
+   it within reach of anything sitting on the network path.
+
+   Many Qumulo clusters present a self-signed certificate, or one signed by an
+   internal CA that this machine has no reason to trust. When that happens the
+   run stops and tells you how to proceed:
+
+   ```
+   Verifying cluster connection... FAILED
+   [ERROR] TLS certificate verification failed for cluster.example.com:8000
+   [HINT] If the cluster uses an internally signed or self-signed certificate,
+          trust its CA with --ca-bundle /path/to/ca.pem
+   [HINT] To connect without verifying, use --verify-tls no (or set
+          GRUMPWALK_VERIFY_TLS=no).
+   ```
+
+   The best answer is to keep verification and trust your CA:
+   ```bash
+   ./grumpwalk.py --host cluster.example.com --ca-bundle /path/to/internal-ca.pem ...
+   ```
+
+   Failing that, turn it off for one run with `--verify-tls no`, or for every
+   run by exporting `GRUMPWALK_VERIFY_TLS=no` - worth adding to your shell
+   profile if none of your clusters have certificates you can verify.
+
+3. **Dependencies**: Install required packages:
    ```bash
    pip install aiohttp
 

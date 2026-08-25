@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.9.2** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.9.3** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -60,6 +60,7 @@ Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md)
 - **Object tagging** - Add, find, and remove custom key/value tags on matching objects
 - **Extended attribute management** - Find and set DOS attributes (read_only, hidden, system, archive)
 - **Similarity detection** - Find similar files using adaptive sampling
+- **Verified TLS** - Certificate and hostname verification on by default, with `--ca-bundle` for internal CAs and an opt-out for self-signed clusters
 - **Auto-tuning** - Automatic performance tuning based on system resources
 
 ## Requirements
@@ -334,6 +335,23 @@ Use `--show-owner` and `--show-group` to include owner and group columns in the 
 - `--port PORT` - API port (default: 8000)
 - `--credentials-store PATH` - Credentials file path
 - `--update-atime` - Allow access times (atime) to be updated by grumpwalk's reads. By default, on clusters that support it (Qumulo Core 7.9.0+), grumpwalk suppresses atime updates so a crawl does not disturb access-time metadata. This flag restores normal atime behavior.
+- `--verify-tls yes|no` - Verify the cluster's TLS certificate (default: `yes`)
+- `--ca-bundle PATH` - PEM bundle of CA certificates to verify against, instead of the machine's trust store. Implies verification
+
+**TLS verification is on by default.** Your bearer token is sent on every request, so an unverified connection puts it within reach of anything on the network path. Qumulo clusters often present a self-signed certificate or one signed by an internal CA, which this machine has no reason to trust - if so, a run will stop and tell you how to proceed:
+
+```bash
+# Best: keep verification, and trust the CA that signed the cluster certificate
+./grumpwalk.py --host cluster --path / --ca-bundle /path/to/internal-ca.pem
+
+# Or turn verification off for one run
+./grumpwalk.py --host cluster --path / --verify-tls no
+
+# Or for every run, if all your clusters are self-signed
+export GRUMPWALK_VERIFY_TLS=no
+```
+
+The flag beats the environment variable, and `--ca-bundle` implies verification.
 
 ### Name/Type Filters
 - `--name PATTERN` - Match by name (glob/regex, OR logic, repeatable)
