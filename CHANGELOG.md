@@ -5,6 +5,34 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.3] - 2026-08-25
+
+### Changed
+
+- **grumpwalk now verifies the cluster's TLS certificate.** Every request carries your bearer token, and until now every one of them went over a connection nobody had authenticated: certificate and hostname checking were switched off with no way to turn them back on. Anything able to sit on the route between you and the cluster could read the token and everything the crawl returned.
+
+  Verification is now on by default. **If your cluster presents a self-signed certificate, or one signed by an internal CA, runs that used to work will now stop** with an explanation and three ways forward:
+
+  ```
+  Verifying cluster connection... FAILED
+  [ERROR] TLS certificate verification failed for cluster.example.com:8000
+  [HINT] [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate
+  [HINT] If the cluster uses an internally signed or self-signed certificate, trust its CA
+         with --ca-bundle /path/to/ca.pem
+  [HINT] To connect without verifying, use --verify-tls no (or set GRUMPWALK_VERIFY_TLS=no).
+         The bearer token is then sent over a connection nothing has authenticated.
+  ```
+
+### Added
+
+- **`--ca-bundle PATH`** - Verify against a PEM bundle of your own CA certificates instead of the machine's trust store. This is the option to reach for with an internal CA: you keep verification rather than giving it up.
+- **`--verify-tls yes|no`** - Turn verification off for a single run.
+- **`GRUMPWALK_VERIFY_TLS=no`** - Turn it off for every run, so a site whose clusters all present self-signed certificates can set it once instead of appending a flag to every command. The flag beats the environment variable, and `--ca-bundle` implies verification. A value that is neither yes nor no is an error rather than a silent fallback, because guessing either way would be wrong for a setting that decides whether a credential crosses an authenticated connection.
+
+### Fixed
+
+- **A local `import os.path` inside the main routine shadowed the module-level `os`** for the whole function, so any use of `os` earlier in it failed with "cannot access local variable 'os'". Nothing hit it before now because nothing used `os` earlier in that function.
+
 ## [3.9.2] - 2026-08-15
 
 ### Changed

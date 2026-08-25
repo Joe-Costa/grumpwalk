@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.9.2"
+__version__ = "3.9.3"
 
 import argparse
 import asyncio
@@ -6460,6 +6460,65 @@ def render_directory_match_report(dir_stats, args, elapsed):
         log_stderr("INFO", f"Wrote {len(machine_rows)} rows to {args.csv_out}")
 
 
+def report_tls_failure(host, port, ca_bundle, error) -> None:
+    """Explain a rejected certificate and the three ways forward, then exit.
+
+    This can surface at either of two points - the connection check, which
+    completes a TLS handshake, or the first authenticated request - so both
+    call this rather than describing it twice.
+    """
+    log_stderr("ERROR", f"TLS certificate verification failed for {host}:{port}",
+               newline_before=True)
+    log_stderr("HINT", f"{error}")
+    if ca_bundle:
+        log_stderr("HINT", f"The certificate was checked against {ca_bundle}; "
+                           f"confirm that bundle signs this cluster's certificate")
+    else:
+        log_stderr("HINT", "If the cluster uses an internally signed or "
+                           "self-signed certificate, trust its CA with "
+                           "--ca-bundle /path/to/ca.pem")
+    log_stderr("HINT", f"To connect without verifying, use --verify-tls no (or "
+                       f"set {VERIFY_TLS_ENV}=no). The bearer token is then "
+                       f"sent over a connection nothing has authenticated.")
+    sys.exit(1)
+
+
+VERIFY_TLS_ENV = "GRUMPWALK_VERIFY_TLS"
+
+_TRUTHY = {"yes", "y", "true", "1", "on", "enable", "enabled"}
+_FALSEY = {"no", "n", "false", "0", "off", "disable", "disabled"}
+
+
+def resolve_verify_tls(args) -> bool:
+    """Decide whether to verify the cluster's certificate.
+
+    The flag wins, then the environment, then the secure default. The
+    environment variable exists so a site whose clusters all present
+    certificates this machine cannot verify can set it once, instead of
+    appending a flag to every command.
+
+    An unreadable value is an error rather than a silent fallback: this
+    setting decides whether a bearer token crosses an authenticated
+    connection, and quietly guessing either way would be wrong.
+    """
+    if getattr(args, "ca_bundle", None):
+        return True
+    if getattr(args, "verify_tls", None) is not None:
+        return args.verify_tls == "yes"
+
+    raw = os.environ.get(VERIFY_TLS_ENV)
+    if raw is None or raw.strip() == "":
+        return True
+    value = raw.strip().lower()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSEY:
+        return False
+    log_stderr("ERROR", f"{VERIFY_TLS_ENV} is set to '{raw}', which is neither "
+                        f"yes nor no. Unset it, or set it to yes or no.")
+    sys.exit(1)
+
+
 def validate_attribute_args(args):
     """
     Validate --find-attribute-* and --set-attribute-* arguments.
@@ -6723,18 +6782,43 @@ async def _main_async(args):
     # Load persistent identity cache
     identity_cache = load_identity_cache(verbose=args.verbose)
 
+    # TLS settings: flag, then environment, then verify by default.
+    verify_tls = resolve_verify_tls(args)
+    ca_bundle = getattr(args, "ca_bundle", None)
+    if ca_bundle:
+        if getattr(args, "verify_tls", None) == "no":
+            log_stderr("ERROR", "--ca-bundle and --verify-tls no contradict each "
+                                "other: a CA bundle is only used when the "
+                                "certificate is being verified")
+            sys.exit(1)
+        if not os.path.isfile(ca_bundle):
+            log_stderr("ERROR", f"--ca-bundle file not found: {ca_bundle}")
+            sys.exit(1)
+    if not verify_tls and args.verbose:
+        log_stderr("WARN", "TLS certificate verification is off; the bearer "
+                           "token is sent over a connection that has not been "
+                           "authenticated")
+
     # Create client with identity cache
-    client = AsyncQumuloClient(
-        args.host,
-        args.port,
-        bearer_token,
-        args.max_concurrent,
-        args.connector_limit,
-        identity_cache=identity_cache,
-        verbose=args.verbose,
-        update_atime=args.update_atime,
-        max_retries=getattr(args, "max_retries", 5),
-    )
+    try:
+        client = AsyncQumuloClient(
+            args.host,
+            args.port,
+            bearer_token,
+            args.max_concurrent,
+            args.connector_limit,
+            identity_cache=identity_cache,
+            verbose=args.verbose,
+            update_atime=args.update_atime,
+            max_retries=getattr(args, "max_retries", 5),
+            verify_tls=verify_tls,
+            ca_bundle=ca_bundle,
+        )
+    except (OSError, ssl.SSLError) as e:
+        log_stderr("ERROR", f"Could not use --ca-bundle {ca_bundle}: {e}")
+        log_stderr("HINT", "The file must be a readable PEM bundle of CA "
+                           "certificates")
+        sys.exit(1)
     # Expose the client to main_async's finally clause so an incomplete walk in
     # any mode is reported and exits non-zero.
     args._walk_client = client
@@ -6750,6 +6834,11 @@ async def _main_async(args):
         log_stderr("HINT", "Check that the cluster is powered on and reachable")
         log_stderr("HINT", "Verify the hostname/IP and port are correct")
         sys.exit(1)
+    except ssl.SSLError as e:
+        # Before the OSError branch below: ssl.SSLError is an OSError, and the
+        # connection itself succeeded - it is the certificate that was refused.
+        print("FAILED", file=sys.stderr)
+        report_tls_failure(args.host, args.port, client.ca_bundle, e)
     except OSError as e:
         print("FAILED", file=sys.stderr)
         log_stderr("ERROR", f"Cannot connect to {args.host}:{args.port}", newline_before=True)
@@ -6770,6 +6859,10 @@ async def _main_async(args):
         try:
             await client.test_auth(session)
             print("OK", file=sys.stderr)
+        except aiohttp.ClientSSLError as e:
+            # Also an OSError subclass, so it must precede any broader handler.
+            print("FAILED", file=sys.stderr)
+            report_tls_failure(args.host, args.port, client.ca_bundle, e)
         except aiohttp.ClientResponseError as e:
             print("FAILED", file=sys.stderr)
             if e.status == 401:
@@ -9721,8 +9814,11 @@ async def _main_async(args):
                     if target:
                         # Convert relative paths to absolute paths
                         if not target.startswith('/'):
-                            # Relative path - resolve relative to symlink's directory
-                            import os.path
+                            # Relative path - resolve relative to symlink's directory.
+                            # os is imported at module scope; a local "import
+                            # os.path" here would rebind os as a local name for
+                            # the whole of _main_async and break every earlier
+                            # use of it.
                             symlink_dir = os.path.dirname(entry["path"])
                             # Normalize path to handle .. and . components
                             absolute_target = os.path.normpath(os.path.join(symlink_dir, target))
@@ -11779,6 +11875,23 @@ Examples:
              "grumpwalk suppresses atime updates so a crawl does not disturb "
              "access-time metadata. This flag restores normal atime behavior.",
     )
+    connection.add_argument(
+        "--verify-tls",
+        choices=["yes", "no"],
+        default=None,
+        metavar="yes|no",
+        help=f"Verify the cluster's TLS certificate (default: yes). Turn it "
+             f"off for a cluster whose certificate this machine has no reason "
+             f"to trust, such as a self-signed one. Set {VERIFY_TLS_ENV}=no to "
+             f"change the default for every run without typing the flag.",
+    )
+    connection.add_argument(
+        "--ca-bundle",
+        metavar="PATH",
+        help="PEM file of CA certificates to verify the cluster against, "
+             "instead of this machine's trust store. Use this to keep "
+             "verification on for a cluster signed by an internal CA.",
+    )
 
     # ============================================================================
     # PERFORMANCE TUNING
@@ -12442,6 +12555,8 @@ Examples:
                     max_concurrent=concurrent,
                     connector_limit=concurrent,
                     verbose=False,
+                    verify_tls=resolve_verify_tls(args),
+                    ca_bundle=getattr(args, "ca_bundle", None),
                 )
 
                 # Use ProgressTracker with limit to stop early
