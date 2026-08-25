@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **grumpwalk now verifies the cluster's TLS certificate.** Verification was previously switched off with no way to turn it on, so the bearer token sent with every request could be read by anything on the network path.
+- **grumpwalk now verifies the cluster's TLS certificate.** Verification was previously switched off with no way to turn it on, so the bearer token sent with every request could potentially be read by anything on the network path.
 
   **If your cluster presents a self-signed certificate, or one signed by an internal CA, runs that used to work will now stop** with an explanation and three ways forward:
 
