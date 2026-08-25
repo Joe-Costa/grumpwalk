@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **grumpwalk now verifies the cluster's TLS certificate.** Every request carries your bearer token, and until now every one of them went over a connection nobody had authenticated: certificate and hostname checking were switched off with no way to turn them back on. Anything able to sit on the route between you and the cluster could read the token and everything the crawl returned.
+- **grumpwalk now verifies the cluster's TLS certificate.** Verification was previously switched off with no way to turn it on, so the bearer token sent with every request could be read by anything on the network path.
 
-  Verification is now on by default. **If your cluster presents a self-signed certificate, or one signed by an internal CA, runs that used to work will now stop** with an explanation and three ways forward:
+  **If your cluster presents a self-signed certificate, or one signed by an internal CA, runs that used to work will now stop** with an explanation and three ways forward:
 
   ```
   Verifying cluster connection... FAILED
