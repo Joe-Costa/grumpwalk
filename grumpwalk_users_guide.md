@@ -4,6 +4,8 @@
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
+#### **Important note for Windows users:** Please replace any single quotes used in code examples with double quotes to prevent parsing errors, thanks!
+
 ---
 
 ## Table of Contents

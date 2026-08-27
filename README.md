@@ -16,7 +16,12 @@ High-performance, multi-purpose file crawling tool for Qumulo storage systems.
 I've observed performance as high as 12k objects per second processed against an old QC24 Qumulo cluster.<br>The lower the latency you have between where this code is running and the Qumulo cluster the better your performance
 will be.<br>Keep in mind that some operations will read contents of files, which might be slower over low bandwidth public internet & VPN connections.
 
-Please note that this tool should not be installed directly in a Qumulo node, due to RAM use conflicts. 
+**Please note that this tool should not be installed directly in a Qumulo node, due to RAM use conflicts.**
+
+### **Important note for existing Grumpwalk users:  Version 3.9.3 and above performs TLS certificate validation, research the flag `--verify-tls` in the User's Guide for more info!**
+
+#### **Friendly note for Windows users: Many examples in the documentaion use single quotes to escape portions of the commands, please always use double quotes instead, sorry for the inconvenience!**
+
 
 Don't forget to check out the [Grumpwalk User's Guide](grumpwalk_users_guide.md) for many real world usage examples.
 
