@@ -1972,6 +1972,30 @@ Following [NTFS permissions best practices](https://activedirectorypro.com/ntfs-
   --propagate-changes --progress
 ```
 
+### How do I grant several permissions in one command?
+
+Repeat `--add-ace` once for each ACE. All of them are applied to each object
+in a single update, so the tree is walked only once:
+
+```bash
+# Preview: read/write for one group, read-only for another
+./grumpwalk.py --host cluster --path /projects/finance \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RW:Modify" \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RO:Read" \
+  --propagate-changes --dry-run
+
+# If satisfied, run without --dry-run
+./grumpwalk.py --host cluster --path /projects/finance \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RW:Modify" \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RO:Read" \
+  --propagate-changes --progress
+```
+
+If a trustee already has an ACE of the same type on an object, the new rights
+and flags are merged into that ACE instead of being added as a second entry.
+`--remove-ace`, `--add-rights` and `--remove-rights` can be repeated the same
+way, and mixed in the same command.
+
 ### How do I revoke write access while keeping read?
 
 ```bash
