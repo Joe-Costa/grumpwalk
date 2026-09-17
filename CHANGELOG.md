@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`name:NAME`** - Say that an identity is a name, whatever it looks like, so a user or group whose name is a number can be named at all. Everything after `name:` goes to the cluster's identity lookup as a name, so every spelling the cluster accepts works: `name:jsmith`, `name:DOMAIN\jsmith`, `name:dns.domain.com\jsmith`, `name:jsmith@domain.com`, and names with spaces such as `name:Domain Users`.
+- **`name:NAME`** -  Everything after `name:` goes to the cluster's identity lookup as a name, so every spelling the cluster accepts works: `name:jsmith`, `name:DOMAIN\jsmith`, `name:dns.domain.com\jsmith`, `name:jsmith@domain.com`, and names with spaces such as `name:Domain Users`.
 
 ### Changed
 
