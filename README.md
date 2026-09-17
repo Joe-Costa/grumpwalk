@@ -586,6 +586,16 @@ Surgically modify Access Control Entries (ACEs) within ACLs without replacing th
 - `--remove-rights 'Type:Trustee:Rights'` - Remove specific rights from existing ACE (keeps other rights)
 - `--clone-ace-source 'Trustee' --clone-ace-target 'Trustee'` - Clone all ACEs from source to target trustee
 
+Every operation can be repeated, and different operations can be combined in one command. Each object is still read once and written once:
+
+```bash
+./grumpwalk.py --host cluster --path /projects/finance \
+  --remove-ace 'Allow:Everyone' \
+  --add-ace 'Allow:fd:DOMAIN\Finance_RW:Modify' \
+  --add-ace 'Allow:fd:DOMAIN\Finance_RO:Read' \
+  --propagate-changes --dry-run
+```
+
 **Bulk Operations (CSV source files):**
 - `--migrate-trustees FILE.csv` - In-place trustee replacement from CSV (source ACE becomes target)
 - `--clone-ace-map FILE.csv` - Bulk clone ACEs from CSV mappings (works with `--sync-cloned-aces`)
@@ -656,7 +666,8 @@ Flags (inheritance):
 
 **Behavior Notes:**
 
-- **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists. `--replace-ace` completely replaces the existing ACE's flags and rights with the new values.
+- **--add-ace vs --replace-ace**: `--add-ace` merges rights if an ACE with the same type and trustee already exists, so it never lowers access (adding `Read` to a trustee that has `Modify` changes nothing). `--replace-ace` completely replaces the existing ACE's flags and rights with the new values. To lower a trustee's access, use `--replace-ace`, or `--remove-ace` plus `--add-ace` for that trustee in the same command.
+- **Order of operations**: When operations are combined, they run in a fixed order regardless of their order on the command line: `--remove-ace`, `--remove-rights`, `--add-rights`, `--replace-ace`, `--add-ace`, `--migrate-trustees`, then `--clone-ace-*`. Removes always happen before adds.
 - **--replace-ace with --new-ace**: When paired with `--new-ace`, you can change the ACE type (Allow to Deny or vice versa). The `--replace-ace` pattern specifies which ACE to find, and `--new-ace` specifies the full replacement. These must be positionally adjacent and paired 1:1.
 - **--clone-ace-source/--clone-ace-target**: Clones ALL ACEs (both Allow and Deny) from source trustee to target trustee, preserving flags and rights. By default, skips if target already has an ACE of the same type. Use `--sync-cloned-aces` to update existing target ACEs to match source rights. Supports uid:N, gid:N, DOMAIN\\user, and plain name formats.
 - **--migrate-trustees**: In-place trustee replacement. The source ACE's trustee is changed to the target trustee (preserving type, flags, and rights). Use for domain migrations where you want to replace OLD_DOMAIN\\user with NEW_DOMAIN\\user.
@@ -666,12 +677,12 @@ Flags (inheritance):
 
 **Inheritance Handling:**
 
-When modifying an inherited ACE (one that has the INHERITED flag), grumpwalk automatically:
-1. **Breaks inheritance** at the target path by adding PROTECTED to control flags
+When a `--remove-ace`, `--remove-rights`, `--add-rights` or `--replace-ace` pattern matches an inherited ACE (one that has the INHERITED flag) on an object, grumpwalk automatically, on that object:
+1. **Breaks inheritance** by adding PROTECTED to control flags
 2. **Converts inherited ACEs to explicit** by removing the INHERITED flag from all ACEs
 3. **Applies your modifications** to the now-explicit ACE
 
-This establishes the target path as a new inheritance root. When used with `--propagate-changes`, the modified ACL propagates to all children with proper inheritance flags.
+`--add-ace` never triggers this. With `--propagate-changes`, each object is checked on its own, so inheritance is broken on every object where the matched ACE is inherited, which is usually every object below the folder where it was set. Those objects keep their other permissions, but no longer pick up later changes to their parent's ACL, so make later changes with `--propagate-changes` as well.
 
 **Disabling Inheritance Directly:**
 

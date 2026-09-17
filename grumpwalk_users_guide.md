@@ -1994,7 +1994,47 @@ in a single update, so the tree is walked only once:
 If a trustee already has an ACE of the same type on an object, the new rights
 and flags are merged into that ACE instead of being added as a second entry.
 `--remove-ace`, `--add-rights` and `--remove-rights` can be repeated the same
-way, and mixed in the same command.
+way, and mixed in the same command (see the next question).
+
+### How do I remove and add permissions in the same command?
+
+Combine `--remove-ace` and `--add-ace`, repeating either as needed. Each object
+is still updated only once:
+
+```bash
+# Remove Everyone, then grant two groups their own access
+./grumpwalk.py --host cluster --path /projects/finance \
+  --remove-ace "Allow:Everyone" \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RW:Modify" \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RO:Read" \
+  --propagate-changes --dry-run
+```
+
+Removes always run before adds, whatever order you type the flags in. The full
+order is `--remove-ace`, `--remove-rights`, `--add-rights`, `--replace-ace`,
+then `--add-ace`. `--remove-ace "Allow:TRUSTEE"` removes every Allow ACE for
+that trustee, whatever its flags or rights.
+
+**Lowering a trustee's access.** `--add-ace` only ever adds rights. If
+`Finance_RW` already has Modify, `--add-ace "Allow:fd:DOMAIN\\Finance_RW:Read"`
+changes nothing. To lower its access, remove the ACE and add it back in the same
+command:
+
+```bash
+./grumpwalk.py --host cluster --path /projects/finance \
+  --remove-ace "Allow:DOMAIN\\Finance_RW" \
+  --add-ace "Allow:fd:DOMAIN\\Finance_RW:Read" \
+  --propagate-changes --dry-run
+```
+
+`--replace-ace "Allow:fd:DOMAIN\\Finance_RW:Read"` does the same with one flag.
+
+> **Note:** Removing an ACE that an object inherited turns off inheritance on
+> that object. Its remaining inherited ACEs become explicit copies, so its
+> permissions are otherwise unchanged, but it no longer picks up later changes
+> to its parent. With `--propagate-changes` this usually applies to every
+> object below the folder where the ACE was set, so make later changes with
+> `--propagate-changes` too. See [Inheritance Handling](#inheritance-handling).
 
 ### How do I revoke write access while keeping read?
 
@@ -3267,9 +3307,17 @@ Both describe the same amount of storage. See
 
 | Operation | When trustee exists | When trustee doesn't exist |
 |-----------|--------------------|-----------------------------|
-| `--add-ace` | Merges rights with existing ACE | Creates new ACE |
-| `--replace-ace` (alone) | Replaces flags and rights in-place | No change |
+| `--remove-ace` | Removes every ACE of that type for the trustee | No change |
+| `--add-ace` | Merges rights and flags into the existing ACE (never lowers rights) | Creates new ACE |
+| `--replace-ace` (alone) | Replaces flags and rights in-place | Creates new ACE (with a warning) |
 | `--replace-ace` + `--new-ace` | Replaces first match, removes duplicates | No change |
+
+**Combining operations:** every ACE operation flag can be repeated, and
+different operations can be used together. Each object's ACL is read once, all
+changes are applied, and it is written once. They are applied in a fixed order,
+regardless of their order on the command line: `--remove-ace`,
+`--remove-rights`, `--add-rights`, `--replace-ace`, `--add-ace`,
+`--migrate-trustees`, then `--clone-ace-*`.
 
 **Important:** When using `--replace-ace` with `--new-ace`:
 - The `--replace-ace` pattern is a **search pattern** using `Type:Trustee` format only
@@ -3284,12 +3332,21 @@ Results in a single ACE with Modify rights; the other two are removed.
 
 ### Inheritance Handling
 
-When modifying an inherited ACE, grumpwalk automatically:
-1. Breaks inheritance at the target path (sets PROTECTED control flag)
-2. Converts inherited ACEs to explicit (removes INHERITED flag)
+When a `--remove-ace`, `--remove-rights`, `--add-rights` or `--replace-ace`
+pattern matches an inherited ACE on an object, grumpwalk automatically, on that
+object:
+1. Breaks inheritance (sets PROTECTED control flag)
+2. Converts its inherited ACEs to explicit (removes INHERITED flag)
 3. Applies your modifications
 
-This establishes the target as a new inheritance root. Use `--propagate-changes` to push the modified ACL to children.
+`--add-ace` never triggers this.
+
+With `--propagate-changes`, each object is checked on its own, so this happens on
+every object where the matched ACE is inherited. Usually that is every object
+below the folder where the ACE was originally set. Those objects keep all their
+other permissions, but they no longer pick up changes made to their parent's
+ACL, so make later changes with `--propagate-changes` as well. `--dry-run` lists
+every object that would change.
 
 ### Disabling Inheritance
 
