@@ -1,6 +1,6 @@
 # grumpwalk.py
 
-**Version 3.9.3** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
+**Version 3.9.4** | [Changelog](CHANGELOG.md) | [User Guide](grumpwalk_users_guide.md)
 
 <img height="300" alt="grumprun" src="https://github.com/user-attachments/assets/37ec015f-7ff1-40e5-ba7f-02440079974b" />
 
@@ -280,7 +280,7 @@ Updating the `atime` attribute on file read and write ops is disabled by default
 ### With --show-owner --dont-resolve-ids
 ```
 /home/joe/file1.txt    UID:1000
-/home/jane/file2.log   SID:S-1-5-21-3192274952-881459882-370606532-1352
+/home/jane/file2.log   SID:S-1-5-21-12345678-12345678-12345678-1352
 ```
 
 ### With --fields (tab-separated)
@@ -307,7 +307,7 @@ path,modification_time,size
 
 ### JSON with --fields
 ```json
-{"path":"/home/joe/file1.txt","size":"1024","owner_id":"S-1-5-21-123456-1109"}
+{"path":"/home/joe/file1.txt","size":"1024","owner_id":"S-1-5-21-12345678-12345678-12345678-1109"}
 ```
 
 ### ACL Reports
@@ -529,15 +529,35 @@ Selective ownership changes - find files by current owner/group and change to a 
 - `--change-group 'SOURCE:TARGET'` - Change group from SOURCE to TARGET (e.g., `'oldgroup:newgroup'`, `'gid:100:gid:200'`)
 - `--change-owners-file FILE.csv` - Load owner mappings from CSV file
 - `--change-groups-file FILE.csv` - Load group mappings from CSV file
-- `--propagate-changes` - Apply changes to all children recursively (without this, only the target path is changed)
+- `--propagate-changes` - Apply changes to the `--path` object and all of its children recursively (without this, only the `--path` object is changed)
+
+These change the POSIX owner and group-owner fields only. The ACL's own entries are untouched, apart from the mode-derived entry that names the owner or group, which the cluster rewrites as part of the ownership change itself. Use `--migrate-trustees` for the opposite job: rewriting ACL trustees while leaving ownership alone.
 
 **CSV Format** (same as `--migrate-trustees`):
 ```csv
 source,target
 olduser1,newuser1
 uid:1001,uid:2001
+gid:14011,S-1-5-21-12345678-12345678-12345678-1001
 OLDDOMAIN\user,NEWDOMAIN\user
 ```
+
+**Identity formats** - either side of a mapping, on the command line or in a CSV:
+
+| Format | Meaning |
+|--------|---------|
+| `uid:1001` | NFS UID |
+| `gid:100` | NFS GID |
+| `auth_id:500` | Qumulo auth_id |
+| `S-1-5-21-...` or `sid:S-1-5-21-...` | SID |
+| `DOMAIN\user`, `user@domain.com` | AD user or group |
+| `name:NAME` | NAME is a name, whatever it looks like |
+| `local:admin`, `ad:jsmith` | Look the name up in local accounts, or in AD |
+| `jsmith` | Plain name (looked up in AD) |
+
+A bare number is **rejected** in these mappings: `14011` could be a UID, a GID, an auth_id, or a user named `14011`. Write `uid:14011`, `gid:14011`, `auth_id:14011`, or `name:14011`.
+
+`name:` passes the rest through to the cluster's identity lookup as a name, so it accepts every spelling the cluster does: `name:jsmith`, `name:DOMAIN\jsmith`, `name:dns.domain.com\jsmith`, `name:jsmith@domain.com`, and names containing spaces such as `name:Domain Users`. A name is looked up in AD, so use `local:admin` for a local user or group, and write a SID as a SID rather than as a name.
 
 **Important:** Always use `--dry-run` first to preview changes before applying.
 
@@ -608,7 +628,7 @@ source,target
 OLDDOMAIN\user1,NEWDOMAIN\user1
 OLDDOMAIN\user2,NEWDOMAIN\user2
 uid:1001,uid:2001
-S-1-5-21-123456,S-1-5-21-789012
+S-1-5-21-12345678-12345678-12345678-1001,S-1-5-21-12345678-12345678-12345678-2001
 gid:100,NEWDOMAIN\Domain Users
 ```
 

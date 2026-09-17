@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.9.3** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.9.4** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1733,6 +1733,17 @@ OLDDOMAIN\jsmith,NEWDOMAIN\jsmith
   --propagate-changes --progress
 ```
 
+Owner changes and group changes follow the same rules. Each side of a mapping
+can be written in any of the forms in the
+[identity format table](#ownergroup-change-pattern-quick-reference), the two
+sides do not have to match, and only the field you asked for is touched, so an
+owner change leaves the group as it was and the other way round. The directory
+you point at is changed along with everything under it.
+
+The CSV is two columns, `source,target`, with an optional header row. Comment
+lines are not supported: a line starting with `#` stops the run with an error
+naming the line number.
+
 ### How do I change group ownership?
 
 **Change group for a directory tree:**
@@ -2250,12 +2261,24 @@ uid:1003,NEWDOMAIN\charlie
 ```csv
 source,target
 gid:100,NEWDOMAIN\Engineering
-gid:200,NEWDOMAIN\Sales
-gid:300,NEWDOMAIN\Marketing
+gid:200,S-1-5-21-12345678-12345678-12345678-1001
+gid:300,ad:Marketing
 ```
 
-**Execute NFS to AD ownership migration:**
+Either side of a mapping can be written in any of the forms in the
+[identity format table](#ownergroup-change-pattern-quick-reference), and the two
+sides do not have to match. The rows above name the new AD group three ways: in
+`DOMAIN\group` form, by SID, and by plain name with `ad:` to say it is an AD
+group rather than a local one. Mappings work in either direction, so an AD group
+can become a GID just as easily.
+
+**Preview first, then execute:**
 ```bash
+# Preview: lists every object that would change, and a count
+./grumpwalk.py --host cluster --path /nfs-data \
+  --change-owners-file uid_to_ad_owners.csv \
+  --propagate-changes --dry-run
+
 # Migrate owners
 ./grumpwalk.py --host cluster --path /nfs-data \
   --change-owners-file uid_to_ad_owners.csv \
@@ -2266,6 +2289,31 @@ gid:300,NEWDOMAIN\Marketing
   --change-groups-file gid_to_ad_groups.csv \
   --propagate-changes --progress
 ```
+
+Both files can be given in one command to migrate owners and groups in a single
+pass. Objects whose owner or group is not in the CSV are left alone, and the
+directory you point at is changed along with everything under it.
+
+**What this changes, and what it does not:** only the owner and group fields you
+mapped. Mode bits, file contents and timestamps are left as they are, and so are
+the permissions granted to everyone else.
+
+> **Permission entries that stand for the owner or group change with it.** Where
+> an object's permissions come from POSIX mode bits, the ACL is generated from
+> them: its entries stand for the owner, the group owner and everyone else rather
+> than for named users. Every one of those entries follows an ownership change and
+> names the new identity afterwards, with the same rights as before. That is the
+> ownership change showing through in the permissions rather than a separate edit,
+> and it is what gives the new owner or group the access the old one had.
+>
+> Entries that were applied explicitly to a named user or group, and entries
+> inherited from a parent directory, do not stand for the owner or group and are
+> left alone.
+
+If you need to update the users and groups listed in the *permissions* instead,
+that is `--migrate-trustees`. It rewrites ACL entries and leaves the owner and
+group alone, so it will not by itself fix access that depends on the group
+owner.
 
 ### How do I consolidate ownership after an acquisition?
 
@@ -2689,7 +2737,7 @@ Use `--dont-resolve-ids` with `--show-owner` or `--show-group` to skip identity 
 Output:
 ```
 /data/file1.txt	UID:1001	GID:100
-/data/file2.txt	SID:S-1-5-21-3192274952-881459882-370606532-1352	SID:S-1-5-21-3192274952-881459882-370606532-513
+/data/file2.txt	SID:S-1-5-21-12345678-12345678-12345678-1352	SID:S-1-5-21-12345678-12345678-12345678-513
 ```
 
 **CSV export with raw IDs:**
@@ -2726,7 +2774,7 @@ Use `--fields` to choose exactly which columns appear in output. This reduces fi
 
 Output:
 ```json
-{"path": "/data/report.pdf", "size": "1048576", "owner_id": "S-1-5-21-123456-1109"}
+{"path": "/data/report.pdf", "size": "1048576", "owner_id": "S-1-5-21-12345678-12345678-12345678-1109"}
 ```
 
 **CSV with selected fields:**
@@ -3387,7 +3435,44 @@ Use `--disable-inheritance` for standalone inheritance control, equivalent to Wi
 | `gid:100:gid:200` | GID to GID (NFS) |
 | `DOMAIN\old:DOMAIN\new` | AD user/group change |
 | `uid:1001:DOMAIN\user` | UID to AD user |
+| `gid:14011:S-1-5-21-12345678-12345678-12345678-1001` | GID to AD group SID |
+| `S-1-5-21-12345678-12345678-12345678-1001:uid:1001` | SID to UID |
 | `OLDDOMAIN\user:NEWDOMAIN\user` | Cross-domain migration |
+
+Either side may be written in any of these forms, on the command line or in a
+CSV:
+
+| Format | Meaning |
+|--------|---------|
+| `uid:1001` | NFS UID |
+| `gid:100` | NFS GID |
+| `auth_id:500` | Qumulo auth_id |
+| `S-1-5-21-...` or `sid:S-1-5-21-...` | SID |
+| `DOMAIN\user`, `user@domain.com` | AD user or group |
+| `name:NAME` | NAME is a name, whatever it looks like |
+| `local:admin`, `ad:jsmith` | Look the name up in local accounts, or in AD |
+| `jsmith` | Plain name (looked up in AD) |
+
+**A bare number is rejected here.** `14011` on its own could be a UID, a
+GID, an auth_id, or the name of a user called `14011`, and guessing wrong
+changes the ownership of the wrong files. Write `uid:14011`,
+`gid:14011`, `auth_id:14011`, or `name:14011`.
+
+**What `name:` accepts.** Everything after `name:` is passed to the cluster's
+identity lookup as a name, so any spelling the cluster accepts works:
+
+| Example | Form |
+|---------|------|
+| `name:jsmith` | Bare account name |
+| `name:DOMAIN\jsmith` | NetBIOS domain and name |
+| `name:dns.domain.com\jsmith` | DNS domain and name |
+| `name:jsmith@domain.com` | UPN |
+| `name:Domain Users` | A name containing spaces |
+| `name:DOMAIN\Domain Users` | Domain plus a name with spaces |
+
+A name with no domain is looked up in **AD**, so a local user or group needs
+`local:admin` instead, and a SID should be written as a SID (`S-1-5-...` or
+`sid:S-1-5-...`) rather than passed to `name:`.
 
 ### Propagation Flag
 

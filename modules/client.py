@@ -2069,7 +2069,11 @@ class AsyncQumuloClient:
         return collected_results if collected_results is not None else []
 
     async def resolve_identity(
-        self, session: aiohttp.ClientSession, identifier: str, id_type: str = "auth_id"
+        self,
+        session: aiohttp.ClientSession,
+        identifier: str,
+        id_type: str = "auth_id",
+        domain: Optional[str] = None,
     ) -> Dict:
         """
         Resolve an identity using various identifier types.
@@ -2078,6 +2082,9 @@ class AsyncQumuloClient:
             session: aiohttp ClientSession
             identifier: The identifier value (auth_id, SID, UID, GID, or name)
             id_type: Type of identifier - "auth_id", "sid", "uid", "gid", or "name"
+            domain: Optional domain for a name - "LOCAL" or "ACTIVE_DIRECTORY".
+                Without it the cluster looks a bare name up in AD, so a local
+                user or group only resolves when the domain is given.
 
         Returns:
             Dictionary containing complete identity information
@@ -2103,6 +2110,8 @@ class AsyncQumuloClient:
                 raise ValueError(f"GID must be a valid integer: {identifier}")
         elif id_type == "name":
             payload = {"name": str(identifier)}
+            if domain:
+                payload["domain"] = domain
         else:
             raise ValueError(
                 f"Unknown id_type: {id_type}. Must be auth_id, sid, uid, gid, or name"

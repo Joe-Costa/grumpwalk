@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.9.3"
+__version__ = "3.9.4"
 
 import argparse
 import asyncio
@@ -5655,17 +5655,45 @@ def load_trustee_mappings(filepath: str, verbose: bool = False) -> List[dict]:
         raise ValueError(f"CSV parsing error in {filepath}: {e}")
 
 
+# Trustee forms whose own syntax carries a colon. A trustee cannot contain a
+# colon any other way - AD names, UPNs and SIDs have no room for one - so in
+# 'SOURCE:TARGET' every other colon separates the two sides.
+OWNER_CHANGE_TRUSTEE_PREFIXES = (
+    'uid', 'gid', 'auth_id', 'sid', 'name', 'ad', 'active_directory', 'local',
+)
+
+
+def _take_trustee(parts: List[str], index: int) -> Tuple[str, int]:
+    """
+    Consume one trustee from the colon-split parts of an owner change pattern.
+
+    A known prefix takes the token after it as its value ('uid' + '1001'), so
+    the trustee is two parts; anything else is a trustee on its own.
+
+    Args:
+        parts: The pattern split on ':'
+        index: Where this trustee starts
+
+    Returns:
+        (trustee, index of the next trustee)
+    """
+    token = parts[index]
+    if index + 1 < len(parts) and token.lower() in OWNER_CHANGE_TRUSTEE_PREFIXES:
+        return f"{token}:{parts[index + 1]}", index + 2
+    return token, index + 1
+
+
 def parse_owner_change_pattern(pattern: str) -> dict:
     """
     Parse 'SOURCE:TARGET' pattern for owner/group changes.
 
-    Handles trustees that contain colons (uid:N, gid:N) by smart splitting.
-
-    Handles:
-    - DOMAIN\\user:DOMAIN\\other
-    - uid:1001:uid:2001
-    - gid:100:gid:200
+    Either side may be a prefixed trustee that contains a colon, so the pattern
+    is read as two trustees rather than split on a fixed colon:
     - olduser:newuser
+    - uid:1001:uid:2001
+    - S-1-5-21-...:uid:1001
+    - DOMAIN\\user:gid:14011
+    - sid:S-1-5-21-...:name:12345
 
     Args:
         pattern: The owner/group change pattern
@@ -5676,72 +5704,82 @@ def parse_owner_change_pattern(pattern: str) -> dict:
     Raises:
         ValueError if pattern is invalid
     """
+    expected = (
+        "Expected 'SOURCE:TARGET' (e.g., 'olduser:newuser', 'uid:1001:uid:2001', "
+        "'S-1-5-21-...:gid:14011')"
+    )
+
     if ':' not in pattern:
+        raise ValueError(f"Invalid owner change pattern '{pattern}'. {expected}")
+
+    parts = [part.strip() for part in pattern.split(':')]
+
+    source, index = _take_trustee(parts, 0)
+    if index >= len(parts):
+        raise ValueError(f"Invalid pattern '{pattern}': target cannot be empty. {expected}")
+
+    target, index = _take_trustee(parts, index)
+    if index != len(parts):
         raise ValueError(
-            f"Invalid owner change pattern '{pattern}'. "
-            f"Expected format: 'SOURCE:TARGET' (e.g., 'olduser:newuser', 'uid:1001:uid:2001')"
+            f"Invalid owner change pattern '{pattern}': more than two identities. {expected}"
         )
 
-    # Handle special prefixed formats that contain colons
-    # uid:N:uid:M -> split after first uid:N
-    # gid:N:gid:M -> split after first gid:N
-    # auth_id:N:auth_id:M -> split after first auth_id:N
-
-    lower_pattern = pattern.lower()
-
-    # Check for uid:N:target
-    if lower_pattern.startswith('uid:'):
-        rest = pattern[4:]  # after 'uid:'
-        if ':' in rest:
-            colon_pos = rest.index(':')
-            uid_part = rest[:colon_pos]
-            if uid_part.isdigit():
-                source = pattern[:4 + colon_pos]  # uid:N
-                target = rest[colon_pos + 1:]     # everything after
-                if target:
-                    return {'source': source, 'target': target}
-
-    # Check for gid:N:target
-    if lower_pattern.startswith('gid:'):
-        rest = pattern[4:]  # after 'gid:'
-        if ':' in rest:
-            colon_pos = rest.index(':')
-            gid_part = rest[:colon_pos]
-            if gid_part.isdigit():
-                source = pattern[:4 + colon_pos]  # gid:N
-                target = rest[colon_pos + 1:]     # everything after
-                if target:
-                    return {'source': source, 'target': target}
-
-    # Check for auth_id:N:target
-    if lower_pattern.startswith('auth_id:'):
-        rest = pattern[8:]  # after 'auth_id:'
-        if ':' in rest:
-            colon_pos = rest.index(':')
-            auth_part = rest[:colon_pos]
-            if auth_part.isdigit():
-                source = pattern[:8 + colon_pos]  # auth_id:N
-                target = rest[colon_pos + 1:]     # everything after
-                if target:
-                    return {'source': source, 'target': target}
-
-    # Default: split on the last colon (handles DOMAIN\user:DOMAIN\other, simple:names)
-    last_colon = pattern.rfind(':')
-    if last_colon <= 0 or last_colon >= len(pattern) - 1:
-        raise ValueError(
-            f"Invalid owner change pattern '{pattern}'. "
-            f"Expected format: 'SOURCE:TARGET' (e.g., 'olduser:newuser')"
-        )
-
-    source = pattern[:last_colon].strip()
-    target = pattern[last_colon + 1:].strip()
-
-    if not source:
+    if not source or source.endswith(':'):
         raise ValueError(f"Invalid pattern '{pattern}': source cannot be empty")
-    if not target:
+    if not target or target.endswith(':'):
         raise ValueError(f"Invalid pattern '{pattern}': target cannot be empty")
 
     return {'source': source, 'target': target}
+
+
+def validate_owner_change_identity(identity: str, flag: str, where: str = '') -> None:
+    """
+    Reject a bare number in an owner/group mapping.
+
+    A number on its own could be a UID, a GID, an auth_id, or the name of a user
+    who happens to be called '1001' - and guessing wrong silently changes the
+    ownership of the wrong files.
+
+    Args:
+        identity: The source or target as the user wrote it
+        flag: The flag it came from, for the message
+        where: Optional location suffix, e.g. ' on line 4 of owners.csv'
+
+    Raises:
+        ValueError if the identity is ambiguous
+    """
+    if identity.isdigit():
+        raise ValueError(
+            f"Ambiguous identity '{identity}'{where} for {flag}: a bare number could be a "
+            f"UID, a GID, an auth_id, or a user named '{identity}'. Write "
+            f"uid:{identity}, gid:{identity}, auth_id:{identity}, or name:{identity}."
+        )
+
+
+def build_identity_change_pattern(source: str, target: str, flag: str, where: str = '') -> dict:
+    """
+    Validate one owner/group mapping and parse both of its trustees.
+
+    Args:
+        source: Identity to match on, as the user wrote it
+        target: Identity to set instead
+        flag: The flag it came from, for error messages
+        where: Optional location suffix, e.g. ' on line 4 of owners.csv'
+
+    Returns:
+        Pattern dict with source, target and both parsed trustees
+
+    Raises:
+        ValueError if either identity is ambiguous
+    """
+    validate_owner_change_identity(source, flag, where)
+    validate_owner_change_identity(target, flag, where)
+    return {
+        'source': source,
+        'target': target,
+        'source_trustee': parse_trustee(source),
+        'target_trustee': parse_trustee(target),
+    }
 
 
 def parse_trustee(trustee_input: str) -> Dict:
@@ -5773,6 +5811,10 @@ def parse_trustee(trustee_input: str) -> Dict:
     # 'sid:S-1-...' is how grumpwalk prints SID trustees, so accept it back
     if trustee.lower().startswith("sid:"):
         return {"payload": {"sid": trustee[4:]}, "type": "sid"}
+
+    # 'name:1001' says the trustee is the name '1001', not UID 1001
+    if trustee.lower().startswith("name:"):
+        return {"payload": {"name": trustee[5:]}, "type": "name"}
 
     if trustee.startswith("uid:"):
         try:
@@ -8666,12 +8708,9 @@ async def _main_async(args):
             for pattern in args.change_owner:
                 try:
                     parsed = parse_owner_change_pattern(pattern)
-                    owner_change_patterns.append({
-                        'source': parsed['source'],
-                        'target': parsed['target'],
-                        'source_trustee': parse_trustee(parsed['source']),
-                        'target_trustee': parse_trustee(parsed['target']),
-                    })
+                    owner_change_patterns.append(build_identity_change_pattern(
+                        parsed['source'], parsed['target'], '--change-owner'
+                    ))
                 except ValueError as e:
                     log_stderr("ERROR", f"{e}")
                     sys.exit(1)
@@ -8681,12 +8720,9 @@ async def _main_async(args):
             for pattern in args.change_group:
                 try:
                     parsed = parse_owner_change_pattern(pattern)
-                    group_change_patterns.append({
-                        'source': parsed['source'],
-                        'target': parsed['target'],
-                        'source_trustee': parse_trustee(parsed['source']),
-                        'target_trustee': parse_trustee(parsed['target']),
-                    })
+                    group_change_patterns.append(build_identity_change_pattern(
+                        parsed['source'], parsed['target'], '--change-group'
+                    ))
                 except ValueError as e:
                     log_stderr("ERROR", f"{e}")
                     sys.exit(1)
@@ -8696,13 +8732,12 @@ async def _main_async(args):
             try:
                 csv_mappings = load_trustee_mappings(args.change_owners_file, verbose=args.verbose)
                 for mapping in csv_mappings:
-                    owner_change_patterns.append({
-                        'source': mapping['source'],
-                        'target': mapping['target'],
-                        'source_trustee': parse_trustee(mapping['source']),
-                        'target_trustee': parse_trustee(mapping['target']),
-                        'line': mapping.get('line'),
-                    })
+                    where = f" on line {mapping.get('line')} of {args.change_owners_file}"
+                    pattern_dict = build_identity_change_pattern(
+                        mapping['source'], mapping['target'], '--change-owners-file', where
+                    )
+                    pattern_dict['line'] = mapping.get('line')
+                    owner_change_patterns.append(pattern_dict)
             except (FileNotFoundError, ValueError) as e:
                 log_stderr("ERROR", f"Failed to load owner mappings file: {e}")
                 sys.exit(1)
@@ -8711,13 +8746,12 @@ async def _main_async(args):
             try:
                 csv_mappings = load_trustee_mappings(args.change_groups_file, verbose=args.verbose)
                 for mapping in csv_mappings:
-                    group_change_patterns.append({
-                        'source': mapping['source'],
-                        'target': mapping['target'],
-                        'source_trustee': parse_trustee(mapping['source']),
-                        'target_trustee': parse_trustee(mapping['target']),
-                        'line': mapping.get('line'),
-                    })
+                    where = f" on line {mapping.get('line')} of {args.change_groups_file}"
+                    pattern_dict = build_identity_change_pattern(
+                        mapping['source'], mapping['target'], '--change-groups-file', where
+                    )
+                    pattern_dict['line'] = mapping.get('line')
+                    group_change_patterns.append(pattern_dict)
             except (FileNotFoundError, ValueError) as e:
                 log_stderr("ERROR", f"Failed to load group mappings file: {e}")
                 sys.exit(1)
@@ -8741,20 +8775,23 @@ async def _main_async(args):
             print("=" * 70, file=sys.stderr)
             log_stderr("INFO", "Resolving identities...", newline_before=True)
 
-        # Helper to extract identifier and type from parsed trustee
+        # Helper to extract identifier, type and domain from parsed trustee
         def get_identifier_and_type(trustee_spec):
             payload = trustee_spec['payload']
             id_type = trustee_spec['type']
             if id_type == 'uid':
-                return payload.get('uid'), id_type
+                return payload.get('uid'), id_type, None
             elif id_type == 'gid':
-                return payload.get('gid'), id_type
+                return payload.get('gid'), id_type, None
             elif id_type == 'sid':
-                return payload.get('sid'), id_type
+                return payload.get('sid'), id_type, None
             elif id_type == 'auth_id':
-                return payload.get('auth_id'), id_type
+                return payload.get('auth_id'), id_type, None
             else:  # name
-                return payload.get('name'), 'name'
+                # 'local:admin' and 'ad:jsmith' carry a domain; without it the
+                # cluster looks every bare name up in AD, so a local user or
+                # group would never resolve.
+                return payload.get('name'), 'name', payload.get('domain')
 
         async with client.create_session() as session:
             # Resolve owner change patterns
@@ -8763,8 +8800,8 @@ async def _main_async(args):
                 source_name = p['source']
                 if args.verbose:
                     log_stderr("INFO", f"Resolving source owner '{source_name}'...")
-                source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
-                result = await client.resolve_identity(session, source_identifier, source_id_type)
+                source_identifier, source_id_type, source_domain = get_identifier_and_type(p['source_trustee'])
+                result = await client.resolve_identity(session, source_identifier, source_id_type, source_domain)
                 if result and result.get('auth_id'):
                     p['source_auth_id'] = str(result['auth_id'])
                     if args.verbose:
@@ -8777,8 +8814,8 @@ async def _main_async(args):
                 target_name = p['target']
                 if args.verbose:
                     log_stderr("INFO", f"Resolving target owner '{target_name}'...")
-                target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
-                result = await client.resolve_identity(session, target_identifier, target_id_type)
+                target_identifier, target_id_type, target_domain = get_identifier_and_type(p['target_trustee'])
+                result = await client.resolve_identity(session, target_identifier, target_id_type, target_domain)
                 if result and result.get('auth_id'):
                     p['target_auth_id'] = str(result['auth_id'])
                     if args.verbose:
@@ -8794,8 +8831,8 @@ async def _main_async(args):
                 source_name = p['source']
                 if args.verbose:
                     log_stderr("INFO", f"Resolving source group '{source_name}'...")
-                source_identifier, source_id_type = get_identifier_and_type(p['source_trustee'])
-                result = await client.resolve_identity(session, source_identifier, source_id_type)
+                source_identifier, source_id_type, source_domain = get_identifier_and_type(p['source_trustee'])
+                result = await client.resolve_identity(session, source_identifier, source_id_type, source_domain)
                 if result and result.get('auth_id'):
                     p['source_auth_id'] = str(result['auth_id'])
                     if args.verbose:
@@ -8808,8 +8845,8 @@ async def _main_async(args):
                 target_name = p['target']
                 if args.verbose:
                     log_stderr("INFO", f"Resolving target group '{target_name}'...")
-                target_identifier, target_id_type = get_identifier_and_type(p['target_trustee'])
-                result = await client.resolve_identity(session, target_identifier, target_id_type)
+                target_identifier, target_id_type, target_domain = get_identifier_and_type(p['target_trustee'])
+                result = await client.resolve_identity(session, target_identifier, target_id_type, target_domain)
                 if result and result.get('auth_id'):
                     p['target_auth_id'] = str(result['auth_id'])
                     if args.verbose:
@@ -8967,6 +9004,31 @@ async def _main_async(args):
                 if args.verbose:
                     log_stderr("ERROR", f"Failed to change ownership: {file_path}: {error_msg}")
 
+        async def process_target_path_object(session):
+            """Apply the mappings to the object at --path itself.
+
+            walk_tree_async yields only the children of --path, so the directory
+            named on the command line is handled here - otherwise a migrated tree
+            keeps the old owner or group on its top directory.
+            """
+            owner_group_info = await client.get_file_owner_group(session, args.path)
+            if not owner_group_info:
+                log_stderr("ERROR", f"Could not get attributes for: {args.path}")
+                change_stats['errors'].append({
+                    'path': args.path,
+                    'error': 'Could not get file attributes'
+                })
+                return
+
+            entry = {
+                'path': args.path,
+                'owner': owner_group_info.get('owner'),
+                'group': owner_group_info.get('group'),
+                'owner_details': owner_group_info.get('owner_details'),
+                'group_details': owner_group_info.get('group_details'),
+            }
+            await process_file_for_ownership_change(session, entry)
+
         async with client.create_session() as session:
             if args.propagate_changes:
                 await display_scope_aggregates(
@@ -8976,6 +9038,10 @@ async def _main_async(args):
                     max_depth=args.max_depth,
                     omit_subdirs=args.omit_subdirs,
                 )
+
+                # The tree walk covers the children; --path itself is not one of
+                # them, so it is changed here before the walk starts.
+                await process_target_path_object(session)
 
                 # Walk the tree and change ownership for all matching files
                 async def tree_walk_callback(entry):
@@ -8999,23 +9065,7 @@ async def _main_async(args):
                 )
             else:
                 # Only process the target path itself
-                owner_group_info = await client.get_file_owner_group(session, args.path)
-                if owner_group_info:
-                    # Build an entry dict compatible with the processing function
-                    entry = {
-                        'path': args.path,
-                        'owner': owner_group_info.get('owner'),
-                        'group': owner_group_info.get('group'),
-                        'owner_details': owner_group_info.get('owner_details'),
-                        'group_details': owner_group_info.get('group_details'),
-                    }
-                    await process_file_for_ownership_change(session, entry)
-                else:
-                    log_stderr("ERROR", f"Could not get attributes for: {args.path}")
-                    change_stats['errors'].append({
-                        'path': args.path,
-                        'error': 'Could not get file attributes'
-                    })
+                await process_target_path_object(session)
 
         elapsed = time.time() - start_time
 
@@ -11231,9 +11281,13 @@ Examples:
         "--change-owner",
         action="append",
         metavar="SOURCE:TARGET",
-        help="Change file owner from SOURCE to TARGET. "
-             "Finds files owned by SOURCE and changes owner to TARGET. "
-             "Format: 'olduser:newuser', 'uid:1001:uid:2001', 'DOMAIN\\\\user:DOMAIN\\\\other'. "
+        help="Change the file owner from SOURCE to TARGET. "
+             "Finds files owned by SOURCE and changes owner to TARGET, leaving "
+             "the group owner and the ACL entries alone. "
+             "Either side may be uid:N, gid:N, auth_id:N, a SID, DOMAIN\\user, "
+             "name:NAME, local:NAME, ad:NAME, or a plain name. A bare number is "
+             "rejected as ambiguous - write uid:N, gid:N, auth_id:N or name:N. "
+             "Format: 'olduser:newuser', 'uid:1001:uid:2001', 'S-1-5-21-...:uid:1001'. "
              "Repeatable for multiple mappings. Use with --dry-run to preview changes."
     )
 
@@ -11241,9 +11295,11 @@ Examples:
         "--change-group",
         action="append",
         metavar="SOURCE:TARGET",
-        help="Change file group from SOURCE to TARGET. "
-             "Finds files with group SOURCE and changes group to TARGET. "
-             "Format: 'oldgroup:newgroup', 'gid:100:gid:200'. "
+        help="Change the group owner from SOURCE to TARGET. "
+             "Finds files with group SOURCE and changes group to TARGET, leaving "
+             "the file owner and the ACL entries alone. Same identity formats as "
+             "--change-owner. Format: 'oldgroup:newgroup', 'gid:100:gid:200', "
+             "'gid:14011:S-1-5-21-...'. "
              "Repeatable for multiple mappings. Use with --dry-run to preview changes."
     )
 
@@ -11251,16 +11307,22 @@ Examples:
         "--change-owners-file",
         metavar="FILE",
         help="CSV file with owner mappings (source,target format). "
-             "Each row maps a source owner to target owner. "
-             "Same format as --migrate-trustees CSV."
+             "Each row maps a source owner to a target owner, e.g. "
+             "'uid:1001,S-1-5-21-...' to replace a legacy UID with an AD user "
+             "SID. Changes the owner field only, not ACL trustees. Same "
+             "identity formats as --change-owner, and the same file format as "
+             "the --migrate-trustees CSV."
     )
 
     acl_management.add_argument(
         "--change-groups-file",
         metavar="FILE",
         help="CSV file with group mappings (source,target format). "
-             "Each row maps a source group to target group. "
-             "Same format as --migrate-trustees CSV."
+             "Each row maps a source group owner to a target group owner, e.g. "
+             "'gid:14011,S-1-5-21-...' to replace a legacy GID with an AD "
+             "group SID. Changes the group-owner field only, not ACL trustees. "
+             "Same identity formats as --change-group, and the same file format "
+             "as the --migrate-trustees CSV."
     )
 
     # Hidden alias for backward compatibility (use --propagate-changes instead)

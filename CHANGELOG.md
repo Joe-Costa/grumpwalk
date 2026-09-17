@@ -5,6 +5,24 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.4] - 2026-09-17
+
+### Fixed
+
+- **`--change-owner` and `--change-group` now read prefixed identities on both sides.** The pattern was split on its last colon, so a target written as `uid:N`, `gid:N` or `auth_id:N` took the prefix away from itself and glued it to the source: `--change-owner 'S-1-5-21-...:uid:1001'` looked for an owner called `S-1-5-21-...:uid` and changed nothing, reporting only that the source "may not exist". Any source that is not itself `uid:`/`gid:`/`auth_id:` prefixed was affected, `DOMAIN\user:uid:1001` included. A pattern is now read as two identities, each of which may carry its own prefix.
+
+- **Owner and group changes now include the `--path` object when propagating.** `--propagate-changes` walked the children only, so a migrated tree kept the old owner or group on its top directory and a fix needed a second run without the flag. Without `--propagate-changes` the behavior is unchanged: only the `--path` object.
+
+- **`local:NAME` and `ad:NAME` now reach the cluster with their domain.** Both were parsed, then the domain was dropped before the identity lookup. A bare name is looked up in AD, so on an AD-joined cluster `local:admin` could never resolve. `resolve_identity` takes an optional domain and the owner/group change path passes it.
+
+### Added
+
+- **`name:NAME`** - Say that an identity is a name, whatever it looks like, so a user or group whose name is a number can be named at all. Everything after `name:` goes to the cluster's identity lookup as a name, so every spelling the cluster accepts works: `name:jsmith`, `name:DOMAIN\jsmith`, `name:dns.domain.com\jsmith`, `name:jsmith@domain.com`, and names with spaces such as `name:Domain Users`.
+
+### Changed
+
+- **A bare number is no longer accepted in an owner or group mapping.** `--change-owner`, `--change-group` and their CSV files rejected nothing before, and read a number as a UID. Since user and group names can be numbers too, and guessing wrong changes the ownership of the wrong files, `14011` is now an error naming the four ways to be explicit: `uid:14011`, `gid:14011`, `auth_id:14011`, or `name:14011`. Every other feature reads a bare number as a UID as it did before.
+
 ## [3.9.3] - 2026-08-25
 
 ### Changed
