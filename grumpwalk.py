@@ -8,7 +8,7 @@ Usage:
 
 """
 
-__version__ = "3.9.4"
+__version__ = "3.9.5"
 
 import argparse
 import asyncio
@@ -4802,11 +4802,21 @@ def _revert_under_any(path, dirs):
     return any(base != d.rstrip("/") and base.startswith(d.rstrip("/") + "/") for d in dirs)
 
 
-async def _delete_live_tree(client, session, dir_path, stats):
-    """Recursively delete a live directory and everything under it (revert of a
-    CREATEd directory). Enumerates the whole subtree, deletes files/symlinks first,
-    then directories deepest-first so each is empty when removed. Returns
-    (deleted_object_count, ok)."""
+def _has_ancestor_in(path, dirs) -> bool:
+    """True if a proper ancestor directory of `path` is in the set `dirs`. O(depth),
+    unlike _revert_under_any, for checks over every file of a large subtree."""
+    p = path.rstrip("/")
+    while "/" in p:
+        p = p.rsplit("/", 1)[0]
+        if p in dirs:
+            return True
+    return False
+
+
+async def _live_subtree(client, session, dir_path):
+    """Enumerate a live directory recursively. Returns (files, subdirs): every
+    non-directory path and every descendant directory path (not dir_path itself).
+    A failed listing raises (enumerate_directory retries, then propagates)."""
     files, subdirs, stack = [], [], [dir_path]
     while stack:
         d = stack.pop()
@@ -4819,6 +4829,15 @@ async def _delete_live_tree(client, session, dir_path, stats):
                 stack.append(cpath)
             else:
                 files.append(cpath)
+    return files, subdirs
+
+
+async def _delete_live_tree(client, session, dir_path, stats):
+    """Recursively delete a live directory and everything under it (revert of a
+    CREATEd directory). Enumerates the whole subtree, deletes files/symlinks first,
+    then directories deepest-first so each is empty when removed. Returns
+    (deleted_object_count, ok)."""
+    files, subdirs = await _live_subtree(client, session, dir_path)
     ok = True
     deleted = 0
     for f in files:
@@ -4856,6 +4875,11 @@ async def _revert_recreate_file(client, session, path, is_symlink, size, args, c
         stats["recreated_files"] += 1
     else:
         stats["failed"] += 1
+        if msg and "fs_directory_error" in msg:
+            # A directory now occupies the snapshot file's path (inside a replaced
+            # directory); without --delete-new the live directory is kept.
+            msg = ("a directory now exists where the snapshot has a file; kept "
+                   "(use --delete-new to replace it with the snapshot version)")
         _mv_record_error(stats, path, msg or "recreate failed")
 
 
@@ -4894,6 +4918,33 @@ async def _revert_restore_modified(client, session, path, snap_id, now_snap, arg
         _mv_record_error(stats, path, msg or "restore failed")
 
 
+async def _revert_subtree_totals(client, session, dirs, snapshot_id=None):
+    """Sum recursive aggregates (file count, capacity) over `dirs`, read from
+    `snapshot_id` or live. Returns (files, capacity_bytes, complete) where complete is
+    False if any directory's aggregates could not be read. Aggregates are computed
+    in the background, so data written just before a snapshot may be under-counted."""
+    async def _one(d):
+        a = await client.get_directory_aggregates(session, d.rstrip("/"), snapshot_id=snapshot_id)
+        if not a or a.get("error"):
+            return None
+        try:
+            return int(a.get("total_files", 0)), int(a.get("total_capacity", 0))
+        except (TypeError, ValueError):
+            return None
+    results = await asyncio.gather(*[_one(d) for d in dirs])
+    ok = [r for r in results if r is not None]
+    return sum(r[0] for r in ok), sum(r[1] for r in ok), len(ok) == len(results)
+
+
+def _revert_totals_text(totals) -> str:
+    """' (about N files, X)' for a _revert_subtree_totals result, or '' if None."""
+    if totals is None:
+        return ""
+    files, capacity, complete = totals
+    qualifier = "about" if complete else "at least"
+    return f" ({qualifier} {files:,} files, {format_bytes(capacity)})"
+
+
 async def revert_to_snapshot(client, session, args) -> dict:
     """Restore the directory at --path to its state in --snapshot.
 
@@ -4903,14 +4954,17 @@ async def revert_to_snapshot(client, session, args) -> dict:
     from the snapshot subtree) and restore modified files (delta-patched with --delta,
     else whole-file). Files/dirs CREATED since the snapshot are kept by default
     (non-destructive to new data); with --delete-new they are also removed, making the
-    directory byte-identical to the snapshot (an exact rollback). Overwrites modified
-    files, so it requires --yes; --dry-run previews the full plan.
+    directory byte-identical to the snapshot (an exact rollback). A path deleted AND
+    re-created since the snapshot is "replaced": its snapshot version is restored over
+    the live one and it is never deleted as new. Overwrites modified files, so it
+    requires --yes; --dry-run previews the full plan, sized from directory aggregates.
 
     This is a whole-directory operation; content filters (--name/--type/--owner) do
     not apply. Discovery is proportional to the number of changes, not the tree size.
     """
     stats = {"diff_changes": 0, "recreated_files": 0, "recreated_dirs": 0, "patched": 0,
-             "deleted_files": 0, "deleted_dirs": 0, "kept_new": 0, "failed": 0, "errors": []}
+             "deleted_files": 0, "deleted_dirs": 0, "kept_new": 0, "replaced": 0,
+             "type_changed_kept": 0, "failed": 0, "errors": []}
     snap_id = args.snapshot
     snap = await client.get_snapshot(session, snap_id)
     if snap is None:
@@ -4968,38 +5022,98 @@ async def revert_to_snapshot(client, session, args) -> dict:
                                "nothing to revert.")
             return stats
 
+        # A path that is both DELETEd and CREATEd was REPLACED: the snapshot object was
+        # deleted and a new one written at the same path (e.g. data re-copied from its
+        # original source). The snapshot version wins - it is restored, and the path is
+        # never treated as "created since" (deleting it would undo the restore). If the
+        # type changed (file <-> directory) the live object blocks the restore:
+        # --delete-new removes it first; otherwise it is kept and reported.
         delete_new = args.delete_new
-        new_count = len(standalone_cre_files) + len(cre_dir_roots)
+        del_dirs = {d.rstrip("/") for d in del_dir_roots}
+        cre_dirs = {d.rstrip("/") for d in cre_dir_roots}
+        del_files, cre_files = set(standalone_del_files), set(standalone_cre_files)
+        replace_dirs = sorted(del_dirs & cre_dirs)
+        replace_files = sorted(del_files & cre_files)
+        type_changed = sorted((del_dirs & cre_files) | (del_files & cre_dirs))
+        in_snapshot = del_dirs | del_files
+        in_live = cre_dirs | cre_files
+        recreate_dirs = [d for d in del_dir_roots if d.rstrip("/") not in in_live]
+        recreate_files = [f for f in standalone_del_files if f not in in_live]
+        new_files = [f for f in standalone_cre_files if f not in in_snapshot]
+        new_dir_roots = [d for d in cre_dir_roots if d.rstrip("/") not in in_snapshot]
+        if not delete_new:
+            del_dir_roots = [d for d in del_dir_roots if d.rstrip("/") not in type_changed]
+            standalone_del_files = [f for f in standalone_del_files if f not in type_changed]
+        new_count = len(new_files) + len(new_dir_roots)
+
+        # Size each directory subtree from aggregates (one call per subtree root):
+        # the diff lists a deleted/created directory as ONE entry however much it holds.
+        async def _totals(dirs, sid):
+            return await _revert_subtree_totals(client, session, dirs, sid) if dirs else None
+        recreate_tot, replace_tot, new_tot = await asyncio.gather(
+            _totals(recreate_dirs, snap_id), _totals(replace_dirs, snap_id),
+            _totals(new_dir_roots, None))
 
         log_stderr("INFO", f"Revert plan for {path} -> snapshot {snap_id}:")
-        log_stderr("INFO", f"  recreate: {len(del_dir_roots)} deleted dir subtree(s), "
-                           f"{len(standalone_del_files)} deleted file(s)")
+        log_stderr("INFO", f"  recreate: {len(recreate_dirs)} deleted dir subtree(s)"
+                           f"{_revert_totals_text(recreate_tot)}, "
+                           f"{len(recreate_files)} deleted file(s)")
+        if replace_dirs or replace_files:
+            log_stderr("INFO", f"  replace : {len(replace_dirs)} dir subtree(s)"
+                               f"{_revert_totals_text(replace_tot)}, {len(replace_files)} "
+                               "file(s) deleted and re-created since the snapshot; the live "
+                               "copies are overwritten with the snapshot version"
+                               + ("; live entries inside them that are not in the snapshot "
+                                  "are deleted" if delete_new else ""))
         log_stderr("INFO", f"  restore : {len(modified_files)} modified file(s)"
                            + (" (delta)" if args.delta else " (whole-file)"))
+        if type_changed:
+            if delete_new:
+                log_stderr("INFO", f"  retype  : {len(type_changed)} object(s) changed between "
+                                   "file and directory since the snapshot; the live object is "
+                                   "DELETED and the snapshot version restored")
+            else:
+                log_stderr("WARN", f"  {len(type_changed)} object(s) changed between file and "
+                                   "directory since the snapshot and are kept as they are "
+                                   "(use --delete-new to restore the snapshot version)")
         if delete_new:
-            log_stderr("INFO", f"  DELETE  : {len(standalone_cre_files)} created file(s), "
-                               f"{len(cre_dir_roots)} created dir subtree(s) "
-                               "(data added since the snapshot)")
+            log_stderr("INFO", f"  DELETE  : {len(new_files)} created file(s), "
+                               f"{len(new_dir_roots)} created dir subtree(s)"
+                               f"{_revert_totals_text(new_tot)} (data added since the snapshot)")
         else:
-            log_stderr("INFO", f"  keep    : {new_count} object(s) created since the snapshot "
-                               "left in place (use --delete-new for an exact rollback)")
+            log_stderr("INFO", f"  keep    : {new_count} object(s) created since the snapshot"
+                               f"{_revert_totals_text(new_tot)} left in place "
+                               "(use --delete-new for an exact rollback)")
 
         if args.dry_run:
-            for d in del_dir_roots:
+            for d in recreate_dirs:
                 log_stderr("DRY RUN", f"recreate dir subtree {d} (from snapshot {snap_id})")
-            for f in standalone_del_files:
+            for f in recreate_files:
                 log_stderr("DRY RUN", f"recreate file {f}")
+            for d in replace_dirs:
+                log_stderr("DRY RUN", f"replace dir subtree {d}/ with its snapshot version"
+                                      + (" (deleting live entries not in the snapshot)"
+                                         if delete_new else ""))
+            for f in replace_files:
+                log_stderr("DRY RUN", f"replace file {f} with its snapshot version")
+            for p in type_changed:
+                if delete_new:
+                    log_stderr("DRY RUN", f"DELETE live {'directory' if p in cre_dirs else 'file'} "
+                                          f"{p} (type changed), then restore its snapshot version")
+                else:
+                    log_stderr("DRY RUN", f"keep {p} (changed between file and directory "
+                                          "since the snapshot; not restored)")
             for f in modified_files:
                 log_stderr("DRY RUN", f"{'delta-restore' if args.delta else 'restore'} {f}")
             if delete_new:
-                for f in standalone_cre_files:
+                for f in new_files:
                     log_stderr("DRY RUN", f"DELETE created file {f}")
-                for d in cre_dir_roots:
+                for d in new_dir_roots:
                     log_stderr("DRY RUN", f"DELETE created dir subtree {d}")
             else:
-                for f in standalone_cre_files:
+                for f in new_files:
                     log_stderr("DRY RUN", f"keep created file {f}")
-                for d in cre_dir_roots:
+                for d in new_dir_roots:
                     log_stderr("DRY RUN", f"keep created dir subtree {d}")
             return stats
 
@@ -5010,12 +5124,19 @@ async def revert_to_snapshot(client, session, args) -> dict:
                 sys.exit(1)
             print(f"\nAbout to revert {path} to snapshot {snap_id}.", file=sys.stderr)
             if delete_new:
-                print(f"  This will DELETE {len(standalone_cre_files)} file(s) and "
-                      f"{len(cre_dir_roots)} director(ies) created since the snapshot,",
+                print(f"  This will DELETE {len(new_files)} file(s) and "
+                      f"{len(new_dir_roots)} director(ies) created since the snapshot,",
                       file=sys.stderr)
             print(f"  restore {len(modified_files)} modified file(s) to the snapshot version "
-                  f"and recreate {len(standalone_del_files) + len(del_dir_roots)} deleted item(s).",
+                  f"and recreate {len(recreate_files) + len(recreate_dirs)} deleted item(s).",
                   file=sys.stderr)
+            if replace_dirs or replace_files:
+                print(f"  {len(replace_dirs) + len(replace_files)} item(s) deleted and re-created "
+                      "since the snapshot will be overwritten with the snapshot version"
+                      f"{_revert_totals_text(replace_tot)}.", file=sys.stderr)
+            if type_changed and delete_new:
+                print(f"  {len(type_changed)} item(s) that changed between file and directory "
+                      "will be DELETED and restored from the snapshot.", file=sys.stderr)
             if not delete_new and new_count:
                 print(f"  {new_count} object(s) created since the snapshot will be KEPT "
                       "(pass --delete-new to remove them).", file=sys.stderr)
@@ -5028,15 +5149,68 @@ async def revert_to_snapshot(client, session, args) -> dict:
         args.rename_on_conflict = False
         created_set = set()
         sem = asyncio.Semaphore(max(1, args.copy_concurrency))
+        stats["replaced"] = len(replace_dirs) + len(replace_files)
 
-        # Phase 1 (sequential): recreate the directory structure of each deleted dir
+        async def _delete_object(p, is_dir):
+            """Delete one live file, or a live directory subtree. Never raises: a
+            failed listing or delete is recorded as a failure."""
+            async with sem:
+                try:
+                    if is_dir:
+                        _, ok = await _delete_live_tree(client, session, p.rstrip("/"), stats)
+                        if ok:
+                            stats["deleted_dirs"] += 1
+                        else:
+                            stats["failed"] += 1
+                        return
+                    ok, err2 = await client.delete_entry(session, p.rstrip("/"))
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    stats["failed"] += 1
+                    _mv_record_error(stats, p, f"delete failed: {e}")
+                    return
+                if ok:
+                    stats["deleted_files"] += 1
+                else:
+                    stats["failed"] += 1
+                    _mv_record_error(stats, p, f"delete failed: {err2}")
+
+        # Phase 1a: enumerate every deleted dir subtree in the snapshot BEFORE writing
+        # anything, so a listing failure aborts the run with the live tree untouched.
+        snap_subtrees = []
+        for root in del_dir_roots:
+            snap_subtrees.append((root.rstrip("/"), *await _collect_snapshot_subtree(
+                client, session, root.rstrip("/"), snap_id)))
+
+        # Phase 1b (--delete-new): clear what blocks an exact restore - live objects
+        # whose type changed, and entries inside replaced directories that are not in
+        # the snapshot. Skipped for a replaced directory whose live listing fails.
+        if delete_new:
+            blockers = [(p, p in cre_dirs) for p in type_changed]
+            replaced = set(replace_dirs)
+            for root, sub_files, sub_dirs in snap_subtrees:
+                if root not in replaced:
+                    continue
+                try:
+                    live_files, live_dirs = await _live_subtree(client, session, root)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    stats["failed"] += 1
+                    _mv_record_error(stats, root, f"could not list live directory; entries "
+                                                  f"not in the snapshot were not deleted: {e}")
+                    continue
+                snap_files = {f for f, _, _ in sub_files}
+                snap_dirs = set(sub_dirs)
+                extra_dirs = {d for d in live_dirs if d not in snap_dirs}
+                blockers += [(d, True) for d in extra_dirs if not _has_ancestor_in(d, extra_dirs)]
+                blockers += [(f, False) for f in live_files
+                             if f not in snap_files and not _has_ancestor_in(f, extra_dirs)]
+            await asyncio.gather(*[_delete_object(p, is_dir) for p, is_dir in blockers])
+
+        # Phase 1c (sequential): recreate the directory structure of each deleted dir
         # subtree, shallow-first so parents exist before children, and collect the
         # files to restore. Directory creation is cheap relative to the file copies.
         subtree_files = []
-        for root in del_dir_roots:
-            sub_files, sub_dirs = await _collect_snapshot_subtree(
-                client, session, root.rstrip("/"), snap_id)
-            for d in sorted([root.rstrip("/")] + sub_dirs, key=lambda x: (x.count("/"), x)):
+        for root, sub_files, sub_dirs in snap_subtrees:
+            for d in sorted([root] + sub_dirs, key=lambda x: (x.count("/"), x)):
                 if await _ensure_restore_parent(client, session, d, args, created_set):
                     stats["recreated_dirs"] += 1
                 else:
@@ -5069,28 +5243,13 @@ async def revert_to_snapshot(client, session, args) -> dict:
         )
 
         # Phase 3 (concurrent): delete objects created since the snapshot (--delete-new).
+        # Replaced paths are excluded from new_files/new_dir_roots: they were just restored.
         if delete_new:
-            async def _del_file(f):
-                async with sem:
-                    ok, err2 = await client.delete_entry(session, f.rstrip("/"))
-                    if ok:
-                        stats["deleted_files"] += 1
-                    else:
-                        stats["failed"] += 1
-                        _mv_record_error(stats, f, f"delete failed: {err2}")
-
-            async def _del_tree(root):
-                async with sem:
-                    _, ok = await _delete_live_tree(client, session, root.rstrip("/"), stats)
-                    if ok:
-                        stats["deleted_dirs"] += 1
-                    else:
-                        stats["failed"] += 1
-
-            await asyncio.gather(*[_del_file(f) for f in standalone_cre_files],
-                                 *[_del_tree(r) for r in cre_dir_roots])
+            await asyncio.gather(*[_delete_object(f, False) for f in new_files],
+                                 *[_delete_object(d, True) for d in new_dir_roots])
         else:
             stats["kept_new"] = new_count
+            stats["type_changed_kept"] = len(type_changed)
     finally:
         ok, derr = await client.delete_snapshot(session, now_snap)
         if not ok:
@@ -7414,6 +7573,12 @@ async def _main_async(args):
                 print(f"Files recreated:       {stats['recreated_files']:,}", file=sys.stderr)
                 print(f"Directories recreated: {stats['recreated_dirs']:,}", file=sys.stderr)
                 print(f"Files restored:        {stats['patched']:,}", file=sys.stderr)
+                if stats["replaced"]:
+                    print(f"Replaced objects:      {stats['replaced']:,} (deleted and re-created "
+                          "since the snapshot; restored to the snapshot version)", file=sys.stderr)
+                if stats["type_changed_kept"]:
+                    print(f"Kept (type changed):   {stats['type_changed_kept']:,} "
+                          "(use --delete-new to restore the snapshot version)", file=sys.stderr)
                 if args.delete_new:
                     print(f"Files deleted:         {stats['deleted_files']:,}", file=sys.stderr)
                     print(f"Dir subtrees deleted:  {stats['deleted_dirs']:,}", file=sys.stderr)

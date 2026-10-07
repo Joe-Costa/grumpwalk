@@ -1,6 +1,6 @@
 # Grumpwalk Users Guide
 
-**Version 3.9.4** | [Changelog](CHANGELOG.md) | [README](README.md)
+**Version 3.9.5** | [Changelog](CHANGELOG.md) | [README](README.md)
 
 A practical guide with recipes for common storage administration tasks using grumpwalk.
 
@@ -1554,6 +1554,29 @@ is. Reverting a directory with millions of files where only a few hundred change
 touches only those few hundred. Add `--delta` and the modified files are patched by
 byte range too (see the previous question).
 
+**Reading the plan.** A deleted or re-created folder counts as one change in the
+diff, however much it holds. The plan therefore shows the approximate number of
+files and the amount of data for each step, so you can see the real size of the
+job before you confirm:
+```
+recreate: 2,400 deleted dir subtree(s) (about 2,987,112 files, 119.60 TiB), 8,600 deleted file(s)
+replace : 1,200 dir subtree(s) (about 41,250 files, 1.20 TiB), 300 file(s) deleted and re-created since the snapshot; ...
+restore : 12 modified file(s) (whole-file)
+keep    : 4 object(s) created since the snapshot (about 90 files, 2.10 GiB) left in place ...
+```
+These figures come from the cluster's directory totals, so they are close but not
+always exact. Data written in the last moments before a snapshot may not be
+counted.
+
+**Data that was deleted and then put back.** If files or folders were deleted after
+the snapshot and later copied back to the same place (for example, from the system
+they were originally migrated from), the cluster sees them as new files. `--revert`
+lists these on a separate `replace` line and overwrites them with their snapshot
+version. They are never deleted as "new", with or without `--delete-new`. With
+`--delete-new`, only files and folders inside them that were not in the snapshot are
+removed. If something changed between a file and a folder, it is kept and reported
+unless you add `--delete-new`.
+
 Important notes:
 - By default `--revert` **keeps** files created since the snapshot; `--delete-new`
   removes them for an exact mirror. Either way it **overwrites modified files** with
@@ -1566,7 +1589,11 @@ Important notes:
   selected subset of files).
 - It needs the **snapshot-write** privilege (to take the temporary snapshot, which is
   deleted automatically when the run finishes).
-- Re-running it is safe and idempotent: a second run finds nothing left to change.
+- Restored files are written as new files, so they get the current time as their
+  timestamps. To keep the original timestamps, owner and permissions, copy the
+  directory out of the snapshot with `--copy-to` and `--preserve-all` instead.
+- Re-running it is safe. Files restored by an earlier run are new files to the
+  cluster, so they show up as `replace` items and are copied again.
 
 ### What if a name already exists at the destination?
 

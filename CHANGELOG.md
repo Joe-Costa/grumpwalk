@@ -5,6 +5,18 @@ All notable changes to grumpwalk will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.5] - 2026-10-07
+
+### Fixed
+
+- **`--revert --delete-new` no longer deletes data it has just restored.** When something was deleted after the snapshot and then put back at the same path (for example, data re-copied from its original source), the revert restored the snapshot version and then deleted it again as "created since the snapshot". The run reported no failures. Re-running `--revert --delete-new` after any earlier revert caused the same loss, because restored files count as new. These paths are now treated as replaced: the snapshot version is restored over the live copy and never deleted. With `--delete-new`, only files and folders inside them that are not in the snapshot are removed.
+
+### Changed
+
+- **The `--revert` plan now shows how much data each step involves.** A deleted or replaced folder counts as a single change however much it holds, so "11,000 changes" could really mean 3 million files. The plan now gives the approximate number of files and the capacity for folders to recreate, replace, keep or delete, for example `recreate: 2,400 deleted dir subtree(s) (about 2,987,112 files, 119.60 TiB)`.
+- **`--revert` lists replaced items separately.** Items deleted and re-created since the snapshot appear on their own `replace` line in the plan and in `--dry-run`, and in the summary as `Replaced objects`.
+- **`--revert` reports items that changed between file and folder.** By default the live item is kept and reported; with `--delete-new` it is removed and the snapshot version restored.
+
 ## [3.9.4] - 2026-09-17
 
 ### Fixed
