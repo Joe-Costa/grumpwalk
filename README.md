@@ -89,6 +89,13 @@ chmod +x grumpwalk.py
 pip install -r requirements.txt
 ```
 
+**If `pip install` fails with `ujson` errors (for example `command 'g++' failed`), your pip is too old to use ujson's prebuilt packages. This is common with Python 3.9 on RHEL 8 and Rocky 8. Update pip, then run the install again:**
+
+```bash
+python3 -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
 ### Bash Completion Setup (Optional)
 
 To enable tab completion for command-line arguments, use the provided setup script:
